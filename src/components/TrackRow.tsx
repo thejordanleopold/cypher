@@ -5,6 +5,7 @@ import { useCypher, type TrackState } from "@/state/store";
 import { Waveform } from "@/components/Waveform";
 import { LiveWaveform } from "@/components/LiveWaveform";
 import { InputPicker } from "@/components/InputPicker";
+import { LevelMeter } from "@/components/LevelMeter";
 
 export function TrackRow({ track }: { track: TrackState }) {
   const {
@@ -66,6 +67,7 @@ export function TrackRow({ track }: { track: TrackState }) {
               : "no audio"}
           </div>
         </div>
+        {isRecordingNow && <LevelMeter trackId={track.id} />}
         <ToggleButton
           active={track.muted}
           activeClass="bg-amber-500 text-black"

@@ -30,6 +30,8 @@ export interface PersistedProject {
   tracks: PersistedTrack[];
   createdAt: number;
   updatedAt: number;
+  latencyOffsetMs?: number;
+  countInBeats?: number;
 }
 
 export interface ProjectSummary {

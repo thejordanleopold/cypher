@@ -4,6 +4,7 @@ import "./globals.css";
 import { SwRegister } from "@/components/SwRegister";
 import { VisibilityHandler } from "@/components/VisibilityHandler";
 import { WakeLockHandler } from "@/components/WakeLockHandler";
+import { Toaster } from "@/components/Toaster";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -64,6 +65,7 @@ export default function RootLayout({
         <VisibilityHandler />
         <WakeLockHandler />
         {children}
+        <Toaster />
       </body>
     </html>
   );

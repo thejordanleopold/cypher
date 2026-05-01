@@ -296,11 +296,29 @@ class AudioEngine {
     return this.metronomeOn;
   }
 
+  tickClick(accent: boolean) {
+    if (!this.metronomeSynth) {
+      this.metronomeSynth = new Tone.MembraneSynth({
+        pitchDecay: 0.01,
+        octaves: 2,
+        envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 },
+        volume: -10,
+      }).toDestination();
+    }
+    this.metronomeSynth.triggerAttackRelease(accent ? "C5" : "C4", "16n");
+  }
+
   // ---- Recording ----
   async listInputDevices(): Promise<MediaDeviceInfo[]> {
     if (!navigator.mediaDevices?.enumerateDevices) return [];
     const all = await navigator.mediaDevices.enumerateDevices();
     return all.filter((d) => d.kind === "audioinput");
+  }
+
+  async listOutputDevices(): Promise<MediaDeviceInfo[]> {
+    if (!navigator.mediaDevices?.enumerateDevices) return [];
+    const all = await navigator.mediaDevices.enumerateDevices();
+    return all.filter((d) => d.kind === "audiooutput");
   }
 
   async requestMicPermission(): Promise<void> {
@@ -400,7 +418,11 @@ class AudioEngine {
     }
     session.stream.getTracks().forEach((t) => t.stop());
 
-    if (session.chunks.length === 0) return null;
+    if (session.chunks.length === 0) {
+      throw Object.assign(new Error("Recording captured no audio"), {
+        name: "EmptyRecordingError",
+      });
+    }
     const blob = new Blob(session.chunks, { type: session.mimeType });
     let buf: AudioBuffer;
     try {
@@ -408,7 +430,12 @@ class AudioEngine {
       buf = await this.context().decodeAudioData(arr.slice(0));
     } catch (err) {
       console.error("Failed to decode recording", err);
-      return null;
+      throw Object.assign(
+        new Error(
+          err instanceof Error ? err.message : "Could not decode the recording",
+        ),
+        { name: "DecodeFailedError" },
+      );
     }
 
     const track = this.tracks.get(session.trackId);
@@ -488,16 +515,27 @@ class AudioEngine {
     for (const s of sessions) this.startSession(s);
   }
 
-  async stopMultiRecording(): Promise<Map<TrackId, AudioBuffer | null>> {
+  async stopMultiRecording(): Promise<{
+    results: Map<TrackId, AudioBuffer | null>;
+    errors: Map<TrackId, Error>;
+  }> {
     const results = new Map<TrackId, AudioBuffer | null>();
-    if (this.multiRecording.size === 0) return results;
+    const errors = new Map<TrackId, Error>();
+    if (this.multiRecording.size === 0) return { results, errors };
     const sessions = [...this.multiRecording.values()];
     this.multiRecording.clear();
     for (const s of sessions) {
-      results.set(s.trackId, await this.finalizeSession(s));
+      try {
+        results.set(s.trackId, await this.finalizeSession(s));
+      } catch (err) {
+        errors.set(
+          s.trackId,
+          err instanceof Error ? err : new Error(String(err)),
+        );
+      }
     }
     this.pause();
-    return results;
+    return { results, errors };
   }
 
   isMultiRecording() {

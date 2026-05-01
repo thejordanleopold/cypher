@@ -17,6 +17,11 @@ export function Transport() {
     startArmedRecording,
     stopArmedRecording,
     tracks,
+    countInBeats,
+    setCountInBeats,
+    countdownActive,
+    countdownBeat,
+    cancelCountdown,
   } = useCypher();
   const armedCount = tracks.filter((t) => t.armed).length;
   const emptyCount = tracks.filter((t) => !t.hasAudio).length;
@@ -51,11 +56,19 @@ export function Transport() {
           </svg>
         </button>
         <button
-          onClick={() =>
-            isMultiRecording ? stopArmedRecording() : startArmedRecording()
+          onClick={() => {
+            if (countdownActive) cancelCountdown();
+            else if (isMultiRecording) stopArmedRecording();
+            else startArmedRecording();
+          }}
+          aria-label={
+            countdownActive
+              ? "Cancel countdown"
+              : isMultiRecording
+              ? "Stop recording"
+              : "Play and record"
           }
-          aria-label={isMultiRecording ? "Stop recording" : "Play and record"}
-          aria-pressed={isMultiRecording}
+          aria-pressed={isMultiRecording || countdownActive}
           title={
             isMultiRecording
               ? "Stop recording"
@@ -68,14 +81,22 @@ export function Transport() {
           className={`h-10 w-10 rounded-full flex items-center justify-center active:scale-95 shrink-0 transition-colors ${
             isMultiRecording
               ? "bg-red-600 text-white animate-pulse ring-2 ring-red-400/60 ring-offset-2 ring-offset-neutral-950"
+              : countdownActive
+              ? "bg-amber-500 text-black"
               : "bg-neutral-800 text-neutral-200 hover:bg-neutral-700"
           }`}
         >
-          <span
-            className={`block h-2.5 w-2.5 rounded-full ${
-              isMultiRecording ? "bg-white" : "bg-red-500"
-            }`}
-          />
+          {countdownActive ? (
+            <span className="text-xs font-bold tabular-nums">
+              {Math.max(1, countInBeats - countdownBeat + 1)}
+            </span>
+          ) : (
+            <span
+              className={`block h-2.5 w-2.5 rounded-full ${
+                isMultiRecording ? "bg-white" : "bg-red-500"
+              }`}
+            />
+          )}
         </button>
 
         <div className="w-px h-7 bg-neutral-800 mx-1 shrink-0" aria-hidden="true" />
@@ -104,6 +125,21 @@ export function Transport() {
             aria-label="Tempo in beats per minute"
           />
         </label>
+        <button
+          onClick={() => {
+            const next = countInBeats === 0 ? 1 : countInBeats === 1 ? 2 : countInBeats === 2 ? 4 : 0;
+            setCountInBeats(next);
+          }}
+          aria-label={`Count-in: ${countInBeats === 0 ? "off" : `${countInBeats} beat${countInBeats === 1 ? "" : "s"}`}`}
+          title="Pre-record count-in"
+          className={`h-9 px-2 rounded-md text-xs font-bold flex items-center justify-center active:scale-95 shrink-0 tabular-nums ${
+            countInBeats > 0
+              ? "bg-amber-500 text-black"
+              : "bg-neutral-800 text-neutral-300"
+          }`}
+        >
+          {countInBeats === 0 ? "0" : countInBeats}·
+        </button>
         <button
           onClick={toggleMetronome}
           aria-pressed={metronomeOn}

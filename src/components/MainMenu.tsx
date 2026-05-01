@@ -20,6 +20,10 @@ export function MainMenu() {
     exportMix,
     exportStems,
     exportProgress,
+    latencyOffsetMs,
+    setLatencyOffsetMs,
+    calibrateLatency,
+    isCalibrating,
   } = useCypher();
   const [open, setOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -204,6 +208,39 @@ export function MainMenu() {
                 </button>
               );
             })}
+          </div>
+
+          {/* Latency calibration */}
+          <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">
+            <div className="flex items-center justify-between">
+              <Section label="Recording latency" />
+              <span className="text-[11px] tabular-nums text-emerald-400">
+                {latencyOffsetMs} ms
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={400}
+              step={1}
+              value={latencyOffsetMs}
+              onChange={(e) => setLatencyOffsetMs(Number(e.target.value))}
+              aria-label="Recording latency offset in milliseconds"
+              className="w-full accent-emerald-500"
+            />
+            <button
+              onClick={async () => {
+                setOpen(false);
+                await calibrateLatency("default");
+              }}
+              disabled={isCalibrating}
+              className="w-full h-9 rounded-md bg-neutral-800 hover:bg-neutral-700 text-neutral-100 text-sm font-medium active:scale-[0.98] disabled:opacity-50"
+            >
+              {isCalibrating ? "Calibrating…" : "Auto-calibrate (3 s)"}
+            </button>
+            <p className="text-[10px] text-neutral-500 leading-snug">
+              Plays four short clicks through the speaker and listens for them on the mic. Hold the phone close enough that the mic can hear it. New recordings are shifted earlier by this amount so they line up with playback.
+            </p>
           </div>
 
           {/* Export */}

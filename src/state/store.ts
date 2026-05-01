@@ -23,6 +23,16 @@ function makeId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+export interface Toast {
+  id: number;
+  variant: "info" | "warn" | "error";
+  title: string;
+  message?: string;
+  ttlMs?: number;
+}
+
+let toastSeq = 0;
+
 const DEFAULT_PROJECT_ID = "default";
 
 export interface TrackState {
@@ -87,12 +97,27 @@ interface CypherState {
   stopRecording: () => Promise<void>;
   toggleArm: (id: string) => void;
   isMultiRecording: boolean;
+
+  countInBeats: number; // 0 = disabled, otherwise N beats of click before record
+  setCountInBeats: (n: number) => void;
+  countdownActive: boolean;
+  countdownBeat: number;
+  cancelCountdown: () => void;
+
+  latencyOffsetMs: number;
+  setLatencyOffsetMs: (ms: number) => void;
+  calibrateLatency: (deviceId: string) => Promise<void>;
+  isCalibrating: boolean;
   startArmedRecording: () => Promise<void>;
   stopArmedRecording: () => Promise<void>;
 
   exportProgress: number | null;
   exportMix: (format: ExportFormat) => Promise<void>;
   exportStems: (format: ExportFormat) => Promise<void>;
+
+  toasts: Toast[];
+  pushToast: (t: Omit<Toast, "id">) => void;
+  dismissToast: (id: number) => void;
 }
 
 let trackCounter = 0;
@@ -116,6 +141,60 @@ export const useCypher = create<CypherState>((set, get) => ({
   projects: [],
   isLoaded: false,
   lastSavedAt: null,
+  toasts: [],
+  countInBeats: 0,
+  countdownActive: false,
+  countdownBeat: 0,
+  latencyOffsetMs: 0,
+  isCalibrating: false,
+
+  setCountInBeats: (n) => set({ countInBeats: Math.max(0, Math.min(8, n)) }),
+  cancelCountdown: () => {
+    countInCancelled = true;
+  },
+  setLatencyOffsetMs: (ms) =>
+    set({ latencyOffsetMs: Math.max(-200, Math.min(500, Math.round(ms))) }),
+
+  calibrateLatency: async (deviceId) => {
+    if (get().isCalibrating) return;
+    set({ isCalibrating: true });
+    try {
+      const ms = await measureLatency(deviceId);
+      if (ms !== null) {
+        set({ latencyOffsetMs: ms });
+        get().pushToast({
+          variant: "info",
+          title: `Calibrated: ${ms} ms latency`,
+          message:
+            "Future recordings will be shifted earlier by this amount so they line up with playback.",
+          ttlMs: 6000,
+        });
+      } else {
+        get().pushToast({
+          variant: "warn",
+          title: "Calibration failed",
+          message:
+            "Couldn't detect the click in the mic input. Make sure your phone speaker (or headphone leak) is loud enough for the mic to hear it, and try again.",
+          ttlMs: 8000,
+        });
+      }
+    } finally {
+      set({ isCalibrating: false });
+    }
+  },
+
+  pushToast: (t) => {
+    const id = ++toastSeq;
+    set((s) => ({ toasts: [...s.toasts, { id, ...t }] }));
+    const ttl = t.ttlMs ?? 6000;
+    if (ttl > 0) {
+      setTimeout(() => {
+        set((s) => ({ toasts: s.toasts.filter((x) => x.id !== id) }));
+      }, ttl);
+    }
+  },
+  dismissToast: (id) =>
+    set((s) => ({ toasts: s.toasts.filter((x) => x.id !== id) })),
 
   initProject: async () => {
     if (initInFlight) return initInFlight;
@@ -337,9 +416,14 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   startRecording: async (trackId) => {
+    await maybeWarnAboutBluetoothMic(get().pushToast);
     const t = get().tracks.find((x) => x.id === trackId);
-    await getEngine().startRecording(trackId, t?.inputDeviceId);
-    set({ recordingTrackId: trackId, isMultiRecording: false });
+    try {
+      await getEngine().startRecording(trackId, t?.inputDeviceId);
+      set({ recordingTrackId: trackId, isMultiRecording: false });
+    } catch (err) {
+      get().pushToast(toastFromMicError(err));
+    }
   },
 
   exportMix: async (format) => {
@@ -388,6 +472,12 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   startArmedRecording: async () => {
+    await maybeWarnAboutBluetoothMic(get().pushToast);
+    const beats = get().countInBeats;
+    if (beats > 0) {
+      const ok = await runCountIn(beats, get().bpm, set);
+      if (!ok) return; // user cancelled
+    }
     const all = get().tracks;
     let targets = all.filter((t) => t.armed);
     // If the user hasn't armed anything, default to all empty tracks so
@@ -404,10 +494,18 @@ export const useCypher = create<CypherState>((set, get) => ({
       }));
     }
     if (targets.length > 0) {
-      await getEngine().startMultiRecording(
-        targets.map((t) => ({ trackId: t.id, deviceId: t.inputDeviceId })),
-      );
-      set({ isMultiRecording: true, isPlaying: true, recordingTrackId: null });
+      try {
+        await getEngine().startMultiRecording(
+          targets.map((t) => ({ trackId: t.id, deviceId: t.inputDeviceId })),
+        );
+        set({ isMultiRecording: true, isPlaying: true, recordingTrackId: null });
+      } catch (err) {
+        // Roll back any auto-arm we did so the user isn't stuck in an armed state.
+        set((s) => ({
+          tracks: s.tracks.map((t) => ({ ...t, armed: false })),
+        }));
+        get().pushToast(toastFromMicError(err));
+      }
     } else {
       // All tracks already have audio; just play.
       await getEngine().play();
@@ -416,8 +514,24 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   stopArmedRecording: async () => {
-    const results = await getEngine().stopMultiRecording();
+    let results = new Map<string, AudioBuffer | null>();
+    let errors = new Map<string, Error>();
+    try {
+      const out = await getEngine().stopMultiRecording();
+      results = out.results;
+      errors = out.errors;
+    } catch (err) {
+      get().pushToast(toastFromCaptureError(err));
+    }
     set({ isMultiRecording: false, isPlaying: false });
+    for (const [trackId, err] of errors) {
+      const t = get().tracks.find((x) => x.id === trackId);
+      const toast = toastFromCaptureError(err);
+      get().pushToast({
+        ...toast,
+        title: t ? `${t.name}: ${toast.title}` : toast.title,
+      });
+    }
     const updates = new Map<string, { audioKey: string; duration: number }>();
     for (const [trackId, buf] of results) {
       if (!buf) continue;
@@ -428,10 +542,16 @@ export const useCypher = create<CypherState>((set, get) => ({
       updates.set(trackId, { audioKey, duration: buf.duration });
     }
     if (updates.size > 0) {
+      const latencySec = get().latencyOffsetMs / 1000;
+      for (const [trackId, u] of updates) {
+        const trimIn = Math.max(0, Math.min(u.duration, latencySec));
+        getEngine().setTrim(trackId, trimIn, null);
+      }
       set((s) => ({
         tracks: s.tracks.map((t) => {
           const u = updates.get(t.id);
           if (!u) return t;
+          const trimIn = Math.max(0, Math.min(u.duration, latencySec));
           return {
             ...t,
             hasAudio: true,
@@ -439,7 +559,7 @@ export const useCypher = create<CypherState>((set, get) => ({
             durationSec: u.duration,
             bufferRevision: t.bufferRevision + 1,
             audioKey: u.audioKey,
-            trimInSec: 0,
+            trimInSec: trimIn,
             trimOutSec: null,
           };
         }),
@@ -450,13 +570,21 @@ export const useCypher = create<CypherState>((set, get) => ({
 
   stopRecording: async () => {
     const id = get().recordingTrackId;
-    const buf = await getEngine().stopRecording();
+    let buf: AudioBuffer | null = null;
+    try {
+      buf = await getEngine().stopRecording();
+    } catch (err) {
+      get().pushToast(toastFromCaptureError(err));
+    }
     set({ recordingTrackId: null });
     if (id && buf) {
       const prev = get().tracks.find((t) => t.id === id);
       if (prev?.audioKey) await deleteAudio(prev.audioKey);
       const audioKey = `audio:${get().currentProjectId}:${id}:${Date.now()}`;
       await saveAudio(audioKey, audioBufferToWavBlob(buf));
+      const latencySec = get().latencyOffsetMs / 1000;
+      const trimIn = Math.max(0, Math.min(buf.duration, latencySec));
+      getEngine().setTrim(id, trimIn, null);
       set((s) => ({
         tracks: s.tracks.map((t) =>
           t.id === id
@@ -467,7 +595,7 @@ export const useCypher = create<CypherState>((set, get) => ({
                 durationSec: buf.duration,
                 bufferRevision: t.bufferRevision + 1,
                 audioKey,
-                trimInSec: 0,
+                trimInSec: trimIn,
                 trimOutSec: null,
               }
             : t,
@@ -506,6 +634,8 @@ interface PersistInput {
   currentProjectName: string;
   tracks: TrackState[];
   bpm: number;
+  latencyOffsetMs: number;
+  countInBeats: number;
 }
 
 function buildPersisted(state: PersistInput): PersistedProject {
@@ -531,6 +661,8 @@ function buildPersisted(state: PersistInput): PersistedProject {
     })),
     createdAt: 0, // filled in by flush — preserves existing createdAt if present.
     updatedAt: Date.now(),
+    latencyOffsetMs: state.latencyOffsetMs,
+    countInBeats: state.countInBeats,
   };
 }
 
@@ -636,6 +768,8 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
     bpm: persisted.bpm,
     currentProjectId: id,
     currentProjectName: persisted.name,
+    latencyOffsetMs: persisted.latencyOffsetMs ?? 0,
+    countInBeats: persisted.countInBeats ?? 0,
     isPlaying: false,
     isMultiRecording: false,
     recordingTrackId: null,
@@ -681,8 +815,269 @@ async function switchToProject(
     currentProjectName: name,
     tracks,
     bpm: 120,
+    latencyOffsetMs: 0,
+    countInBeats: 0,
   });
   await flushPersist();
+}
+
+/**
+ * Plays a series of short clicks to the speaker and records the mic at the
+ * same time. Cross-correlates the recorded buffer against the expected
+ * click times to estimate the round-trip latency in milliseconds.
+ *
+ * Best-effort. Requires getUserMedia permission. Returns null if the click
+ * couldn't be detected (mic too quiet, headphones isolating the speaker, etc).
+ */
+async function measureLatency(deviceId: string): Promise<number | null> {
+  const ctx = new AudioContext({ latencyHint: "interactive" });
+  if (ctx.state === "suspended") {
+    try {
+      await ctx.resume();
+    } catch {
+      // ignore
+    }
+  }
+  const sampleRate = ctx.sampleRate;
+  const beatMs = 500;
+  const beats = 4;
+  const totalSec = (beats * beatMs) / 1000 + 0.5;
+  const totalSamples = Math.ceil(totalSec * sampleRate);
+
+  let stream: MediaStream | null = null;
+  let recorderSamples: Float32Array;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: deviceId === "default" ? undefined : { exact: deviceId },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    });
+    // Schedule N click bursts.
+    const clickTimes: number[] = [];
+    const startAt = ctx.currentTime + 0.2;
+    for (let i = 0; i < beats; i++) {
+      const at = startAt + i * (beatMs / 1000);
+      clickTimes.push(at);
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = 1000;
+      gain.gain.setValueAtTime(0, at);
+      gain.gain.linearRampToValueAtTime(1, at + 0.001);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.04);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(at);
+      osc.stop(at + 0.05);
+    }
+    recorderSamples = await captureViaMediaRecorder(stream, totalSec);
+    // Detect click peaks in recorded audio.
+    const sampleClickWindow = Math.floor(0.06 * sampleRate);
+    const peaks: number[] = [];
+    let i = 0;
+    const threshold = 0.1;
+    while (i < recorderSamples.length) {
+      const v = Math.abs(recorderSamples[i]);
+      if (v > threshold) {
+        // Find the local max in the next ~20 ms.
+        let bestIdx = i;
+        let bestVal = v;
+        const windowEnd = Math.min(
+          recorderSamples.length,
+          i + Math.floor(0.02 * sampleRate),
+        );
+        for (let j = i + 1; j < windowEnd; j++) {
+          if (Math.abs(recorderSamples[j]) > bestVal) {
+            bestVal = Math.abs(recorderSamples[j]);
+            bestIdx = j;
+          }
+        }
+        peaks.push(bestIdx / sampleRate);
+        i = bestIdx + sampleClickWindow;
+      } else {
+        i++;
+      }
+    }
+    if (peaks.length < 2) return null;
+    // Average the per-click delay (peak time minus click schedule time relative
+    // to when recording started — we assume recorder started ~0 s into the buffer).
+    let totalDelayMs = 0;
+    let count = 0;
+    for (let i = 0; i < Math.min(peaks.length, clickTimes.length); i++) {
+      const expected = clickTimes[i] - startAt; // 0, 0.5, 1.0, ...
+      const observed = peaks[i];
+      const delayMs = (observed - expected) * 1000;
+      if (delayMs > 0 && delayMs < 600) {
+        totalDelayMs += delayMs;
+        count++;
+      }
+    }
+    if (count === 0) return null;
+    return Math.round(totalDelayMs / count);
+  } catch (err) {
+    console.error("Latency calibration failed", err);
+    return null;
+  } finally {
+    stream?.getTracks().forEach((t) => t.stop());
+    try {
+      await ctx.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function captureViaMediaRecorder(
+  stream: MediaStream,
+  durationSec: number,
+): Promise<Float32Array> {
+  const types = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+    "audio/aac",
+  ];
+  const mime =
+    types.find((t) => MediaRecorder.isTypeSupported(t)) ?? "audio/webm";
+  const rec = new MediaRecorder(stream, { mimeType: mime });
+  const chunks: Blob[] = [];
+  rec.ondataavailable = (e) => {
+    if (e.data?.size > 0) chunks.push(e.data);
+  };
+  rec.start(50);
+  await new Promise((r) => setTimeout(r, durationSec * 1000));
+  await new Promise<void>((resolve) => {
+    rec.onstop = () => resolve();
+    rec.stop();
+  });
+  const blob = new Blob(chunks, { type: mime });
+  const ctx = new AudioContext();
+  const arr = await blob.arrayBuffer();
+  const buf = await ctx.decodeAudioData(arr);
+  await ctx.close();
+  return buf.getChannelData(0);
+}
+
+let countInCancelled = false;
+
+async function runCountIn(
+  beats: number,
+  bpm: number,
+  set: Setter,
+): Promise<boolean> {
+  const engine = getEngine();
+  await engine.start();
+  countInCancelled = false;
+  const beatMs = 60_000 / bpm;
+  for (let i = 0; i < beats; i++) {
+    if (countInCancelled) {
+      set({ countdownActive: false, countdownBeat: 0 });
+      return false;
+    }
+    set({ countdownActive: true, countdownBeat: i + 1 });
+    engine.tickClick(i % 4 === 0);
+    await new Promise((r) => setTimeout(r, beatMs));
+  }
+  set({ countdownActive: false, countdownBeat: 0 });
+  return true;
+}
+
+let bluetoothWarnShown = false;
+const BLUETOOTH_PATTERN = /(bluetooth|airpods|beats|earbuds|wireless|hands.?free|sony|bose|jbl)/i;
+
+async function maybeWarnAboutBluetoothMic(
+  pushToast: (t: Omit<Toast, "id">) => void,
+) {
+  if (bluetoothWarnShown) return;
+  try {
+    const outputs = await getEngine().listOutputDevices();
+    const inputs = await getEngine().listInputDevices();
+    const btOutput = outputs.find(
+      (d) => d.label && BLUETOOTH_PATTERN.test(d.label),
+    );
+    const btInput = inputs.find(
+      (d) => d.label && BLUETOOTH_PATTERN.test(d.label),
+    );
+    // If we see a Bluetooth output but no matching Bluetooth input,
+    // the headset is in A2DP-only mode — mic falls back to phone.
+    if (btOutput && !btInput) {
+      bluetoothWarnShown = true;
+      pushToast({
+        variant: "warn",
+        title: "Bluetooth headset detected",
+        message: `${btOutput.label} is your output, but iOS/Android won't expose its mic to web apps. Recording will use the phone's built-in mic. For clean overdubs, switch to wired headphones.`,
+        ttlMs: 12000,
+      });
+    }
+  } catch {
+    // enumerateDevices can throw before permission is granted; ignore.
+  }
+}
+
+function toastFromMicError(err: unknown): Omit<Toast, "id"> {
+  const name = err instanceof Error ? err.name : "Error";
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return {
+      variant: "error",
+      title: "Mic permission denied",
+      message:
+        "Cypher can't record without mic access. Open your browser settings → Site settings → Microphone, then reload.",
+      ttlMs: 12000,
+    };
+  }
+  if (name === "NotFoundError" || name === "OverconstrainedError") {
+    return {
+      variant: "error",
+      title: "Mic not found",
+      message:
+        "The selected mic isn't available. Pick a different one with the 🎤 button on the track.",
+      ttlMs: 10000,
+    };
+  }
+  if (name === "NotReadableError") {
+    return {
+      variant: "error",
+      title: "Mic is in use elsewhere",
+      message:
+        "Another app is holding the microphone. Close it (or another browser tab) and try again.",
+      ttlMs: 10000,
+    };
+  }
+  return {
+    variant: "error",
+    title: "Recording failed",
+    message: err instanceof Error ? err.message : "Unknown error",
+    ttlMs: 8000,
+  };
+}
+
+function toastFromCaptureError(err: unknown): Omit<Toast, "id"> {
+  const name = err instanceof Error ? err.name : "Error";
+  if (name === "EmptyRecordingError") {
+    return {
+      variant: "warn",
+      title: "No audio captured",
+      message:
+        "Nothing was recorded. Check the mic level and that the right input is selected.",
+      ttlMs: 8000,
+    };
+  }
+  if (name === "DecodeFailedError") {
+    return {
+      variant: "error",
+      title: "Recording could not be decoded",
+      message:
+        "The captured audio file was unreadable. This is rare on iOS with very short clips — try recording for at least a second.",
+      ttlMs: 10000,
+    };
+  }
+  return {
+    variant: "error",
+    title: "Recording failed",
+    message: err instanceof Error ? err.message : String(err),
+    ttlMs: 8000,
+  };
 }
 
 function applyMixState(tracks: TrackState[]) {
