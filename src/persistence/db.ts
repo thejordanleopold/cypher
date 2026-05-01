@@ -177,6 +177,16 @@ export async function setCurrentProjectId(id: string) {
   await db.put(META_STORE, id, "currentProjectId");
 }
 
+export async function getOutputDeviceId(): Promise<string | undefined> {
+  const db = await getDb();
+  return (await db.get(META_STORE, "outputDeviceId")) as string | undefined;
+}
+
+export async function setOutputDeviceId(id: string) {
+  const db = await getDb();
+  await db.put(META_STORE, id, "outputDeviceId");
+}
+
 // ---- Storage estimate ----
 
 export interface StorageEstimate {

@@ -24,6 +24,11 @@ export function MainMenu() {
     setLatencyOffsetMs,
     calibrateLatency,
     isCalibrating,
+    outputDevices,
+    currentOutputDeviceId,
+    outputSelectable,
+    refreshOutputDevices,
+    setOutputDevice,
   } = useCypher();
   const [open, setOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -36,8 +41,9 @@ export function MainMenu() {
   useEffect(() => {
     if (!open) return;
     refreshProjects();
+    refreshOutputDevices();
     estimateStorage().then(setStorage).catch(() => setStorage(null));
-  }, [open, refreshProjects]);
+  }, [open, refreshProjects, refreshOutputDevices]);
 
   useEffect(() => setDraftName(currentProjectName), [currentProjectName]);
 
@@ -209,6 +215,31 @@ export function MainMenu() {
               );
             })}
           </div>
+
+          {/* Output device */}
+          {outputSelectable && (
+            <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">
+              <Section label="Audio output" />
+              <select
+                value={currentOutputDeviceId}
+                onChange={(e) => setOutputDevice(e.target.value)}
+                aria-label="Audio output device"
+                className="w-full h-9 bg-neutral-800 border border-neutral-700 rounded-md px-2 text-sm text-neutral-100"
+              >
+                <option value="default">System default</option>
+                {outputDevices
+                  .filter((d) => d.deviceId !== "default" && d.deviceId !== "")
+                  .map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label || `Output ${d.deviceId.slice(0, 6)}`}
+                    </option>
+                  ))}
+              </select>
+              <p className="text-[10px] text-neutral-500 leading-snug">
+                Routes playback to a specific speaker or headphones. iOS uses your system audio route and won't show options here.
+              </p>
+            </div>
+          )}
 
           {/* Latency calibration */}
           <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">

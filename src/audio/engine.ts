@@ -321,6 +321,35 @@ class AudioEngine {
     return all.filter((d) => d.kind === "audiooutput");
   }
 
+  isOutputSelectionSupported(): boolean {
+    if (typeof AudioContext === "undefined") return false;
+    return (
+      typeof (
+        AudioContext.prototype as unknown as { setSinkId?: unknown }
+      ).setSinkId === "function"
+    );
+  }
+
+  async setOutputDevice(deviceId: string): Promise<void> {
+    await this.start();
+    const ctx = this.nativeCtx as AudioContext & {
+      setSinkId?: (id: string) => Promise<void>;
+    };
+    if (typeof ctx.setSinkId !== "function") {
+      throw new Error("Output device selection is not supported in this browser");
+    }
+    await ctx.setSinkId(deviceId === "default" ? "" : deviceId);
+  }
+
+  getOutputDeviceId(): string {
+    const ctx = this.nativeCtx as
+      | (AudioContext & { sinkId?: string })
+      | null;
+    if (!ctx) return "default";
+    const id = ctx.sinkId;
+    return !id || id === "" ? "default" : id;
+  }
+
   async requestMicPermission(): Promise<void> {
     // Triggers the OS prompt so subsequent enumerateDevices() returns labels.
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });

@@ -14,6 +14,8 @@ import {
   duplicateProject,
   getCurrentProjectId,
   setCurrentProjectId,
+  getOutputDeviceId,
+  setOutputDeviceId,
   type PersistedProject,
   type PersistedTrack,
   type ProjectSummary,
@@ -87,6 +89,12 @@ interface CypherState {
   setInputDevice: (id: string, deviceId: string) => void;
   inputDevices: MediaDeviceInfo[];
   refreshInputDevices: () => Promise<void>;
+
+  outputDevices: MediaDeviceInfo[];
+  currentOutputDeviceId: string;
+  outputSelectable: boolean;
+  refreshOutputDevices: () => Promise<void>;
+  setOutputDevice: (deviceId: string) => Promise<void>;
   play: () => Promise<void>;
   pause: () => void;
   stop: () => void;
@@ -135,6 +143,9 @@ export const useCypher = create<CypherState>((set, get) => ({
   recordingTrackId: null,
   exportProgress: null,
   inputDevices: [],
+  outputDevices: [],
+  currentOutputDeviceId: "default",
+  outputSelectable: false,
   isMultiRecording: false,
   currentProjectId: DEFAULT_PROJECT_ID,
   currentProjectName: "Untitled",
@@ -203,6 +214,24 @@ export const useCypher = create<CypherState>((set, get) => ({
       const savedId = (await getCurrentProjectId()) ?? DEFAULT_PROJECT_ID;
       await loadProjectIntoEngine(savedId, set);
       await get().refreshProjects();
+      // Restore the previously chosen output device, if any. Best-effort:
+      // a device id from a previous session may no longer be present (USB
+      // unplugged, headphones gone), in which case setSinkId fails and we
+      // silently fall back to the system default.
+      const savedOutput = await getOutputDeviceId();
+      if (savedOutput && getEngine().isOutputSelectionSupported()) {
+        try {
+          await getEngine().setOutputDevice(savedOutput);
+          set({
+            currentOutputDeviceId: savedOutput,
+            outputSelectable: true,
+          });
+        } catch {
+          // ignore; fall back to default
+        }
+      } else {
+        set({ outputSelectable: getEngine().isOutputSelectionSupported() });
+      }
       initialized = true;
     })();
     try {
@@ -360,6 +389,36 @@ export const useCypher = create<CypherState>((set, get) => ({
       }
     }
     set({ inputDevices: devices });
+  },
+
+  refreshOutputDevices: async () => {
+    const engine = getEngine();
+    const supported = engine.isOutputSelectionSupported();
+    if (!supported) {
+      set({ outputSelectable: false, outputDevices: [] });
+      return;
+    }
+    const devices = await engine.listOutputDevices();
+    set({
+      outputSelectable: true,
+      outputDevices: devices,
+      currentOutputDeviceId: engine.getOutputDeviceId(),
+    });
+  },
+
+  setOutputDevice: async (deviceId) => {
+    try {
+      await getEngine().setOutputDevice(deviceId);
+      await setOutputDeviceId(deviceId);
+      set({ currentOutputDeviceId: deviceId });
+    } catch (err) {
+      get().pushToast({
+        variant: "error",
+        title: "Couldn't switch output",
+        message:
+          err instanceof Error ? err.message : "Output selection failed",
+      });
+    }
   },
 
   setTrim: (id, inSec, outSec) => {
