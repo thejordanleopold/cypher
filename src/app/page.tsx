@@ -22,7 +22,9 @@ export default function Home() {
     <main className="flex-1 flex flex-col bg-neutral-950 text-neutral-100 min-h-[100dvh]">
       <header className="px-3 sm:px-4 pt-[max(env(safe-area-inset-top),0.75rem)] pb-2 shrink-0 flex items-center gap-2">
         <div className="flex items-baseline gap-2 min-w-0 flex-1">
-          <h1 className="text-lg font-semibold tracking-tight">Cypher</h1>
+          <h1 className="font-[family-name:var(--font-bebas)] text-2xl tracking-[0.08em] leading-none">
+            CYPHER
+          </h1>
           <span aria-hidden="true" className="text-neutral-700">/</span>
           <p className="text-sm text-neutral-400 truncate min-w-0">
             {projectName}
