@@ -9,7 +9,6 @@ import { MainMenu } from "@/components/MainMenu";
 
 export default function Home() {
   const tracks = useCypher((s) => s.tracks);
-  const isLoaded = useCypher((s) => s.isLoaded);
   const projectName = useCypher((s) => s.currentProjectName);
   const initProject = useCypher((s) => s.initProject);
   const addTrack = useCypher((s) => s.addTrack);
@@ -38,23 +37,16 @@ export default function Home() {
         {tracks.map((t) => (
           <TrackRow key={t.id} track={t} />
         ))}
-        {tracks.length === 0 && !isLoaded && (
-          <div className="p-8 text-center text-neutral-500 text-sm">
-            Loading project…
-          </div>
-        )}
-        {isLoaded && (
-          <button
-            onClick={() => addTrack()}
-            className="block w-full rounded-lg border border-neutral-800 bg-neutral-900/40 hover:bg-neutral-900 hover:border-neutral-700 text-neutral-400 hover:text-neutral-100 px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
-            aria-label="Add new track"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-            {tracks.length === 0 ? "Add your first track" : "Add track"}
-          </button>
-        )}
+        <button
+          onClick={() => addTrack()}
+          className="block w-full rounded-lg border border-neutral-800 bg-neutral-900/40 hover:bg-neutral-900 hover:border-neutral-700 text-neutral-400 hover:text-neutral-100 px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+          aria-label="Add new track"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          {tracks.length === 0 ? "Add your first track" : "Add track"}
+        </button>
       </div>
     </main>
   );
