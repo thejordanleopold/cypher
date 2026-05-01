@@ -1,12 +1,20 @@
 // Minimal service worker: cache the app shell so Cypher works offline after first load.
 // User audio is NOT cached — it lives in IndexedDB.
 
-const CACHE = "cypher-shell-v1";
-const SHELL = ["/", "/manifest.webmanifest", "/worklets/recorder-worklet.js"];
+const CACHE = "cypher-shell-v2";
+// Paths resolve relative to the worker's scope, which Next.js sets to the
+// basePath under which the page was served (e.g. /cypher/ on GitHub Pages,
+// / locally).
+function shellUrls() {
+  const scope =
+    (self.registration && self.registration.scope) || self.location.origin + "/";
+  const base = scope.endsWith("/") ? scope : scope + "/";
+  return [base, base + "manifest.webmanifest"];
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(SHELL)).catch(() => {}),
+    caches.open(CACHE).then((cache) => cache.addAll(shellUrls())).catch(() => {}),
   );
   self.skipWaiting();
 });

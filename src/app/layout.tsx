@@ -14,21 +14,23 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+
 export const metadata: Metadata = {
   title: "Cypher",
   description: "A pocket DAW for sketching musical ideas.",
   applicationName: "Cypher",
-  manifest: "/manifest.webmanifest",
+  manifest: `${BASE}/manifest.webmanifest`,
   appleWebApp: {
     capable: true,
     title: "Cypher",
     statusBarStyle: "black-translucent",
   },
   icons: {
-    apple: "/icon-192.png",
+    apple: `${BASE}/icon-192.png`,
     icon: [
-      { url: "/icon-192.png", sizes: "192x192" },
-      { url: "/icon-512.png", sizes: "512x512" },
+      { url: `${BASE}/icon-192.png`, sizes: "192x192" },
+      { url: `${BASE}/icon-512.png`, sizes: "512x512" },
     ],
   },
 };
