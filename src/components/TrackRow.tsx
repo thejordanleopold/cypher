@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { useCypher, type TrackState } from "@/state/store";
+import { useCypher, MAX_INPUT_GAIN, type TrackState } from "@/state/store";
 import { Waveform } from "@/components/Waveform";
 import { LiveWaveform } from "@/components/LiveWaveform";
 import { InputPicker } from "@/components/InputPicker";
@@ -12,6 +12,7 @@ export function TrackRow({ track }: { track: TrackState }) {
     importFile,
     setVolume,
     setPan,
+    setInputGain,
     toggleMute,
     toggleSolo,
     toggleArm,
@@ -138,6 +139,17 @@ export function TrackRow({ track }: { track: TrackState }) {
                 }}
               />
             </div>
+
+            <SliderRow
+              label="Mic gain"
+              short="G"
+              value={track.inputGain}
+              min={0}
+              max={MAX_INPUT_GAIN}
+              step={0.1}
+              onChange={(v) => setInputGain(track.id, v)}
+              formatValue={(v) => `${v.toFixed(1)}×`}
+            />
 
             <div className="grid grid-cols-2 gap-3">
               <SliderRow

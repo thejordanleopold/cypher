@@ -54,8 +54,12 @@ export interface TrackState {
   trimInSec: number;
   trimOutSec: number | null;
   inputDeviceId: string;
+  inputGain: number;
   armed: boolean;
 }
+
+export const DEFAULT_INPUT_GAIN = 2;
+export const MAX_INPUT_GAIN = 6;
 
 interface CypherState {
   tracks: TrackState[];
@@ -89,6 +93,7 @@ interface CypherState {
   toggleSolo: (id: string) => void;
   setTrim: (id: string, inSec: number, outSec: number | null) => void;
   setInputDevice: (id: string, deviceId: string) => void;
+  setInputGain: (id: string, gain: number) => void;
   inputDevices: MediaDeviceInfo[];
   refreshInputDevices: () => Promise<void>;
   defaultInputDeviceId: string;
@@ -385,6 +390,17 @@ export const useCypher = create<CypherState>((set, get) => ({
     schedulePersist(get());
   },
 
+  setInputGain: (id, gain) => {
+    const clamped = Math.max(0, Math.min(MAX_INPUT_GAIN, gain));
+    getEngine().setRecordingInputGain(id, clamped);
+    set((s) => ({
+      tracks: s.tracks.map((t) =>
+        t.id === id ? { ...t, inputGain: clamped } : t,
+      ),
+    }));
+    schedulePersist(get());
+  },
+
   setDefaultInputDevice: async (deviceId) => {
     await setDefaultInputDeviceId(deviceId);
     set((s) => ({
@@ -496,7 +512,11 @@ export const useCypher = create<CypherState>((set, get) => ({
     await maybeWarnAboutBluetoothMic(get().pushToast);
     const t = get().tracks.find((x) => x.id === trackId);
     try {
-      await getEngine().startRecording(trackId, t?.inputDeviceId);
+      await getEngine().startRecording(
+        trackId,
+        t?.inputDeviceId,
+        t?.inputGain ?? DEFAULT_INPUT_GAIN,
+      );
       set({ recordingTrackId: trackId, isMultiRecording: false });
     } catch (err) {
       get().pushToast(toastFromMicError(err));
@@ -573,7 +593,11 @@ export const useCypher = create<CypherState>((set, get) => ({
     if (targets.length > 0) {
       try {
         await getEngine().startMultiRecording(
-          targets.map((t) => ({ trackId: t.id, deviceId: t.inputDeviceId })),
+          targets.map((t) => ({
+            trackId: t.id,
+            deviceId: t.inputDeviceId,
+            inputGain: t.inputGain,
+          })),
         );
         set({ isMultiRecording: true, isPlaying: true, recordingTrackId: null });
       } catch (err) {
@@ -699,6 +723,7 @@ function emptyTrack(id: string, name: string): TrackState {
     trimInSec: 0,
     trimOutSec: null,
     inputDeviceId: "default",
+    inputGain: DEFAULT_INPUT_GAIN,
     armed: false,
   };
 }
@@ -734,6 +759,7 @@ function buildPersisted(state: PersistInput): PersistedProject {
       trimInSec: t.trimInSec,
       trimOutSec: t.trimOutSec,
       inputDeviceId: t.inputDeviceId,
+      inputGain: t.inputGain,
       armed: t.armed,
     })),
     createdAt: 0, // filled in by flush — preserves existing createdAt if present.
@@ -836,6 +862,7 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
       trimInSec: pt.trimInSec ?? 0,
       trimOutSec: pt.trimOutSec ?? null,
       inputDeviceId: pt.inputDeviceId ?? "default",
+      inputGain: pt.inputGain ?? DEFAULT_INPUT_GAIN,
       armed: pt.armed ?? false,
     });
   }
