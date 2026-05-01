@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useCypher } from "@/state/store";
+import { getEngine } from "@/audio/engine";
 
 interface Props {
   trackId: string;
@@ -16,19 +17,12 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
     setInputDevice,
   } = useCypher();
   const [open, setOpen] = useState(false);
+  const [rescanning, setRescanning] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     refreshInputDevices();
   }, [open, refreshInputDevices]);
-
-  useEffect(() => {
-    const handler = () => {
-      if (useCypher.getState().inputDevices.length > 0) refreshInputDevices();
-    };
-    navigator.mediaDevices?.addEventListener?.("devicechange", handler);
-    return () => navigator.mediaDevices?.removeEventListener?.("devicechange", handler);
-  }, [refreshInputDevices]);
 
   const selected =
     inputDevices.find((d) => d.deviceId === selectedDeviceId) ?? null;
@@ -36,6 +30,23 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
     selectedDeviceId === "default"
       ? "Default mic"
       : selected?.label || "Selected mic";
+
+  async function rescan() {
+    setRescanning(true);
+    try {
+      // Forcing a permission prompt is the only way to get labeled devices
+      // to appear when the user has granted "while using" permission and
+      // then plugged in AirPods or wired headphones.
+      try {
+        await getEngine().requestMicPermission();
+      } catch {
+        // user denied — still try to enumerate so we show what we can
+      }
+      await refreshInputDevices();
+    } finally {
+      setRescanning(false);
+    }
+  }
 
   return (
     <div className="relative w-full">
@@ -56,7 +67,7 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
       {open && (
         <div
           role="listbox"
-          className="absolute left-0 right-0 top-full mt-1 z-30 max-h-72 overflow-auto bg-neutral-900 border border-neutral-700 rounded-md shadow-xl"
+          className="absolute left-0 right-0 top-full mt-1 z-30 max-h-80 overflow-auto bg-neutral-900 border border-neutral-700 rounded-md shadow-xl"
         >
           <DeviceOption
             label="Default mic (system)"
@@ -66,22 +77,31 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
               setOpen(false);
             }}
           />
-          {inputDevices.length === 0 && (
-            <div className="px-3 py-2 text-xs text-neutral-500">
-              Tap to grant mic permission, then reopen.
-            </div>
-          )}
-          {inputDevices.map((d) => (
-            <DeviceOption
-              key={d.deviceId}
-              label={d.label || `Mic ${d.deviceId.slice(0, 6)}`}
-              selected={selectedDeviceId === d.deviceId}
-              onPick={() => {
-                setInputDevice(trackId, d.deviceId);
-                setOpen(false);
-              }}
-            />
-          ))}
+          {inputDevices
+            .filter((d) => d.deviceId !== "default" && d.deviceId !== "")
+            .map((d) => (
+              <DeviceOption
+                key={d.deviceId}
+                label={d.label || `Mic ${d.deviceId.slice(0, 6)}`}
+                selected={selectedDeviceId === d.deviceId}
+                onPick={() => {
+                  setInputDevice(trackId, d.deviceId);
+                  setOpen(false);
+                }}
+              />
+            ))}
+          <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">
+            <button
+              onClick={rescan}
+              disabled={rescanning}
+              className="w-full h-8 rounded-md bg-neutral-800 hover:bg-neutral-700 text-neutral-100 text-xs font-medium active:scale-[0.98] disabled:opacity-50"
+            >
+              {rescanning ? "Scanning…" : "Rescan devices"}
+            </button>
+            <p className="text-[10px] text-neutral-500 leading-snug">
+              Wired headsets and USB mics show up here. Bluetooth like AirPods may not — iOS keeps that mic for phone calls only. To stop the speaker bleeding into the mic, plug in wired headphones.
+            </p>
+          </div>
         </div>
       )}
     </div>

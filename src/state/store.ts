@@ -244,6 +244,17 @@ export const useCypher = create<CypherState>((set, get) => ({
       }
       const savedInput = await getDefaultInputDeviceId();
       if (savedInput) set({ defaultInputDeviceId: savedInput });
+      // Hot-plugging headphones / AirPods should make them show up in the
+      // mic picker without the user having to reopen anything.
+      if (
+        typeof navigator !== "undefined" &&
+        navigator.mediaDevices?.addEventListener
+      ) {
+        navigator.mediaDevices.addEventListener("devicechange", () => {
+          useCypher.getState().refreshInputDevices();
+          useCypher.getState().refreshOutputDevices();
+        });
+      }
       initialized = true;
     })();
     try {
