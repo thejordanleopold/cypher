@@ -20,6 +20,7 @@ export interface PersistedTrack {
   trimInSec: number;
   trimOutSec: number | null;
   inputDeviceId?: string;
+  inputGain?: number;
   armed?: boolean;
 }
 

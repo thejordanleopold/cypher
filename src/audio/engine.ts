@@ -21,12 +21,32 @@ interface RecordingSession {
   trackId: TrackId;
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
+  inputGain: GainNode;
+  limiter: DynamicsCompressorNode;
   analyser: AnalyserNode;
-  sink: GainNode;
+  streamDest: MediaStreamAudioDestinationNode;
   recorder: MediaRecorder;
   chunks: Blob[];
   mimeType: string;
   startedAt: number;
+}
+
+const DEFAULT_RECORDER_BITRATE = 192_000;
+
+function disconnectSessionNodes(session: RecordingSession) {
+  for (const node of [
+    session.analyser,
+    session.limiter,
+    session.inputGain,
+    session.streamDest,
+    session.source,
+  ]) {
+    try {
+      node.disconnect();
+    } catch {
+      // ignore
+    }
+  }
 }
 
 function pickRecorderMimeType(): string {
@@ -359,6 +379,7 @@ class AudioEngine {
   private async openRecordingSession(
     trackId: TrackId,
     deviceId?: string,
+    gainValue = 1,
   ): Promise<RecordingSession> {
     await this.start();
     const track = this.tracks.get(trackId);
@@ -366,10 +387,15 @@ class AudioEngine {
     if (typeof MediaRecorder === "undefined") {
       throw new Error("MediaRecorder is not supported in this browser");
     }
+    // Browser AGC tends to chase the backing track and pump the noise floor,
+    // so we leave it off and apply our own gain + soft limiter below. We
+    // also disable echoCancellation/noiseSuppression because they add
+    // latency and color the signal — fine for VOIP, bad for music.
     const audioConstraints: MediaTrackConstraints = {
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
+      channelCount: 1,
     };
     if (deviceId && deviceId !== "default") {
       audioConstraints.deviceId = { exact: deviceId };
@@ -380,21 +406,31 @@ class AudioEngine {
 
     const ctx = this.context();
     const source = ctx.createMediaStreamSource(stream);
+    const inputGain = ctx.createGain();
+    inputGain.gain.value = Math.max(0, gainValue);
+    // Soft brickwall: catches the peaks that the boosted gain would
+    // otherwise clip, without audibly squashing the signal.
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -1;
+    limiter.knee.value = 6;
+    limiter.ratio.value = 12;
+    limiter.attack.value = 0.003;
+    limiter.release.value = 0.1;
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0;
-    // Force the analyser to be pulled by the audio graph so it actually
-    // updates its time-domain buffer (used by the live waveform).
-    const sink = ctx.createGain();
-    sink.gain.value = 0;
-    sink.connect(ctx.destination);
-    source.connect(analyser);
-    analyser.connect(sink);
+    const streamDest = ctx.createMediaStreamDestination();
+    source.connect(inputGain);
+    inputGain.connect(limiter);
+    limiter.connect(analyser);
+    analyser.connect(streamDest);
 
     const mimeType = pickRecorderMimeType();
-    const recorder = mimeType
-      ? new MediaRecorder(stream, { mimeType })
-      : new MediaRecorder(stream);
+    const options: MediaRecorderOptions = {
+      audioBitsPerSecond: DEFAULT_RECORDER_BITRATE,
+    };
+    if (mimeType) options.mimeType = mimeType;
+    const recorder = new MediaRecorder(streamDest.stream, options);
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) chunks.push(e.data);
@@ -404,8 +440,10 @@ class AudioEngine {
       trackId,
       stream,
       source,
+      inputGain,
+      limiter,
       analyser,
-      sink,
+      streamDest,
       recorder,
       chunks,
       mimeType: recorder.mimeType || mimeType || "audio/webm",
@@ -430,21 +468,7 @@ class AudioEngine {
         }
       });
     }
-    try {
-      session.analyser.disconnect();
-    } catch {
-      // ignore
-    }
-    try {
-      session.sink.disconnect();
-    } catch {
-      // ignore
-    }
-    try {
-      session.source.disconnect();
-    } catch {
-      // ignore
-    }
+    disconnectSessionNodes(session);
     session.stream.getTracks().forEach((t) => t.stop());
 
     if (session.chunks.length === 0) {
@@ -492,13 +516,7 @@ class AudioEngine {
       } catch {
         // ignore
       }
-      try {
-        s.analyser.disconnect();
-        s.sink.disconnect();
-        s.source.disconnect();
-      } catch {
-        // ignore
-      }
+      disconnectSessionNodes(s);
       s.stream.getTracks().forEach((t) => {
         try {
           t.stop();
@@ -509,32 +527,36 @@ class AudioEngine {
     }
   }
 
-  async startRecording(trackId: TrackId, deviceId?: string): Promise<void> {
+  async startRecording(
+    trackId: TrackId,
+    deviceId?: string,
+    inputGain = 1,
+  ): Promise<void> {
     this.abortAllRecording();
-    const session = await this.openRecordingSession(trackId, deviceId);
+    const session = await this.openRecordingSession(
+      trackId,
+      deviceId,
+      inputGain,
+    );
     this.recording = session;
     this.startSession(session);
   }
 
   async startMultiRecording(
-    requests: Array<{ trackId: TrackId; deviceId?: string }>,
+    requests: Array<{ trackId: TrackId; deviceId?: string; inputGain?: number }>,
   ): Promise<void> {
     this.abortAllRecording();
     if (requests.length === 0) return;
     const sessions: RecordingSession[] = [];
     try {
       for (const r of requests) {
-        sessions.push(await this.openRecordingSession(r.trackId, r.deviceId));
+        sessions.push(
+          await this.openRecordingSession(r.trackId, r.deviceId, r.inputGain ?? 1),
+        );
       }
     } catch (err) {
       for (const s of sessions) {
-        try {
-          s.analyser.disconnect();
-          s.sink.disconnect();
-          s.source.disconnect();
-        } catch {
-          // ignore
-        }
+        disconnectSessionNodes(s);
         s.stream.getTracks().forEach((t) => t.stop());
       }
       throw err;
@@ -574,6 +596,19 @@ class AudioEngine {
   getRecordingAnalyser(trackId: TrackId): AnalyserNode | null {
     if (this.recording?.trackId === trackId) return this.recording.analyser;
     return this.multiRecording.get(trackId)?.analyser ?? null;
+  }
+
+  setRecordingInputGain(trackId: TrackId, value: number) {
+    const session =
+      this.recording?.trackId === trackId
+        ? this.recording
+        : this.multiRecording.get(trackId);
+    if (!session) return;
+    session.inputGain.gain.setTargetAtTime(
+      Math.max(0, value),
+      session.inputGain.context.currentTime,
+      0.01,
+    );
   }
 
   async stopRecording(): Promise<AudioBuffer | null> {

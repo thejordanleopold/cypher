@@ -6,6 +6,7 @@ import { Transport } from "@/components/Transport";
 import { Timeline } from "@/components/Timeline";
 import { TrackRow } from "@/components/TrackRow";
 import { MainMenu } from "@/components/MainMenu";
+import { RecordingShield } from "@/components/RecordingShield";
 
 export default function Home() {
   const tracks = useCypher((s) => s.tracks);
@@ -48,6 +49,7 @@ export default function Home() {
           {tracks.length === 0 ? "Add your first track" : "Add track"}
         </button>
       </div>
+      <RecordingShield />
     </main>
   );
 }
