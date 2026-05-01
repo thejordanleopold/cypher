@@ -187,6 +187,18 @@ export async function setOutputDeviceId(id: string) {
   await db.put(META_STORE, id, "outputDeviceId");
 }
 
+export async function getDefaultInputDeviceId(): Promise<string | undefined> {
+  const db = await getDb();
+  return (await db.get(META_STORE, "defaultInputDeviceId")) as
+    | string
+    | undefined;
+}
+
+export async function setDefaultInputDeviceId(id: string) {
+  const db = await getDb();
+  await db.put(META_STORE, id, "defaultInputDeviceId");
+}
+
 // ---- Storage estimate ----
 
 export interface StorageEstimate {
