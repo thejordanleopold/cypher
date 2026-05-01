@@ -3,6 +3,7 @@ import { Geist, Geist_Mono, Bebas_Neue } from "next/font/google";
 import "./globals.css";
 import { SwRegister } from "@/components/SwRegister";
 import { VisibilityHandler } from "@/components/VisibilityHandler";
+import { WakeLockHandler } from "@/components/WakeLockHandler";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -61,6 +62,7 @@ export default function RootLayout({
       <body className="min-h-full flex flex-col">
         <SwRegister />
         <VisibilityHandler />
+        <WakeLockHandler />
         {children}
       </body>
     </html>
