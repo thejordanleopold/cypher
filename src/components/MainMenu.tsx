@@ -29,6 +29,10 @@ export function MainMenu() {
     outputSelectable,
     refreshOutputDevices,
     setOutputDevice,
+    inputDevices,
+    defaultInputDeviceId,
+    refreshInputDevices,
+    setDefaultInputDevice,
   } = useCypher();
   const [open, setOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -42,8 +46,9 @@ export function MainMenu() {
     if (!open) return;
     refreshProjects();
     refreshOutputDevices();
+    refreshInputDevices();
     estimateStorage().then(setStorage).catch(() => setStorage(null));
-  }, [open, refreshProjects, refreshOutputDevices]);
+  }, [open, refreshProjects, refreshOutputDevices, refreshInputDevices]);
 
   useEffect(() => setDraftName(currentProjectName), [currentProjectName]);
 
@@ -214,6 +219,30 @@ export function MainMenu() {
                 </button>
               );
             })}
+          </div>
+
+          {/* Input device */}
+          <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">
+            <Section label="Audio input" />
+            <select
+              value={defaultInputDeviceId}
+              onChange={(e) => setDefaultInputDevice(e.target.value)}
+              aria-label="Default audio input device"
+              className="w-full h-9 bg-neutral-800 border border-neutral-700 rounded-md px-2 text-sm text-neutral-100"
+            >
+              <option value="default">System default mic</option>
+              {inputDevices
+                .filter((d) => d.deviceId !== "default" && d.deviceId !== "")
+                .map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `Mic ${d.deviceId.slice(0, 6)}`}
+                  </option>
+                ))}
+            </select>
+            <p className="text-[10px] text-neutral-500 leading-snug">
+              Default mic for recording. Applies to all tracks; you can still override per track.
+              {inputDevices.length === 0 && " Tap the list, grant mic access, then reopen to see device names."}
+            </p>
           </div>
 
           {/* Output device */}

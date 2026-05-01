@@ -16,6 +16,8 @@ import {
   setCurrentProjectId,
   getOutputDeviceId,
   setOutputDeviceId,
+  getDefaultInputDeviceId,
+  setDefaultInputDeviceId,
   type PersistedProject,
   type PersistedTrack,
   type ProjectSummary,
@@ -89,6 +91,8 @@ interface CypherState {
   setInputDevice: (id: string, deviceId: string) => void;
   inputDevices: MediaDeviceInfo[];
   refreshInputDevices: () => Promise<void>;
+  defaultInputDeviceId: string;
+  setDefaultInputDevice: (deviceId: string) => Promise<void>;
 
   outputDevices: MediaDeviceInfo[];
   currentOutputDeviceId: string;
@@ -143,6 +147,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   recordingTrackId: null,
   exportProgress: null,
   inputDevices: [],
+  defaultInputDeviceId: "default",
   outputDevices: [],
   currentOutputDeviceId: "default",
   outputSelectable: false,
@@ -232,6 +237,8 @@ export const useCypher = create<CypherState>((set, get) => ({
       } else {
         set({ outputSelectable: getEngine().isOutputSelectionSupported() });
       }
+      const savedInput = await getDefaultInputDeviceId();
+      if (savedInput) set({ defaultInputDeviceId: savedInput });
       initialized = true;
     })();
     try {
@@ -303,7 +310,9 @@ export const useCypher = create<CypherState>((set, get) => ({
     const id = nextId();
     const name = `Track ${get().tracks.length + 1}`;
     await getEngine().addTrack(id, name);
-    set((s) => ({ tracks: [...s.tracks, emptyTrack(id, name)] }));
+    const t = emptyTrack(id, name);
+    t.inputDeviceId = get().defaultInputDeviceId;
+    set((s) => ({ tracks: [...s.tracks, t] }));
     schedulePersist(get());
   },
 
@@ -372,6 +381,15 @@ export const useCypher = create<CypherState>((set, get) => ({
       tracks: s.tracks.map((t) =>
         t.id === id ? { ...t, inputDeviceId: deviceId } : t,
       ),
+    }));
+    schedulePersist(get());
+  },
+
+  setDefaultInputDevice: async (deviceId) => {
+    await setDefaultInputDeviceId(deviceId);
+    set((s) => ({
+      defaultInputDeviceId: deviceId,
+      tracks: s.tracks.map((t) => ({ ...t, inputDeviceId: deviceId })),
     }));
     schedulePersist(get());
   },
