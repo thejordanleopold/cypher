@@ -46,13 +46,13 @@ export default function Home() {
         {isLoaded && (
           <button
             onClick={() => addTrack()}
-            className="block w-full rounded-lg border border-dashed border-neutral-700 hover:border-emerald-500/70 hover:text-emerald-400 text-neutral-400 px-4 py-5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+            className="block w-full rounded-lg border border-neutral-800 bg-neutral-900/40 hover:bg-neutral-900 hover:border-neutral-700 text-neutral-400 hover:text-neutral-100 px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
             aria-label="Add new track"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
               <path d="M12 5v14M5 12h14" />
             </svg>
-            {tracks.length === 0 ? "Add your first track" : "Add another track"}
+            {tracks.length === 0 ? "Add your first track" : "Add track"}
           </button>
         )}
       </div>

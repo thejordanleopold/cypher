@@ -10,7 +10,6 @@ export function Transport() {
     stop,
     bpm,
     setBpm,
-    addTrack,
     metronomeOn,
     toggleMetronome,
     isMultiRecording,
@@ -97,16 +96,6 @@ export function Transport() {
               }`}
             />
           )}
-        </button>
-
-        <div className="w-px h-7 bg-neutral-800 mx-1 shrink-0" aria-hidden="true" />
-
-        <button
-          onClick={() => addTrack()}
-          className="h-9 px-2.5 rounded-md bg-neutral-800 text-neutral-100 text-xs font-medium active:scale-95 shrink-0"
-          aria-label="Add track"
-        >
-          + Track
         </button>
 
         <div className="flex-1" />
