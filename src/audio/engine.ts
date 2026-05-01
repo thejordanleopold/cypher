@@ -28,9 +28,10 @@ interface RecordingSession {
   chunks: Blob[];
   mimeType: string;
   startedAt: number;
+  capturedSampleRate: number;
 }
 
-const DEFAULT_RECORDER_BITRATE = 192_000;
+const DEFAULT_RECORDER_BITRATE = 256_000;
 // Decode recordings into a 48 kHz buffer so the saved WAV preserves the
 // mic's full bandwidth even on iOS Safari, where the live AudioContext
 // is often clamped to 24 kHz when the speaker route is active.
@@ -67,17 +68,26 @@ function applyInputGain(buf: AudioBuffer, gain: number): AudioBuffer {
   return buf;
 }
 
-async function decodeRecording(arr: ArrayBuffer): Promise<AudioBuffer> {
+async function decodeRecording(
+  arr: ArrayBuffer,
+  hintRate: number,
+): Promise<AudioBuffer> {
+  // Decode at the source rate when known so we don't bloat the WAV with
+  // empty resampled headroom. Clamp to OfflineAudioContext's valid range.
+  const targetRate = Math.max(
+    8_000,
+    Math.min(96_000, Math.round(hintRate) || DECODE_SAMPLE_RATE),
+  );
   if (typeof OfflineAudioContext !== "undefined") {
     try {
-      const oac = new OfflineAudioContext(1, 1, DECODE_SAMPLE_RATE);
+      const oac = new OfflineAudioContext(1, 1, targetRate);
       return await oac.decodeAudioData(arr.slice(0));
     } catch {
       // Some browsers refuse decodeAudioData on OfflineAudioContext;
       // fall through to a real context.
     }
   }
-  const ctx = new AudioContext({ sampleRate: DECODE_SAMPLE_RATE });
+  const ctx = new AudioContext({ sampleRate: targetRate });
   try {
     return await ctx.decodeAudioData(arr.slice(0));
   } finally {
@@ -429,14 +439,16 @@ class AudioEngine {
     }
     // Disable browser DSP — AGC chases the backing track and pumps the
     // noise floor, while echoCancellation/noiseSuppression add latency
-    // and color the signal. Fine for VOIP, bad for music.
+    // and color the signal. Fine for VOIP, bad for music. Sample rate
+    // and channel count are expressed as `ideal` so devices that can't
+    // hit 48 kHz (Bluetooth HFP mics top out at 16 kHz) still produce
+    // a stream instead of NotReadableError.
     const audioConstraints: MediaTrackConstraints = {
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
-      channelCount: 1,
-      sampleRate: 48_000,
-      sampleSize: 16,
+      sampleRate: { ideal: 48_000 },
+      channelCount: { ideal: 2 },
     };
     if (deviceId && deviceId !== "default") {
       audioConstraints.deviceId = { exact: deviceId };
@@ -444,6 +456,21 @@ class AudioEngine {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: audioConstraints,
     });
+    // Some browsers honor a follow-up applyConstraints when they ignored
+    // the initial ideal hint, so push once more before we start.
+    const audioTrack = stream.getAudioTracks()[0];
+    if (audioTrack) {
+      try {
+        await audioTrack.applyConstraints({
+          sampleRate: { ideal: 48_000 },
+          channelCount: { ideal: 2 },
+        });
+      } catch {
+        // Device can't move; the rate we already have stands.
+      }
+    }
+    const capturedSampleRate =
+      audioTrack?.getSettings().sampleRate ?? this.context().sampleRate;
 
     const ctx = this.context();
     const source = ctx.createMediaStreamSource(stream);
@@ -486,7 +513,16 @@ class AudioEngine {
       chunks,
       mimeType: recorder.mimeType || mimeType || "audio/webm",
       startedAt: ctx.currentTime,
+      capturedSampleRate,
     };
+  }
+
+  capturedSampleRate(trackId: TrackId): number | null {
+    const session =
+      this.recording?.trackId === trackId
+        ? this.recording
+        : this.multiRecording.get(trackId);
+    return session?.capturedSampleRate ?? null;
   }
 
   private startSession(session: RecordingSession) {
@@ -518,7 +554,7 @@ class AudioEngine {
     let buf: AudioBuffer;
     try {
       const arr = await blob.arrayBuffer();
-      buf = await decodeRecording(arr);
+      buf = await decodeRecording(arr, session.capturedSampleRate);
     } catch (err) {
       console.error("Failed to decode recording", err);
       throw Object.assign(

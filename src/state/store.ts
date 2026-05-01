@@ -529,6 +529,10 @@ export const useCypher = create<CypherState>((set, get) => ({
         t?.inputGain ?? DEFAULT_INPUT_GAIN,
       );
       set({ recordingTrackId: trackId, isMultiRecording: false });
+      maybeWarnAboutLowSampleRate(
+        getEngine().capturedSampleRate(trackId),
+        get().pushToast,
+      );
     } catch (err) {
       get().pushToast(toastFromMicError(err));
     }
@@ -611,6 +615,12 @@ export const useCypher = create<CypherState>((set, get) => ({
           })),
         );
         set({ isMultiRecording: true, isPlaying: true, recordingTrackId: null });
+        const rates = targets
+          .map((t) => getEngine().capturedSampleRate(t.id))
+          .filter((r): r is number => typeof r === "number");
+        if (rates.length > 0) {
+          maybeWarnAboutLowSampleRate(Math.min(...rates), get().pushToast);
+        }
       } catch (err) {
         // Roll back any auto-arm we did so the user isn't stuck in an armed state.
         set((s) => ({
@@ -1096,6 +1106,28 @@ async function runCountIn(
   }
   set({ countdownActive: false, countdownBeat: 0 });
   return true;
+}
+
+let lowRateWarnShown = false;
+const LOW_RATE_THRESHOLD_HZ = 32_000;
+
+function maybeWarnAboutLowSampleRate(
+  rate: number | null,
+  pushToast: (t: Omit<Toast, "id">) => void,
+) {
+  if (lowRateWarnShown) return;
+  if (typeof rate !== "number" || rate <= 0) return;
+  if (rate >= LOW_RATE_THRESHOLD_HZ) return;
+  lowRateWarnShown = true;
+  const isHfp = rate <= 16_000;
+  pushToast({
+    variant: "warn",
+    title: `Capturing at ${(rate / 1000).toFixed(1)} kHz`,
+    message: isHfp
+      ? "AirPods and other Bluetooth headsets max out at 16 kHz when used as a mic — that's a hardware limit. Plug in wired headphones or use the built-in mic for full-bandwidth audio."
+      : "The OS handed us a low sample rate, usually because the speaker route is active. Plug in wired headphones, or pick a different mic in the picker, to get full quality.",
+    ttlMs: 12_000,
+  });
 }
 
 let bluetoothWarnShown = false;
