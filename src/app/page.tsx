@@ -43,16 +43,17 @@ export default function Home() {
             Loading project…
           </div>
         )}
-        {tracks.length === 0 && isLoaded && (
-          <div className="p-8 text-center text-neutral-500 text-sm flex flex-col items-center gap-4">
-            <p>This project has no tracks yet.</p>
-            <button
-              onClick={() => addTrack()}
-              className="h-11 px-5 rounded-md bg-emerald-500 text-black text-sm font-semibold active:scale-95"
-            >
-              + Add a track
-            </button>
-          </div>
+        {isLoaded && (
+          <button
+            onClick={() => addTrack()}
+            className="block w-full rounded-lg border border-dashed border-neutral-700 hover:border-emerald-500/70 hover:text-emerald-400 text-neutral-400 px-4 py-5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+            aria-label="Add new track"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            {tracks.length === 0 ? "Add your first track" : "Add another track"}
+          </button>
         )}
       </div>
     </main>
