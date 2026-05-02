@@ -201,7 +201,7 @@ function DeviceOption({
     <button
       onClick={onPick}
       className={`block w-full text-left px-3 py-3 text-sm truncate hover:bg-neutral-800 active:bg-neutral-800 ${
-        selected ? "text-emerald-400" : "text-neutral-100"
+        selected ? "text-[var(--accent)]" : "text-neutral-100"
       }`}
       role="option"
       aria-selected={selected}

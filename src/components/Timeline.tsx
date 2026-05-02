@@ -80,7 +80,7 @@ export function Timeline() {
   return (
     <div className="px-3 py-2 border-b border-neutral-800 bg-neutral-950">
       <div className="flex items-center gap-2">
-        <span className="text-[11px] tabular-nums text-emerald-400 w-10 text-right">
+        <span className="text-[11px] tabular-nums text-[var(--accent)] w-10 text-right">
           {formatTime(position)}
         </span>
         <div
@@ -145,10 +145,10 @@ export function Timeline() {
           {/* Playhead */}
           {hasAudio && (
             <div
-              className="absolute top-0 bottom-0 w-0.5 bg-emerald-400 pointer-events-none"
+              className="absolute top-0 bottom-0 w-0.5 bg-[var(--accent)] pointer-events-none"
               style={{ left: `${playPercent}%` }}
             >
-              <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-2 rounded-full bg-emerald-400" />
+              <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-2 rounded-full bg-[var(--accent)]" />
             </div>
           )}
         </div>
@@ -175,7 +175,7 @@ function TrackLane({
   return (
     <div className="flex-1 relative border-b border-neutral-900/80">
       <div
-        className="absolute top-0.5 bottom-0.5 bg-emerald-500/30 rounded-sm"
+        className="absolute top-0.5 bottom-0.5 bg-blue-500/25 rounded-sm"
         style={{
           left: `${startRatio * 100}%`,
           width: `${(endRatio - startRatio) * 100}%`,

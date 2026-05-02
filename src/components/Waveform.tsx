@@ -36,8 +36,8 @@ export function Waveform({
     const ws = WaveSurfer.create({
       container: containerRef.current,
       height: 44,
-      waveColor: "#3f3f46",
-      progressColor: "#10b981",
+      waveColor: "#324264",
+      progressColor: "#60a5fa",
       cursorColor: "transparent",
       barWidth: 2,
       barGap: 1,

@@ -26,12 +26,12 @@ export function TrackRow({ track }: { track: TrackState }) {
 
   return (
     <article
-      className={`rounded-lg border bg-neutral-900/60 transition-colors ${
+      className={`glass rounded-xl transition-colors ${
         isRecordingNow
-          ? "border-red-600/60 ring-1 ring-red-600/40"
+          ? "!border-red-500/60 ring-1 ring-red-500/40"
           : track.armed
-          ? "border-red-900/70"
-          : "border-neutral-800"
+          ? "!border-red-500/30"
+          : ""
       }`}
       aria-label={track.name}
     >
@@ -39,7 +39,7 @@ export function TrackRow({ track }: { track: TrackState }) {
       <header className="flex items-center gap-1.5 px-3 pt-2.5 pb-2">
         <button
           onClick={() => setCollapsed((v) => !v)}
-          className="h-8 w-8 -ml-1 mr-0.5 rounded-md text-neutral-500 hover:text-neutral-200 active:scale-95 flex items-center justify-center shrink-0"
+          className="h-8 w-8 -ml-1 mr-0.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text-primary)] active:scale-95 flex items-center justify-center shrink-0 transition-colors"
           aria-label={collapsed ? `Expand ${track.name}` : `Collapse ${track.name}`}
           aria-expanded={!collapsed}
         >
@@ -59,10 +59,10 @@ export function TrackRow({ track }: { track: TrackState }) {
           </svg>
         </button>
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-semibold text-neutral-100 truncate leading-tight">
+          <div className="font-[family-name:var(--font-bebas)] tracking-[0.08em] text-base text-[var(--text-primary)] truncate leading-tight">
             {track.name}
           </div>
-          <div className="text-[11px] text-neutral-500 truncate leading-tight">
+          <div className="text-[11px] text-[var(--text-faint)] truncate leading-tight">
             {track.hasAudio
               ? `${track.fileName} · ${track.durationSec.toFixed(1)}s`
               : "no audio"}
@@ -96,7 +96,7 @@ export function TrackRow({ track }: { track: TrackState }) {
         </ToggleButton>
         <button
           onClick={() => removeTrack(track.id)}
-          className="h-8 w-8 ml-0.5 rounded-md text-neutral-600 hover:text-red-400 active:scale-95 flex items-center justify-center shrink-0"
+          className="h-8 w-8 ml-0.5 rounded-md text-[var(--text-faint)] hover:text-red-400 active:scale-95 flex items-center justify-center shrink-0 transition-colors"
           aria-label={`Remove ${track.name}`}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
@@ -123,7 +123,7 @@ export function TrackRow({ track }: { track: TrackState }) {
               </div>
               <button
                 onClick={() => fileRef.current?.click()}
-                className="h-9 px-3 rounded-md bg-neutral-800 text-neutral-100 text-xs font-medium active:scale-95 shrink-0"
+                className="h-9 px-3 rounded-md bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-primary)] text-xs font-medium active:scale-95 shrink-0 transition-colors"
               >
                 {track.hasAudio ? "Replace" : "Import"}
               </button>
@@ -226,7 +226,9 @@ function ToggleButton({
       aria-label={ariaLabel}
       aria-pressed={active}
       className={`h-9 w-9 rounded-md text-xs font-bold flex items-center justify-center active:scale-95 transition-colors shrink-0 ${
-        active ? activeClass : "bg-neutral-800 text-neutral-300"
+        active
+          ? activeClass
+          : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
       } ${disabled ? "opacity-40" : ""}`}
     >
       {children}
@@ -255,7 +257,7 @@ function SliderRow({
 }) {
   return (
     <label className="flex items-center gap-2 min-w-0">
-      <span className="text-[10px] uppercase tracking-wider text-neutral-500 w-3 shrink-0">
+      <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-faint)] w-3 shrink-0">
         {short}
       </span>
       <input
@@ -266,9 +268,9 @@ function SliderRow({
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
         aria-label={label}
-        className="flex-1 accent-emerald-500 min-w-0"
+        className="flex-1 min-w-0"
       />
-      <span className="text-[10px] tabular-nums text-neutral-500 w-7 text-right shrink-0">
+      <span className="text-[10px] tabular-nums text-[var(--text-faint)] w-7 text-right shrink-0">
         {formatValue(value)}
       </span>
     </label>

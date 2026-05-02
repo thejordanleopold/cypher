@@ -13,7 +13,7 @@ export function ExportMenu() {
       <button
         onClick={() => setOpen((v) => !v)}
         disabled={busy}
-        className="h-9 px-4 rounded-md bg-emerald-500 text-black text-sm font-semibold active:scale-95 disabled:bg-neutral-700 disabled:text-neutral-500"
+        className="h-9 px-4 rounded-md bg-[var(--accent)] text-black text-sm font-semibold active:scale-95 disabled:bg-neutral-700 disabled:text-neutral-500"
       >
         {busy ? `${Math.round((exportProgress ?? 0) * 100)}%` : "Export"}
       </button>

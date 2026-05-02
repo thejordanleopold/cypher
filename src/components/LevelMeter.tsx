@@ -100,12 +100,12 @@ function draw(
   const h = canvas.clientHeight;
   ctx.clearRect(0, 0, w, h);
 
-  // Background gradient: green low → amber mid → red high.
+  // Background gradient: blue low → amber mid → red high.
   const grad = ctx.createLinearGradient(0, 0, 0, h);
   grad.addColorStop(0, "#dc2626"); // red top (clipping zone)
   grad.addColorStop(0.2, "#f59e0b"); // amber
-  grad.addColorStop(0.5, "#10b981"); // green
-  grad.addColorStop(1, "#10b981");
+  grad.addColorStop(0.5, "#60a5fa"); // blue
+  grad.addColorStop(1, "#60a5fa");
 
   // Filled portion (RMS).
   const fillH = Math.min(h, Math.max(0, h * Math.min(1, rms * 2.5)));

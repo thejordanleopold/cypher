@@ -25,7 +25,7 @@ export default function Home() {
   if (!splashDone) {
     const letters = "CYPHER".split("");
     return (
-      <main className="flex-1 flex items-center justify-center bg-neutral-950 text-neutral-100 min-h-[100dvh] overflow-hidden">
+      <main className="flex-1 flex items-center justify-center text-[var(--text-primary)] min-h-[100dvh] overflow-hidden">
         <h1
           aria-label="CYPHER"
           className="font-[family-name:var(--font-bebas)] text-6xl sm:text-7xl tracking-[0.12em] leading-none flex cypher-splash"
@@ -70,14 +70,14 @@ export default function Home() {
   }
 
   return (
-    <main className="flex-1 flex flex-col bg-neutral-950 text-neutral-100 min-h-[100dvh]">
+    <main className="flex-1 flex flex-col text-[var(--text-primary)] min-h-[100dvh]">
       <header className="px-3 sm:px-4 pt-[max(env(safe-area-inset-top),0.75rem)] pb-2 shrink-0 flex items-center gap-2">
         <div className="flex items-baseline gap-2 min-w-0 flex-1">
-          <h1 className="font-[family-name:var(--font-bebas)] text-2xl tracking-[0.08em] leading-none">
+          <h1 className="font-[family-name:var(--font-bebas)] text-2xl tracking-[0.14em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
             CYPHER
           </h1>
-          <span aria-hidden="true" className="text-neutral-700">/</span>
-          <p className="text-sm text-neutral-400 truncate min-w-0">
+          <span aria-hidden="true" className="text-[var(--text-faint)]">/</span>
+          <p className="text-sm text-[var(--text-muted)] truncate min-w-0">
             {projectName}
           </p>
         </div>
@@ -91,7 +91,7 @@ export default function Home() {
         ))}
         <button
           onClick={() => addTrack()}
-          className="block w-full rounded-lg border border-neutral-800 bg-neutral-900/40 hover:bg-neutral-900 hover:border-neutral-700 text-neutral-400 hover:text-neutral-100 px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+          className="glass block w-full rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
           aria-label="Add new track"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">

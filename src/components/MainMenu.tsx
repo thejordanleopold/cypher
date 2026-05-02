@@ -115,7 +115,7 @@ export function MainMenu() {
                 />
                 <button
                   type="submit"
-                  className="text-emerald-400 text-xs font-semibold px-2"
+                  className="text-[var(--accent)] text-xs font-semibold px-2"
                 >
                   Save
                 </button>
@@ -126,7 +126,7 @@ export function MainMenu() {
                   setDraftName(currentProjectName);
                   setRenaming(true);
                 }}
-                className="w-full text-left text-sm text-neutral-100 truncate hover:text-emerald-400 flex items-center gap-1.5"
+                className="w-full text-left text-sm text-neutral-100 truncate hover:text-[var(--accent)] flex items-center gap-1.5"
               >
                 <span className="truncate">{currentProjectName}</span>
                 <PencilIcon />
@@ -201,7 +201,7 @@ export function MainMenu() {
                     if (!isCurrent) await openProject(p.id);
                   }}
                   className={`block w-full text-left px-3 py-2 text-sm hover:bg-neutral-800 ${
-                    isCurrent ? "text-emerald-400" : "text-neutral-100"
+                    isCurrent ? "text-[var(--accent)]" : "text-neutral-100"
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -274,7 +274,7 @@ export function MainMenu() {
           <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">
             <div className="flex items-center justify-between">
               <Section label="Recording latency" />
-              <span className="text-[11px] tabular-nums text-emerald-400">
+              <span className="text-[11px] tabular-nums text-[var(--accent)]">
                 {latencyOffsetMs} ms
               </span>
             </div>
@@ -286,7 +286,7 @@ export function MainMenu() {
               value={latencyOffsetMs}
               onChange={(e) => setLatencyOffsetMs(Number(e.target.value))}
               aria-label="Recording latency offset in milliseconds"
-              className="w-full accent-emerald-500"
+              className="w-full accent-[var(--accent)]"
             />
             <button
               onClick={async () => {
@@ -437,7 +437,7 @@ function StorageBar({ s }: { s: StorageEstimate }) {
     <div className="flex items-center gap-2 shrink-0" title={`${formatBytes(s.usageBytes)} of ${formatBytes(s.quotaBytes)}`}>
       <div className="w-12 h-1.5 rounded bg-neutral-800 overflow-hidden">
         <div
-          className={`h-full ${warn ? "bg-red-500" : "bg-emerald-500"}`}
+          className={`h-full ${warn ? "bg-red-500" : "bg-[var(--accent)]"}`}
           style={{ width: `${pct}%` }}
         />
       </div>

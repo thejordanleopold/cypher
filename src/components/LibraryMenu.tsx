@@ -84,7 +84,7 @@ export function LibraryMenu() {
                 />
                 <button
                   type="submit"
-                  className="text-emerald-400 text-xs font-semibold"
+                  className="text-[var(--accent)] text-xs font-semibold"
                 >
                   Save
                 </button>
@@ -95,7 +95,7 @@ export function LibraryMenu() {
                   setDraftName(currentProjectName);
                   setRenaming(true);
                 }}
-                className="w-full text-left text-sm text-neutral-100 truncate hover:text-emerald-400"
+                className="w-full text-left text-sm text-neutral-100 truncate hover:text-[var(--accent)]"
                 title="Rename"
               >
                 {currentProjectName} ✏︎
@@ -165,7 +165,7 @@ export function LibraryMenu() {
                     if (!isCurrent) await openProject(p.id);
                   }}
                   className={`block w-full text-left px-3 py-2 text-sm hover:bg-neutral-800 ${
-                    isCurrent ? "text-emerald-400" : "text-neutral-100"
+                    isCurrent ? "text-[var(--accent)]" : "text-neutral-100"
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -243,7 +243,7 @@ function StorageBar({ s }: { s: StorageEstimate }) {
     <div className="flex items-center gap-2 shrink-0" title={`${formatBytes(s.usageBytes)} of ${formatBytes(s.quotaBytes)}`}>
       <div className="w-16 h-1.5 rounded bg-neutral-800 overflow-hidden">
         <div
-          className={`h-full ${warn ? "bg-red-500" : "bg-emerald-500"}`}
+          className={`h-full ${warn ? "bg-red-500" : "bg-[var(--accent)]"}`}
           style={{ width: `${pct}%` }}
         />
       </div>
