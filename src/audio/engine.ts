@@ -21,69 +21,47 @@ export interface Track {
   normalizationGain: number;
 }
 
+interface CaptureState {
+  on: boolean;
+  chunks: Float32Array[][]; // [chunk][channel]
+  totalSamples: number;
+}
+
 interface RecordingSession {
   trackId: TrackId;
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
   sink: GainNode;
+  processor: ScriptProcessorNode;
+  capture: CaptureState;
+  channelCount: number;
   inputGainValue: number;
-  recorder: MediaRecorder;
-  chunks: Blob[];
-  mimeType: string;
   startedAt: number;
   capturedSampleRate: number;
-  routerEl: HTMLAudioElement | null;
 }
 
-const DEFAULT_RECORDER_BITRATE = 512_000;
-// Decode recordings into a 48 kHz buffer so the saved WAV preserves the
-// mic's full bandwidth even on iOS Safari, where the live AudioContext
-// is often clamped to 24 kHz when the speaker route is active.
-const DECODE_SAMPLE_RATE = 48_000;
+// ScriptProcessor buffer size: 4096 samples ≈ 85 ms at 48 kHz. Big enough
+// to avoid main-thread starvation glitches on phones; small enough that
+// stop() doesn't wait long for the last buffer to flush.
+const CAPTURE_BUFFER_SIZE = 4096;
 
 function disconnectSessionNodes(session: RecordingSession) {
-  for (const node of [session.analyser, session.sink, session.source]) {
+  // Detach the audioprocess handler first so any in-flight callback that
+  // sneaks in after we tear the graph down can't push more samples or
+  // touch a disposed sink.
+  session.processor.onaudioprocess = null;
+  for (const node of [
+    session.processor,
+    session.analyser,
+    session.sink,
+    session.source,
+  ]) {
     try {
       node.disconnect();
     } catch {
       // ignore
     }
-  }
-  if (session.routerEl) {
-    try {
-      session.routerEl.pause();
-      session.routerEl.srcObject = null;
-      session.routerEl.remove();
-    } catch {
-      // ignore
-    }
-    session.routerEl = null;
-  }
-}
-
-function createIosRouter(stream: MediaStream): HTMLAudioElement | null {
-  if (typeof document === "undefined") return null;
-  try {
-    const el = document.createElement("audio");
-    el.muted = true;
-    el.autoplay = true;
-    el.setAttribute("playsinline", "");
-    el.setAttribute("webkit-playsinline", "");
-    el.srcObject = stream;
-    el.style.position = "fixed";
-    el.style.width = "0";
-    el.style.height = "0";
-    el.style.opacity = "0";
-    el.style.pointerEvents = "none";
-    document.body.appendChild(el);
-    el.play().catch(() => {
-      // Autoplay may be blocked off-gesture; the muted hint usually allows
-      // it, but failures here are non-fatal — we still capture audio.
-    });
-    return el;
-  } catch {
-    return null;
   }
 }
 
@@ -126,37 +104,6 @@ function applyInputGain(buf: AudioBuffer, gain: number): AudioBuffer {
   return buf;
 }
 
-async function decodeRecording(
-  arr: ArrayBuffer,
-  hintRate: number,
-): Promise<AudioBuffer> {
-  // Decode at the source rate when known so we don't bloat the WAV with
-  // empty resampled headroom. Clamp to OfflineAudioContext's valid range.
-  const targetRate = Math.max(
-    8_000,
-    Math.min(96_000, Math.round(hintRate) || DECODE_SAMPLE_RATE),
-  );
-  if (typeof OfflineAudioContext !== "undefined") {
-    try {
-      const oac = new OfflineAudioContext(1, 1, targetRate);
-      return await oac.decodeAudioData(arr.slice(0));
-    } catch {
-      // Some browsers refuse decodeAudioData on OfflineAudioContext;
-      // fall through to a real context.
-    }
-  }
-  const ctx = new AudioContext({ sampleRate: targetRate });
-  try {
-    return await ctx.decodeAudioData(arr.slice(0));
-  } finally {
-    try {
-      await ctx.close();
-    } catch {
-      // ignore
-    }
-  }
-}
-
 // iOS 17+ Audio Session API — lets us pick the AVAudioSession category and
 // mode WebKit uses for the page. Without this, recording sessions default
 // to a voice profile that band-limits the mic (and on iPhone forces the
@@ -192,21 +139,6 @@ function setAudioSessionType(type: AudioSessionType) {
   } catch {
     // ignore — older browsers may treat the setter as read-only
   }
-}
-
-function pickRecorderMimeType(): string {
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/mp4;codecs=mp4a.40.2",
-    "audio/mp4",
-    "audio/aac",
-  ];
-  for (const c of candidates) {
-    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(c))
-      return c;
-  }
-  return "";
 }
 
 class AudioEngine {
@@ -719,9 +651,6 @@ class AudioEngine {
     await this.start();
     const track = this.tracks.get(trackId);
     if (!track) throw new Error(`No track ${trackId}`);
-    if (typeof MediaRecorder === "undefined") {
-      throw new Error("MediaRecorder is not supported in this browser");
-    }
     // Tell WebKit we are about to record. This selects the high-fidelity
     // play-and-record profile rather than the voice-call category that iOS
     // would otherwise default to (which forces the bottom mic and clamps
@@ -780,9 +709,6 @@ class AudioEngine {
         // Device can't move; the rate we already have stands.
       }
     }
-    const capturedSampleRate =
-      audioTrack?.getSettings().sampleRate ?? this.context().sampleRate;
-
     // Some platforms (notably iOS Safari) suspend the AudioContext when a
     // mic stream opens. Resume here so playback of other tracks continues
     // through speakers/headphones during recording.
@@ -795,43 +721,55 @@ class AudioEngine {
     }
 
     const ctx = this.context();
+    const channelCount = Math.max(1, audioTrack?.getSettings().channelCount ?? 1);
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0;
-    // Force the analyser to be pulled by the audio graph so it actually
-    // updates its time-domain buffer (used by the live waveform).
+
+    // Capture raw PCM samples directly off the audio graph instead of
+    // pushing the stream through MediaRecorder + Opus/AAC. Codec encoders
+    // run a perceptual voice-activity gate (Opus DTX, AAC silence frames)
+    // that takes 20-100 ms to ramp back up after every silence-to-speech
+    // transition — that's the "first words clipped" + "audio gone for a
+    // split second after I stop talking" symptom on phone vocals.
+    // ScriptProcessor is deprecated but still ships in every browser
+    // including iOS Safari, and avoids the worklet-loader ceremony of
+    // AudioWorkletNode.
+    const processor = ctx.createScriptProcessor(
+      CAPTURE_BUFFER_SIZE,
+      channelCount,
+      channelCount,
+    );
+    const capture: CaptureState = { on: false, chunks: [], totalSamples: 0 };
+    processor.onaudioprocess = (e) => {
+      // Always silence the output. The processor only exists to pull
+      // samples off the source; its output isn't audio anyone should
+      // hear (otherwise the mic feeds back through the speakers).
+      for (let c = 0; c < e.outputBuffer.numberOfChannels; c++) {
+        e.outputBuffer.getChannelData(c).fill(0);
+      }
+      if (!capture.on) return;
+      const input = e.inputBuffer;
+      const chunk: Float32Array[] = [];
+      for (let c = 0; c < input.numberOfChannels; c++) {
+        // The inputBuffer's Float32Array gets recycled across callbacks,
+        // so we have to copy.
+        chunk.push(new Float32Array(input.getChannelData(c)));
+      }
+      capture.chunks.push(chunk);
+      capture.totalSamples += input.length;
+    };
+
+    // Silent sink keeps the analyser + processor pulled by the audio
+    // graph: source → analyser (level meter) → processor (capture) →
+    // sink (silenced) → destination.
     const sink = ctx.createGain();
     sink.gain.value = 0;
     sink.connect(ctx.destination);
     source.connect(analyser);
-    analyser.connect(sink);
-
-    // Recorder reads the raw mic stream — Web Audio is only used for the
-    // level meter / live waveform tap above. Routing the recording through
-    // the AudioContext would resample to its rate (24 kHz on iOS speaker
-    // route), gutting the high-frequency content. Gain is applied on the
-    // decoded buffer in finalizeSession instead, so we don't need a
-    // brickwall limiter to catch peaks during capture.
-    const mimeType = pickRecorderMimeType();
-    const options: MediaRecorderOptions = {
-      audioBitsPerSecond: DEFAULT_RECORDER_BITRATE,
-    };
-    if (mimeType) options.mimeType = mimeType;
-    const recorder = new MediaRecorder(stream, options);
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
-
-    // iOS Safari workaround: when getUserMedia is active the audio session
-    // Speaker routing during recording is handled by the master output
-    // bridge (engine.start installs it as an <audio> element consuming the
-    // mix stream). The earlier mic-stream router was removed because
-    // consuming the mic stream through an HTMLAudioElement on iOS can flip
-    // the audio session into a low-rate voice profile that drags mic
-    // capture down to ~16 kHz.
-    const routerEl: HTMLAudioElement | null = null;
+    analyser.connect(processor);
+    processor.connect(sink);
 
     return {
       trackId,
@@ -839,13 +777,12 @@ class AudioEngine {
       source,
       analyser,
       sink,
+      processor,
+      capture,
+      channelCount,
       inputGainValue: Math.max(0, gainValue),
-      recorder,
-      chunks,
-      mimeType: recorder.mimeType || mimeType || "audio/webm",
       startedAt: ctx.currentTime,
-      capturedSampleRate,
-      routerEl,
+      capturedSampleRate: ctx.sampleRate,
     };
   }
 
@@ -858,45 +795,44 @@ class AudioEngine {
   }
 
   private startSession(session: RecordingSession) {
-    // 100 ms timeslice flushes data periodically so a forced abort still
-    // surfaces something usable, and reduces final-blob assembly cost.
-    session.recorder.start(100);
+    // The processor is already connected and pulling samples; flipping
+    // the capture flag is what actually starts the recording.
+    session.capture.on = true;
   }
 
   private async finalizeSession(session: RecordingSession): Promise<AudioBuffer | null> {
-    if (session.recorder.state !== "inactive") {
-      await new Promise<void>((resolve) => {
-        session.recorder.onstop = () => resolve();
-        try {
-          session.recorder.stop();
-        } catch {
-          resolve();
-        }
-      });
-    }
+    session.capture.on = false;
+    // Give the audio thread one more buffer's worth of time to flush
+    // its most recent onaudioprocess callback before we tear the graph
+    // down, otherwise we drop the trailing 50-100 ms.
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+
     disconnectSessionNodes(session);
     session.stream.getTracks().forEach((t) => t.stop());
     this.disableOutputBridge();
     this.maybeRestorePlaybackSession();
 
-    if (session.chunks.length === 0) {
+    const { chunks, totalSamples } = session.capture;
+    if (totalSamples === 0) {
       throw Object.assign(new Error("Recording captured no audio"), {
         name: "EmptyRecordingError",
       });
     }
-    const blob = new Blob(session.chunks, { type: session.mimeType });
-    let buf: AudioBuffer;
-    try {
-      const arr = await blob.arrayBuffer();
-      buf = await decodeRecording(arr, session.capturedSampleRate);
-    } catch (err) {
-      console.error("Failed to decode recording", err);
-      throw Object.assign(
-        new Error(
-          err instanceof Error ? err.message : "Could not decode the recording",
-        ),
-        { name: "DecodeFailedError" },
-      );
+
+    const ctx = this.context();
+    let buf = ctx.createBuffer(
+      session.channelCount,
+      totalSamples,
+      session.capturedSampleRate,
+    );
+    for (let c = 0; c < session.channelCount; c++) {
+      const channelData = buf.getChannelData(c);
+      let offset = 0;
+      for (const chunk of chunks) {
+        const src = chunk[c] ?? chunk[0];
+        channelData.set(src, offset);
+        offset += src.length;
+      }
     }
     buf = applyInputGain(buf, session.inputGainValue);
 
@@ -920,11 +856,7 @@ class AudioEngine {
     this.recording = null;
     this.multiRecording.clear();
     for (const s of sessions) {
-      try {
-        if (s.recorder.state !== "inactive") s.recorder.stop();
-      } catch {
-        // ignore
-      }
+      s.capture.on = false;
       disconnectSessionNodes(s);
       s.stream.getTracks().forEach((t) => {
         try {
