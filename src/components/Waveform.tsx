@@ -35,7 +35,7 @@ export function Waveform({
     const regions = RegionsPlugin.create();
     const ws = WaveSurfer.create({
       container: containerRef.current,
-      height: 44,
+      height: 32,
       waveColor: "#324264",
       progressColor: "#60a5fa",
       cursorColor: "transparent",

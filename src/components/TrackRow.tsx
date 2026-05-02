@@ -36,10 +36,10 @@ export function TrackRow({ track }: { track: TrackState }) {
       aria-label={track.name}
     >
       {/* Header — always visible */}
-      <header className="flex items-center gap-1.5 px-3 pt-2.5 pb-2">
+      <header className="flex items-center gap-1 px-2.5 pt-1.5 pb-1">
         <button
           onClick={() => setCollapsed((v) => !v)}
-          className="h-8 w-8 -ml-1 mr-0.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text-primary)] active:scale-95 flex items-center justify-center shrink-0 transition-colors"
+          className="h-7 w-7 -ml-1 rounded-md text-[var(--text-faint)] hover:text-[var(--text-primary)] active:scale-95 flex items-center justify-center shrink-0 transition-colors"
           aria-label={collapsed ? `Expand ${track.name}` : `Collapse ${track.name}`}
           aria-expanded={!collapsed}
         >
@@ -58,11 +58,11 @@ export function TrackRow({ track }: { track: TrackState }) {
             <path d="M9 18l6-6-6-6" />
           </svg>
         </button>
-        <div className="min-w-0 flex-1">
-          <div className="font-[family-name:var(--font-bebas)] tracking-[0.08em] text-base text-[var(--text-primary)] truncate leading-tight">
+        <div className="min-w-0 flex-1 flex items-baseline gap-2">
+          <div className="font-[family-name:var(--font-bebas)] tracking-[0.08em] text-sm text-[var(--text-primary)] truncate leading-none shrink-0">
             {track.name}
           </div>
-          <div className="text-[11px] text-[var(--text-faint)] truncate leading-tight">
+          <div className="text-[10px] text-[var(--text-faint)] truncate leading-none">
             {track.hasAudio
               ? `${track.fileName} · ${track.durationSec.toFixed(1)}s`
               : "no audio"}
@@ -96,7 +96,7 @@ export function TrackRow({ track }: { track: TrackState }) {
         </ToggleButton>
         <button
           onClick={() => removeTrack(track.id)}
-          className="h-8 w-8 ml-0.5 rounded-md text-[var(--text-faint)] hover:text-red-400 active:scale-95 flex items-center justify-center shrink-0 transition-colors"
+          className="h-7 w-7 rounded-md text-[var(--text-faint)] hover:text-red-400 active:scale-95 flex items-center justify-center shrink-0 transition-colors"
           aria-label={`Remove ${track.name}`}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
@@ -112,8 +112,8 @@ export function TrackRow({ track }: { track: TrackState }) {
         }`}
       >
         <div className="overflow-hidden">
-          <div className="px-3 pb-2 space-y-2">
-            <div className="flex gap-1.5">
+          <div className="px-2.5 pb-1.5 space-y-1">
+            <div className="flex gap-1">
               <div className="flex-1 min-w-0">
                 <InputPicker
                   trackId={track.id}
@@ -123,7 +123,7 @@ export function TrackRow({ track }: { track: TrackState }) {
               </div>
               <button
                 onClick={() => fileRef.current?.click()}
-                className="h-9 px-3 rounded-md bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-primary)] text-xs font-medium active:scale-95 shrink-0 transition-colors"
+                className="h-7 px-2.5 rounded-md bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-primary)] text-[11px] font-medium active:scale-95 shrink-0 transition-colors"
               >
                 {track.hasAudio ? "Replace" : "Import"}
               </button>
@@ -140,18 +140,17 @@ export function TrackRow({ track }: { track: TrackState }) {
               />
             </div>
 
-            <SliderRow
-              label="Mic gain"
-              short="G"
-              value={track.inputGain}
-              min={0}
-              max={MAX_INPUT_GAIN}
-              step={0.1}
-              onChange={(v) => setInputGain(track.id, v)}
-              formatValue={(v) => `${v.toFixed(1)}×`}
-            />
-
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-3 gap-2">
+              <SliderRow
+                label="Mic gain"
+                short="G"
+                value={track.inputGain}
+                min={0}
+                max={MAX_INPUT_GAIN}
+                step={0.1}
+                onChange={(v) => setInputGain(track.id, v)}
+                formatValue={(v) => `${v.toFixed(1)}×`}
+              />
               <SliderRow
                 label="Volume"
                 short="V"
@@ -184,7 +183,7 @@ export function TrackRow({ track }: { track: TrackState }) {
       </div>
 
       {/* Waveform — always visible so collapsed cards still tell you what's there */}
-      <div className="px-3 pb-3">
+      <div className="px-2.5 pb-2">
         {isRecordingNow ? (
           <LiveWaveform trackId={track.id} />
         ) : (
@@ -225,7 +224,7 @@ function ToggleButton({
       disabled={disabled}
       aria-label={ariaLabel}
       aria-pressed={active}
-      className={`h-9 w-9 rounded-md text-xs font-bold flex items-center justify-center active:scale-95 transition-colors shrink-0 ${
+      className={`h-7 w-7 rounded-md text-[11px] font-bold flex items-center justify-center active:scale-95 transition-colors shrink-0 ${
         active
           ? activeClass
           : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
@@ -256,8 +255,8 @@ function SliderRow({
   formatValue: (v: number) => string;
 }) {
   return (
-    <label className="flex items-center gap-2 min-w-0">
-      <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-faint)] w-3 shrink-0">
+    <label className="flex items-center gap-1 min-w-0">
+      <span className="text-[9px] uppercase tracking-[0.16em] text-[var(--text-faint)] w-2.5 shrink-0">
         {short}
       </span>
       <input
@@ -270,7 +269,7 @@ function SliderRow({
         aria-label={label}
         className="flex-1 min-w-0"
       />
-      <span className="text-[10px] tabular-nums text-[var(--text-faint)] w-7 text-right shrink-0">
+      <span className="text-[9px] tabular-nums text-[var(--text-faint)] w-7 text-right shrink-0">
         {formatValue(value)}
       </span>
     </label>

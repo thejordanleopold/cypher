@@ -85,7 +85,7 @@ export default function Home() {
       </header>
       <Transport />
       <Timeline />
-      <div className="flex-1 overflow-y-auto p-3 space-y-2.5 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
+      <div className="flex-1 overflow-y-auto px-3 pt-2 space-y-1.5 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
         {tracks.map((t) => (
           <TrackRow key={t.id} track={t} />
         ))}
