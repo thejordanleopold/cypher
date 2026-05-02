@@ -22,6 +22,8 @@ export interface PersistedTrack {
   inputDeviceId?: string;
   inputGain?: number;
   armed?: boolean;
+  normalized?: boolean;
+  normalizationGain?: number;
 }
 
 export interface PersistedProject {

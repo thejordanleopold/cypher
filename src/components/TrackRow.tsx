@@ -16,6 +16,7 @@ export function TrackRow({ track }: { track: TrackState }) {
     toggleMute,
     toggleSolo,
     toggleArm,
+    toggleNormalize,
     removeTrack,
     isMultiRecording,
   } = useCypher();
@@ -93,6 +94,19 @@ export function TrackRow({ track }: { track: TrackState }) {
           onClick={() => toggleArm(track.id)}
         >
           R
+        </ToggleButton>
+        <ToggleButton
+          active={track.normalized}
+          activeClass="bg-[var(--accent)] text-[#031024]"
+          ariaLabel={
+            track.normalized
+              ? "Remove normalization"
+              : "Normalize peak to -1 dBFS"
+          }
+          disabled={!track.hasAudio}
+          onClick={() => toggleNormalize(track.id)}
+        >
+          N
         </ToggleButton>
         <button
           onClick={() => removeTrack(track.id)}

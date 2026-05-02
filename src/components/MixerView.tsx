@@ -39,6 +39,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
   const toggleMute = useCypher((s) => s.toggleMute);
   const toggleSolo = useCypher((s) => s.toggleSolo);
   const toggleArm = useCypher((s) => s.toggleArm);
+  const toggleNormalize = useCypher((s) => s.toggleNormalize);
   const isMultiRecording = useCypher((s) => s.isMultiRecording);
   const isRecordingNow = isMultiRecording && track.armed;
 
@@ -83,8 +84,8 @@ function ChannelStrip({ track }: { track: TrackState }) {
         </span>
       </div>
 
-      {/* M / S / R */}
-      <div className="grid grid-cols-3 gap-0.5">
+      {/* M / S / R / N */}
+      <div className="grid grid-cols-4 gap-0.5">
         <ChannelToggle
           active={track.muted}
           onClick={() => toggleMute(track.id)}
@@ -109,6 +110,19 @@ function ChannelStrip({ track }: { track: TrackState }) {
           activeClass="bg-red-600 text-white"
         >
           R
+        </ChannelToggle>
+        <ChannelToggle
+          active={track.normalized}
+          onClick={() => toggleNormalize(track.id)}
+          disabled={!track.hasAudio}
+          ariaLabel={
+            track.normalized
+              ? "Remove normalization"
+              : "Normalize peak to -1 dBFS"
+          }
+          activeClass="bg-[var(--accent)] text-[#031024]"
+        >
+          N
         </ChannelToggle>
       </div>
 

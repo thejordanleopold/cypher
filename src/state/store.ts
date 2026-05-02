@@ -56,6 +56,8 @@ export interface TrackState {
   inputDeviceId: string;
   inputGain: number;
   armed: boolean;
+  normalized: boolean;
+  normalizationGain: number;
 }
 
 export const DEFAULT_INPUT_GAIN = 2;
@@ -113,6 +115,7 @@ interface CypherState {
   startRecording: (trackId: string) => Promise<void>;
   stopRecording: () => Promise<void>;
   toggleArm: (id: string) => void;
+  toggleNormalize: (id: string) => void;
   isMultiRecording: boolean;
 
   countInBeats: number; // 0 = disabled, otherwise N beats of click before record
@@ -587,6 +590,34 @@ export const useCypher = create<CypherState>((set, get) => ({
     }));
   },
 
+  toggleNormalize: (id) => {
+    const t = get().tracks.find((x) => x.id === id);
+    if (!t || !t.hasAudio) return;
+    const engine = getEngine();
+    if (t.normalized) {
+      // Revert to the original signal level.
+      engine.setNormalizationGain(id, 1);
+      set((s) => ({
+        tracks: s.tracks.map((x) =>
+          x.id === id ? { ...x, normalized: false, normalizationGain: 1 } : x,
+        ),
+      }));
+      return;
+    }
+    const peak = engine.bufferPeak(id);
+    if (peak <= 0) return;
+    // Target -1 dBFS so a toggle followed by a quick volume nudge can't
+    // overshoot 0 dBFS and hard-clip the limiter.
+    const target = 0.89;
+    const gain = Math.min(20, target / peak);
+    engine.setNormalizationGain(id, gain);
+    set((s) => ({
+      tracks: s.tracks.map((x) =>
+        x.id === id ? { ...x, normalized: true, normalizationGain: gain } : x,
+      ),
+    }));
+  },
+
   startArmedRecording: async () => {
     // Kick the AudioContext awake inside the user gesture; once we await
     // anything (enumerateDevices, getUserMedia) iOS Safari treats it as
@@ -754,6 +785,8 @@ function emptyTrack(id: string, name: string): TrackState {
     inputDeviceId: "default",
     inputGain: DEFAULT_INPUT_GAIN,
     armed: false,
+    normalized: false,
+    normalizationGain: 1,
   };
 }
 
@@ -790,6 +823,8 @@ function buildPersisted(state: PersistInput): PersistedProject {
       inputDeviceId: t.inputDeviceId,
       inputGain: t.inputGain,
       armed: t.armed,
+      normalized: t.normalized,
+      normalizationGain: t.normalizationGain,
     })),
     createdAt: 0, // filled in by flush — preserves existing createdAt if present.
     updatedAt: Date.now(),
@@ -893,7 +928,12 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
       inputDeviceId: pt.inputDeviceId ?? "default",
       inputGain: pt.inputGain ?? DEFAULT_INPUT_GAIN,
       armed: pt.armed ?? false,
+      normalized: pt.normalized ?? false,
+      normalizationGain: pt.normalizationGain ?? 1,
     });
+    if (hasAudio && pt.normalized && pt.normalizationGain && pt.normalizationGain !== 1) {
+      engine.setNormalizationGain(pt.id, pt.normalizationGain);
+    }
   }
   await setCurrentProjectId(id);
   set({

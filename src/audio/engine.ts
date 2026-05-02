@@ -15,6 +15,10 @@ export interface Track {
   soloed: boolean;
   trimInSec: number;
   trimOutSec: number | null; // null = until end of buffer
+  // Multiplier applied on top of volume to bring quiet recordings up to a
+  // target peak. 1 = unmodified. Stored so the user can toggle it off and
+  // get the original signal back without re-recording or re-importing.
+  normalizationGain: number;
 }
 
 interface RecordingSession {
@@ -32,7 +36,7 @@ interface RecordingSession {
   routerEl: HTMLAudioElement | null;
 }
 
-const DEFAULT_RECORDER_BITRATE = 256_000;
+const DEFAULT_RECORDER_BITRATE = 384_000;
 // Decode recordings into a 48 kHz buffer so the saved WAV preserves the
 // mic's full bandwidth even on iOS Safari, where the live AudioContext
 // is often clamped to 24 kHz when the speaker route is active.
@@ -305,6 +309,7 @@ class AudioEngine {
       soloed: false,
       trimInSec: 0,
       trimOutSec: null,
+      normalizationGain: 1,
     };
     this.tracks.set(id, track);
     return track;
@@ -356,11 +361,15 @@ class AudioEngine {
         : Math.max(t.trimInSec, Math.min(dur, outSec));
   }
 
+  private effectiveGain(t: Track): number {
+    return t.muted ? 0 : t.volume * t.normalizationGain;
+  }
+
   setVolume(id: TrackId, v: number) {
     const t = this.tracks.get(id);
     if (!t) return;
     t.volume = v;
-    t.gain.gain.rampTo(t.muted ? 0 : v, 0.01);
+    t.gain.gain.rampTo(this.effectiveGain(t), 0.01);
   }
 
   setPan(id: TrackId, p: number) {
@@ -374,7 +383,31 @@ class AudioEngine {
     const t = this.tracks.get(id);
     if (!t) return;
     t.muted = muted;
-    t.gain.gain.rampTo(muted ? 0 : t.volume, 0.01);
+    t.gain.gain.rampTo(this.effectiveGain(t), 0.01);
+  }
+
+  setNormalizationGain(id: TrackId, gain: number) {
+    const t = this.tracks.get(id);
+    if (!t) return;
+    t.normalizationGain = Math.max(0, gain);
+    t.gain.gain.rampTo(this.effectiveGain(t), 0.05);
+  }
+
+  // Find the absolute peak across every channel. Used by the store to pick
+  // a normalization multiplier that gets the loudest sample close to full
+  // scale without clipping.
+  bufferPeak(id: TrackId): number {
+    const t = this.tracks.get(id);
+    if (!t || !t.buffer) return 0;
+    let peak = 0;
+    for (let c = 0; c < t.buffer.numberOfChannels; c++) {
+      const data = t.buffer.getChannelData(c);
+      for (let i = 0; i < data.length; i++) {
+        const a = Math.abs(data[i]);
+        if (a > peak) peak = a;
+      }
+    }
+    return peak;
   }
 
   getTracks(): Track[] {
