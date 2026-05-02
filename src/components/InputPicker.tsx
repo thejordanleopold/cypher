@@ -102,6 +102,8 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
       ? "Default mic"
       : selected?.label || "Selected mic";
 
+  const isBluetooth = isBluetoothDevice(selected?.label ?? "");
+
   async function rescan() {
     setRescanning(true);
     try {
@@ -180,11 +182,32 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
               <p className="text-[10px] text-neutral-500 leading-snug">
                 Wired headsets and USB mics show up here. Bluetooth like AirPods may not — iOS keeps that mic for phone calls only. To stop the speaker bleeding into the mic, plug in wired headphones.
               </p>
+              {isBluetooth && (
+                <div className="flex gap-2 rounded-md bg-amber-950/50 border border-amber-800/40 px-2.5 py-2">
+                  <span className="text-amber-400 text-[11px] mt-px shrink-0">ⓘ</span>
+                  <p className="text-[10px] text-amber-300/80 leading-snug">
+                    <strong className="text-amber-300 font-semibold">Voice Isolation</strong> may be filtering your mic. To disable it during recording: swipe open iOS <strong className="text-amber-300 font-semibold">Control Center</strong>, tap <strong className="text-amber-300 font-semibold">Mic Mode</strong>, and choose <strong className="text-amber-300 font-semibold">Standard</strong>. iOS remembers this per app.
+                    {"\n\n"}Note: AirPods Bluetooth is hardware-capped at 16 kHz — for higher quality, use a wired or USB mic.
+                  </p>
+                </div>
+              )}
             </div>
           </div>,
           document.body,
         )}
     </div>
+  );
+}
+
+function isBluetoothDevice(label: string): boolean {
+  const l = label.toLowerCase();
+  return (
+    l.includes("airpod") ||
+    l.includes("bluetooth") ||
+    l.includes(" bt ") ||
+    l.startsWith("bt ") ||
+    l.includes("wireless") ||
+    l.includes("headset")
   );
 }
 
