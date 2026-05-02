@@ -170,6 +170,10 @@ class AudioEngine {
   private outputBridgeStreamNode: MediaStreamAudioDestinationNode | null = null;
   private outputBridgeEl: HTMLAudioElement | null = null;
   private outputBridgeRefs = 0;
+  // Which path is the user's chosen output device routed through. The bridge
+  // path is used when only HTMLMediaElement.setSinkId is available; the ctx
+  // path is preferred otherwise.
+  private activeSinkRoute: "ctx" | "bridge" = "ctx";
 
   async start() {
     // Idempotent. Safe to call from any user gesture or even non-gesture
@@ -270,7 +274,9 @@ class AudioEngine {
   private disableOutputBridge() {
     this.outputBridgeRefs = Math.max(0, this.outputBridgeRefs - 1);
     if (this.outputBridgeRefs > 0) return;
-    if (this.outputBridgeEl) {
+    // Only re-mute when the bridge isn't currently being used as the user's
+    // chosen output sink — otherwise we'd silence them after every record.
+    if (this.outputBridgeEl && this.activeSinkRoute !== "bridge") {
       this.outputBridgeEl.muted = true;
     }
   }
@@ -519,12 +525,18 @@ class AudioEngine {
   }
 
   isOutputSelectionSupported(): boolean {
-    if (typeof AudioContext === "undefined") return false;
-    return (
-      typeof (
+    if (typeof AudioContext !== "undefined") {
+      const ctxSupport = typeof (
         AudioContext.prototype as unknown as { setSinkId?: unknown }
-      ).setSinkId === "function"
-    );
+      ).setSinkId === "function";
+      if (ctxSupport) return true;
+    }
+    if (typeof HTMLMediaElement !== "undefined") {
+      return typeof (
+        HTMLMediaElement.prototype as unknown as { setSinkId?: unknown }
+      ).setSinkId === "function";
+    }
+    return false;
   }
 
   async setOutputDevice(deviceId: string): Promise<void> {
@@ -532,13 +544,58 @@ class AudioEngine {
     const ctx = this.nativeCtx as AudioContext & {
       setSinkId?: (id: string) => Promise<void>;
     };
-    if (typeof ctx.setSinkId !== "function") {
+    const sinkId = deviceId === "default" ? "" : deviceId;
+    // Prefer the AudioContext route when the browser exposes it — the mix
+    // stays on the native destination and the bridge can stay muted.
+    if (typeof ctx.setSinkId === "function") {
+      await ctx.setSinkId(sinkId);
+      this.activeSinkRoute = "ctx";
+      // Bridge can sleep — restore the recording-only behavior.
+      if (this.outputBridgeEl && this.outputBridgeRefs === 0) {
+        this.outputBridgeEl.muted = true;
+      }
+      // Make sure native destination is audible.
+      try {
+        Tone.getDestination().mute = false;
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    // Fallback: route through the bridge audio element. Requires the bridge
+    // to be installed (engine.start sets it up), and HTMLMediaElement to
+    // support setSinkId (Safari 17+, Chromium, etc.).
+    const bridge = this.outputBridgeEl as HTMLAudioElement & {
+      setSinkId?: (id: string) => Promise<void>;
+    } | null;
+    if (!bridge || typeof bridge.setSinkId !== "function") {
       throw new Error("Output device selection is not supported in this browser");
     }
-    await ctx.setSinkId(deviceId === "default" ? "" : deviceId);
+    await bridge.setSinkId(sinkId);
+    bridge.muted = false;
+    try {
+      bridge.play();
+    } catch {
+      // ignore — autoplay race
+    }
+    // Silence the native destination so we don't double-play through the
+    // browser's default speakers and the user's chosen sink.
+    try {
+      Tone.getDestination().mute = true;
+    } catch {
+      // ignore
+    }
+    this.activeSinkRoute = "bridge";
   }
 
   getOutputDeviceId(): string {
+    if (this.activeSinkRoute === "bridge") {
+      const bridge = this.outputBridgeEl as HTMLAudioElement & {
+        sinkId?: string;
+      } | null;
+      const id = bridge?.sinkId ?? "";
+      return id ? id : "default";
+    }
     const ctx = this.nativeCtx as
       | (AudioContext & { sinkId?: string })
       | null;

@@ -265,7 +265,7 @@ export function MainMenu() {
                   ))}
               </select>
               <p className="text-[10px] text-neutral-500 leading-snug">
-                Routes playback to a specific speaker or headphones. iOS uses your system audio route and won't show options here.
+                Routes playback to a specific speaker or headphones. If the list is empty, tap it once to grant device permission, then reopen.
               </p>
             </div>
           )}
