@@ -198,6 +198,13 @@ class AudioEngine {
       this.master.connect(this.limiter);
       this.limiter.toDestination();
       this.started = true;
+      // Set up the output bridge (muted by default) inside this potentially
+      // gesture-bearing call. iOS Safari blocks HTMLAudioElement.play() outside
+      // user gestures, so creating it lazily during a recording session — which
+      // happens after `await getUserMedia` — leaves it silently paused. Build
+      // it now while we may still have the gesture, and unmute later only when
+      // we need it (i.e. while recording on iOS-like browsers).
+      this.installOutputBridge();
     }
     if (this.nativeCtx.state === "running" && !this.toneStartCalled) {
       this.toneStartCalled = true;
@@ -213,21 +220,16 @@ class AudioEngine {
     return this.started;
   }
 
-  private enableOutputBridge() {
-    this.outputBridgeRefs += 1;
+  private installOutputBridge() {
     if (this.outputBridgeStreamNode || !this.nativeCtx || !this.limiter) return;
+    if (typeof document === "undefined") return;
     try {
       const streamNode = this.nativeCtx.createMediaStreamDestination();
-      // Keep the regular destination route AND add the audio-element route.
-      // On iOS the audio element is what reaches the loud speaker; on desktop
-      // the audio element matches ctx.destination so muting it avoids a
-      // double-output. We mute on browsers where ctx.destination already
-      // works (i.e. anywhere setSinkId is supported); otherwise leave it
-      // unmuted so iOS hears the mix.
       this.limiter.connect(streamNode);
       const el = document.createElement("audio");
       el.srcObject = streamNode.stream;
       el.autoplay = true;
+      el.muted = true; // start muted so autoplay is allowed; unmute on demand
       el.setAttribute("playsinline", "");
       el.setAttribute("webkit-playsinline", "");
       el.style.position = "fixed";
@@ -235,14 +237,9 @@ class AudioEngine {
       el.style.height = "0";
       el.style.opacity = "0";
       el.style.pointerEvents = "none";
-      const ctx = this.nativeCtx as AudioContext & {
-        setSinkId?: (id: string) => Promise<void>;
-      };
-      const desktopRouteWorks = typeof ctx.setSinkId === "function";
-      el.muted = desktopRouteWorks; // avoid double-audio on desktop
       document.body.appendChild(el);
       el.play().catch(() => {
-        // Autoplay may be blocked off-gesture; non-fatal.
+        // Even with muted=true autoplay can occasionally fail; non-fatal.
       });
       this.outputBridgeStreamNode = streamNode;
       this.outputBridgeEl = el;
@@ -251,26 +248,30 @@ class AudioEngine {
     }
   }
 
+  private enableOutputBridge() {
+    this.outputBridgeRefs += 1;
+    if (!this.outputBridgeEl || !this.nativeCtx) return;
+    // Only unmute on browsers without ctx.setSinkId — i.e. iOS Safari, where
+    // ctx.destination gets routed away during recording. On desktop and
+    // Android Chrome, ctx.destination keeps working through the recording
+    // session, so leaving the bridge muted avoids a double-output.
+    const ctx = this.nativeCtx as AudioContext & {
+      setSinkId?: (id: string) => Promise<void>;
+    };
+    const desktopRouteWorks = typeof ctx.setSinkId === "function";
+    if (!desktopRouteWorks) {
+      this.outputBridgeEl.muted = false;
+      this.outputBridgeEl.play().catch(() => {
+        // ignore — already playing or autoplay-blocked
+      });
+    }
+  }
+
   private disableOutputBridge() {
     this.outputBridgeRefs = Math.max(0, this.outputBridgeRefs - 1);
     if (this.outputBridgeRefs > 0) return;
-    if (this.outputBridgeStreamNode) {
-      try {
-        this.limiter?.disconnect(this.outputBridgeStreamNode);
-      } catch {
-        // ignore
-      }
-      this.outputBridgeStreamNode = null;
-    }
     if (this.outputBridgeEl) {
-      try {
-        this.outputBridgeEl.pause();
-        this.outputBridgeEl.srcObject = null;
-        this.outputBridgeEl.remove();
-      } catch {
-        // ignore
-      }
-      this.outputBridgeEl = null;
+      this.outputBridgeEl.muted = true;
     }
   }
 
