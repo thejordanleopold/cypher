@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useCypher } from "@/state/store";
 import { Transport } from "@/components/Transport";
 import { Timeline } from "@/components/Timeline";
@@ -14,9 +14,60 @@ export default function Home() {
   const initProject = useCypher((s) => s.initProject);
   const addTrack = useCypher((s) => s.addTrack);
 
+  const [splashDone, setSplashDone] = useState(false);
+
   useEffect(() => {
     initProject();
+    const t = setTimeout(() => setSplashDone(true), 2500);
+    return () => clearTimeout(t);
   }, [initProject]);
+
+  if (!splashDone) {
+    const letters = "CYPHER".split("");
+    return (
+      <main className="flex-1 flex items-center justify-center bg-neutral-950 text-neutral-100 min-h-[100dvh] overflow-hidden">
+        <h1
+          aria-label="CYPHER"
+          className="font-[family-name:var(--font-bebas)] text-6xl sm:text-7xl tracking-[0.12em] leading-none flex cypher-splash"
+        >
+          {letters.map((ch, i) => (
+            <span
+              key={i}
+              className="cypher-letter inline-block"
+              style={{ animationDelay: `${i * 70}ms` }}
+            >
+              {ch}
+            </span>
+          ))}
+        </h1>
+        <style jsx>{`
+          .cypher-splash {
+            animation: cypher-exit 700ms cubic-bezier(0.4, 0, 0.2, 1) 1800ms forwards;
+          }
+          .cypher-letter {
+            opacity: 0;
+            transform: translateY(12px);
+            filter: blur(8px);
+            animation: cypher-in 900ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+          }
+          @keyframes cypher-in {
+            to {
+              opacity: 1;
+              transform: translateY(0);
+              filter: blur(0);
+            }
+          }
+          @keyframes cypher-exit {
+            to {
+              opacity: 0;
+              transform: scale(1.08);
+              filter: blur(6px);
+            }
+          }
+        `}</style>
+      </main>
+    );
+  }
 
   return (
     <main className="flex-1 flex flex-col bg-neutral-950 text-neutral-100 min-h-[100dvh]">

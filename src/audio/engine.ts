@@ -161,6 +161,7 @@ class AudioEngine {
   private metronomeSynth: Tone.MembraneSynth | null = null;
   private metronomeLoop: Tone.Loop | null = null;
   private metronomeOn = false;
+  private toneStartCalled = false;
 
   async start() {
     // Idempotent. Safe to call from any user gesture or even non-gesture
@@ -180,12 +181,23 @@ class AudioEngine {
       }
     }
     if (!this.started) {
-      await Tone.start();
+      // Create the graph nodes synchronously — Tone constructors are safe on
+      // a suspended context. Only await Tone.start() once the context is
+      // actually running (post-gesture), otherwise it blocks forever and
+      // stalls callers like initProject.
       this.master = new Tone.Gain(1);
       this.limiter = new Tone.Limiter(-1);
       this.master.connect(this.limiter);
       this.limiter.toDestination();
       this.started = true;
+    }
+    if (this.nativeCtx.state === "running" && !this.toneStartCalled) {
+      this.toneStartCalled = true;
+      try {
+        await Tone.start();
+      } catch {
+        this.toneStartCalled = false;
+      }
     }
   }
 
@@ -524,6 +536,17 @@ class AudioEngine {
     const capturedSampleRate =
       audioTrack?.getSettings().sampleRate ?? this.context().sampleRate;
 
+    // Some platforms (notably iOS Safari) suspend the AudioContext when a
+    // mic stream opens. Resume here so playback of other tracks continues
+    // through speakers/headphones during recording.
+    if (this.nativeCtx && this.nativeCtx.state === "suspended") {
+      try {
+        await this.nativeCtx.resume();
+      } catch {
+        // ignore
+      }
+    }
+
     const ctx = this.context();
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
@@ -675,6 +698,9 @@ class AudioEngine {
       inputGain,
     );
     this.recording = session;
+    // Start playback of any existing tracks so the user can record along to
+    // them. Without this, single-track recording is silent against the mix.
+    await this.play();
     this.startSession(session);
   }
 
