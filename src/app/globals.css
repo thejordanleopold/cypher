@@ -25,29 +25,32 @@
   --font-mono: var(--font-geist-mono);
 }
 
-html, body {
+html {
+  /* Paint the base color on the root so iOS Safari's overscroll/rubber-band
+     reveal still shows the right tone. */
   background: var(--bg-base);
+}
+html, body {
   color: var(--text-primary);
   font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, sans-serif;
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
 }
-
-/* Ambient atmosphere: two soft blue glows top-left and bottom-right.
-   Fixed so they don't scroll with content. Subtle — kept low alpha so
-   they read as depth, not gradient mesh art. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  background:
+body {
+  /* Layer the gradient stack directly on body so it tiles for any page
+     height. background-attachment: fixed keeps the radial glows pinned to
+     the viewport so they read as ambient atmosphere, not as a panel that
+     scrolls with the content. min-height ensures we cover dynamic viewport
+     height changes (iOS URL bar collapse). */
+  background-color: var(--bg-base);
+  background-image:
     radial-gradient(60% 50% at 15% 10%, rgba(37, 99, 235, 0.18), transparent 60%),
     radial-gradient(55% 45% at 90% 95%, rgba(14, 116, 208, 0.14), transparent 65%),
     linear-gradient(180deg, #050a18 0%, #060c1c 50%, #04081a 100%);
+  background-attachment: fixed, fixed, fixed;
+  background-size: 100% 100%, 100% 100%, 100% 100%;
+  min-height: 100dvh;
 }
-body > * { position: relative; z-index: 1; }
 
 /* Glass surface utilities. Used across cards, headers, menus. */
 .glass {
