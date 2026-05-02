@@ -241,7 +241,7 @@ export function MainMenu() {
             </select>
             <p className="text-[10px] text-neutral-500 leading-snug">
               Default mic for recording. Applies to all tracks; you can still override per track.
-              {inputDevices.length === 0 && " Tap the list, grant mic access, then reopen to see device names."}
+              Device names appear after the first recording — granting mic access early can lower playback quality on iOS, so we hold off until you actually need it.
             </p>
           </div>
 

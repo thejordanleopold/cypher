@@ -425,17 +425,16 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   refreshInputDevices: async () => {
+    // Strictly read-only: enumerate whatever the platform exposes without
+    // calling getUserMedia. Even a quick "permission probe" via
+    // getUserMedia({audio:true}) flips iOS Safari from a Playback audio
+    // session into PlayAndRecord — that demotes already-playing audio
+    // to a lower-quality voice profile and re-routes output. Any actual
+    // permission prompt must be triggered explicitly by the user (e.g.
+    // hitting record, or the explicit "Grant mic access" button in the
+    // input picker), never as a side effect of opening menus.
     const engine = getEngine();
-    let devices = await engine.listInputDevices();
-    // If labels are blank, we lack permission — request once and re-enumerate.
-    if (devices.length > 0 && devices.every((d) => !d.label)) {
-      try {
-        await engine.requestMicPermission();
-        devices = await engine.listInputDevices();
-      } catch {
-        // User denied; keep unlabeled list.
-      }
-    }
+    const devices = await engine.listInputDevices();
     set({ inputDevices: devices });
   },
 
