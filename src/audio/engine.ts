@@ -501,6 +501,13 @@ class AudioEngine {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: audioConstraints,
     });
+    // iOS suspends the AudioContext when it switches the audio session to
+    // "play and record" during getUserMedia.  Re-wake it here while we are
+    // still inside the getUserMedia resolution chain (iOS treats this as an
+    // extension of the original user gesture).
+    if (this.nativeCtx && this.nativeCtx.state !== "running") {
+      await this.nativeCtx.resume().catch(() => {});
+    }
     // Some browsers honor a follow-up applyConstraints when they ignored
     // the initial ideal hint, so push once more before we start.
     const audioTrack = stream.getAudioTracks()[0];
@@ -691,13 +698,15 @@ class AudioEngine {
       throw err;
     }
     for (const s of sessions) this.multiRecording.set(s.trackId, s);
-    // Force a clean restart of playback so backing tracks definitely sound
-    // during the take. Without this, if play() finds the transport already
-    // running (from an earlier press of Play, or from a previous record
-    // that wasn't fully stopped) it short-circuits and never re-schedules
-    // the players whose old start() calls have already finished.
+    // Always restart playback from the beginning when recording starts.
+    // transport.pause() would keep the playhead at its current position:
+    // if the user played all the way to the end of their tracks and then
+    // pressed Record, transport.seconds could be past every track's end,
+    // making dur = 0 for all of them and producing silence.
+    // transport.stop() resets seconds to 0 so the offset calculation in
+    // play() always yields a positive duration.
     const transport = Tone.getTransport();
-    transport.pause();
+    transport.stop();
     for (const t of this.tracks.values()) t.player?.stop();
     await this.play();
     for (const s of sessions) this.startSession(s);
