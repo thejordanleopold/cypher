@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { getEngine } from "@/audio/engine";
-import { mixdown } from "@/audio/mixdown";
+import { mixdown, type MixTrack } from "@/audio/mixdown";
 import { encodeBuffer, downloadBlob, type ExportFormat } from "@/audio/export";
 import { audioBufferToWavBlob } from "@/audio/wav";
 import {
@@ -258,6 +258,7 @@ export const useCypher = create<CypherState>((set, get) => ({
           useCypher.getState().refreshOutputDevices();
         });
       }
+      installLifecycleHooks();
       initialized = true;
     })();
     try {
@@ -545,37 +546,72 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   exportMix: async (format) => {
+    // Capture the latest unsaved edits in the project before mixing — exports
+    // should reflect what's on screen even if the autosave debounce hasn't fired.
+    await flushPersist();
     set({ exportProgress: 0 });
     try {
-      const buf = await mixdown(getEngine().getTracks());
+      const mixTracks = collectMixTracks({ includeMuted: false });
+      if (mixTracks.length === 0) {
+        get().pushToast({
+          variant: "warn",
+          title: "Nothing to export",
+          message:
+            "Add audio to a track (record or import a file), then try again.",
+          ttlMs: 6000,
+        });
+        return;
+      }
+      const buf = await mixdown(mixTracks);
       const blob = await encodeBuffer(buf, format, (p) =>
         set({ exportProgress: p }),
       );
-      const projectName = get().currentProjectName.replace(/[^\w-]+/g, "_");
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      downloadBlob(blob, `${projectName}-${stamp}.${format}`);
+      downloadBlob(blob, exportFilename(get().currentProjectName, format));
+    } catch (err) {
+      get().pushToast({
+        variant: "error",
+        title: "Export failed",
+        message: err instanceof Error ? err.message : String(err),
+        ttlMs: 8000,
+      });
     } finally {
       set({ exportProgress: null });
     }
   },
 
   exportStems: async (format) => {
-    const engine = getEngine();
-    const playable = engine.getTracks().filter((t) => t.buffer);
-    if (playable.length === 0) return;
+    await flushPersist();
+    const stems = collectStems();
+    if (stems.length === 0) {
+      get().pushToast({
+        variant: "warn",
+        title: "Nothing to export",
+        message:
+          "Add audio to a track (record or import a file), then try again.",
+        ttlMs: 6000,
+      });
+      return;
+    }
     const projectName = get().currentProjectName.replace(/[^\w-]+/g, "_");
     set({ exportProgress: 0 });
     try {
-      for (let i = 0; i < playable.length; i++) {
-        const t = playable[i];
-        const stemBuf = await mixdown([t]);
-        const baseFraction = i / playable.length;
+      for (let i = 0; i < stems.length; i++) {
+        const stem = stems[i];
+        const stemBuf = await mixdown([stem.track]);
+        const baseFraction = i / stems.length;
         const blob = await encodeBuffer(stemBuf, format, (p) =>
-          set({ exportProgress: baseFraction + p / playable.length }),
+          set({ exportProgress: baseFraction + p / stems.length }),
         );
-        const safeName = t.name.replace(/[^\w-]+/g, "_");
+        const safeName = stem.name.replace(/[^\w-]+/g, "_") || `track-${i + 1}`;
         downloadBlob(blob, `${projectName}-${safeName}.${format}`);
       }
+    } catch (err) {
+      get().pushToast({
+        variant: "error",
+        title: "Stem export failed",
+        message: err instanceof Error ? err.message : String(err),
+        ttlMs: 8000,
+      });
     } finally {
       set({ exportProgress: null });
     }
@@ -858,6 +894,77 @@ async function flushPersist() {
   const f = pendingFlush;
   pendingFlush = null;
   if (f) await f();
+}
+
+// Build a list of MixTrack values for export. Pulls volume/pan/trim/normalization
+// from the user-facing store state (so solo isn't interpreted as mute) and the
+// audio buffer from the engine.
+function collectMixTracks(opts: { includeMuted: boolean }): MixTrack[] {
+  const engine = getEngine();
+  const state = useCypher.getState();
+  const out: MixTrack[] = [];
+  for (const s of state.tracks) {
+    if (!opts.includeMuted && s.muted) continue;
+    const e = engine.getTrack(s.id);
+    if (!e?.buffer) continue;
+    out.push({
+      buffer: e.buffer,
+      volume: s.volume,
+      pan: s.pan,
+      trimInSec: s.trimInSec,
+      trimOutSec: s.trimOutSec,
+      normalizationGain: s.normalizationGain,
+    });
+  }
+  return out;
+}
+
+function collectStems(): Array<{ name: string; track: MixTrack }> {
+  const engine = getEngine();
+  const state = useCypher.getState();
+  const stems: Array<{ name: string; track: MixTrack }> = [];
+  for (const s of state.tracks) {
+    const e = engine.getTrack(s.id);
+    if (!e?.buffer) continue;
+    stems.push({
+      name: s.name,
+      track: {
+        buffer: e.buffer,
+        volume: s.volume,
+        pan: s.pan,
+        trimInSec: s.trimInSec,
+        trimOutSec: s.trimOutSec,
+        normalizationGain: s.normalizationGain,
+      },
+    });
+  }
+  return stems;
+}
+
+function exportFilename(projectName: string, format: ExportFormat): string {
+  const safeName = projectName.replace(/[^\w-]+/g, "_") || "cypher";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  return `${safeName}-${stamp}.${format}`;
+}
+
+// Flush on page hide/close so users don't lose the last few edits while the
+// autosave debounce is still waiting. visibilitychange fires reliably on
+// mobile when the tab is backgrounded; beforeunload covers desktop close.
+let lifecycleHooksInstalled = false;
+function installLifecycleHooks() {
+  if (lifecycleHooksInstalled) return;
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+  lifecycleHooksInstalled = true;
+  const flush = () => {
+    void flushPersist();
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flush();
+  });
+  // pagehide is more reliable than beforeunload on mobile Safari, but cover
+  // both for desktop browsers that don't fire pagehide for normal closes.
+  window.addEventListener("pagehide", flush);
+  window.addEventListener("beforeunload", flush);
 }
 
 type Setter = {
