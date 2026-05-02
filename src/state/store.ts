@@ -520,6 +520,10 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   startRecording: async (trackId) => {
+    // Kick the AudioContext awake inside the user gesture; once we await
+    // anything (enumerateDevices, getUserMedia) iOS Safari treats it as
+    // out-of-gesture and refuses to resume.
+    void getEngine().start();
     await maybeWarnAboutBluetoothMic(get().pushToast);
     const t = get().tracks.find((x) => x.id === trackId);
     try {
@@ -584,6 +588,10 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   startArmedRecording: async () => {
+    // Kick the AudioContext awake inside the user gesture; once we await
+    // anything (enumerateDevices, getUserMedia) iOS Safari treats it as
+    // out-of-gesture and refuses to resume.
+    void getEngine().start();
     await maybeWarnAboutBluetoothMic(get().pushToast);
     const beats = get().countInBeats;
     if (beats > 0) {
