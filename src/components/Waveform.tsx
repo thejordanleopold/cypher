@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import WaveSurfer from "wavesurfer.js";
-import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.js";
 import { getEngine } from "@/audio/engine";
 import { audioBufferToWavBlob } from "@/audio/wav";
 import { useCypher } from "@/state/store";
@@ -16,6 +15,10 @@ interface WaveformProps {
   durationSec: number;
 }
 
+const HANDLE_WIDTH_PX = 12;
+const MIN_TRIM_GAP_SEC = 0.05;
+const SNAP_TO_END_SEC = 0.01;
+
 export function Waveform({
   trackId,
   hasAudio,
@@ -24,18 +27,24 @@ export function Waveform({
   trimOutSec,
   durationSec,
 }: WaveformProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const waveContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
-  const regionsRef = useRef<RegionsPlugin | null>(null);
-  const trimRegionRef = useRef<Region | null>(null);
   const setTrim = useCypher((s) => s.setTrim);
+  const [activeSide, setActiveSide] = useState<"left" | "right" | null>(null);
+
+  const safeDuration = durationSec > 0 ? durationSec : 1;
+  const effectiveOut = trimOutSec ?? safeDuration;
+  const inPct = clampPct((trimInSec / safeDuration) * 100);
+  const outPct = clampPct((effectiveOut / safeDuration) * 100);
+  const isTrimmed =
+    trimInSec > 0.001 || (trimOutSec !== null && trimOutSec < safeDuration - SNAP_TO_END_SEC);
 
   useEffect(() => {
-    if (!containerRef.current) return;
-    const regions = RegionsPlugin.create();
+    if (!waveContainerRef.current) return;
     const ws = WaveSurfer.create({
-      container: containerRef.current,
-      height: 32,
+      container: waveContainerRef.current,
+      height: 36,
       waveColor: "#324264",
       progressColor: "#60a5fa",
       cursorColor: "transparent",
@@ -44,75 +53,180 @@ export function Waveform({
       barRadius: 1,
       interact: false,
       normalize: true,
-      plugins: [regions],
     });
     wsRef.current = ws;
-    regionsRef.current = regions;
-
-    const onUpdated = (region: Region) => {
-      if (region !== trimRegionRef.current) return;
-      const dur = ws.getDuration() || durationSec;
-      const inS = Math.max(0, region.start);
-      const outS = Math.min(dur, region.end);
-      setTrim(trackId, inS, outS >= dur - 0.01 ? null : outS);
-    };
-    regions.on("region-updated", onUpdated);
-
     return () => {
       ws.destroy();
       wsRef.current = null;
-      regionsRef.current = null;
-      trimRegionRef.current = null;
     };
-  }, [trackId, setTrim, durationSec]);
+  }, [trackId]);
 
-  // Load buffer into wavesurfer.
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws || !hasAudio) return;
     const buf = getEngine().getTrack(trackId)?.buffer;
     if (!buf) return;
-    const blob = audioBufferToWavBlob(buf);
-    ws.loadBlob(blob).catch(() => {});
+    ws.loadBlob(audioBufferToWavBlob(buf)).catch(() => {});
   }, [trackId, hasAudio, bufferRevision]);
 
-  // Sync trim region with state.
-  useEffect(() => {
-    const ws = wsRef.current;
-    const regions = regionsRef.current;
-    if (!ws || !regions || !hasAudio) return;
-    const apply = () => {
-      const dur = ws.getDuration() || durationSec;
-      if (!dur) return;
-      const start = trimInSec;
-      const end = trimOutSec ?? dur;
-      if (trimRegionRef.current) {
-        trimRegionRef.current.setOptions({ start, end });
-      } else {
-        trimRegionRef.current = regions.addRegion({
-          start,
-          end,
-          color: "rgba(16, 185, 129, 0.18)",
-          drag: false,
-          resize: true,
-        });
-      }
-    };
-    if (ws.getDuration() > 0) apply();
-    else {
-      const onReady = () => {
-        apply();
-        ws.un("ready", onReady);
+  function startDrag(side: "left" | "right") {
+    return (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      setActiveSide(side);
+
+      const onMove = (ev: PointerEvent) => {
+        const r = trackRef.current?.getBoundingClientRect();
+        if (!r || r.width === 0) return;
+        const ratio = (ev.clientX - r.left) / r.width;
+        const sec = Math.max(0, Math.min(safeDuration, ratio * safeDuration));
+        if (side === "left") {
+          const limit = (trimOutSec ?? safeDuration) - MIN_TRIM_GAP_SEC;
+          setTrim(trackId, Math.min(sec, Math.max(0, limit)), trimOutSec);
+        } else {
+          const minOut = trimInSec + MIN_TRIM_GAP_SEC;
+          const newOut = Math.max(sec, minOut);
+          // Snap back to "open" trim when dragged to the very end so the
+          // saved value matches the buffer length even if the user grew it.
+          const snapped = newOut >= safeDuration - SNAP_TO_END_SEC ? null : newOut;
+          setTrim(trackId, trimInSec, snapped);
+        }
       };
-      ws.on("ready", onReady);
-    }
-  }, [hasAudio, trimInSec, trimOutSec, durationSec, bufferRevision]);
+      const onUp = (ev: PointerEvent) => {
+        try {
+          (ev.target as Element)?.releasePointerCapture?.(ev.pointerId);
+        } catch {
+          // ignore — pointer capture may already be lost
+        }
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onUp);
+        setActiveSide(null);
+      };
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+      document.addEventListener("pointercancel", onUp);
+    };
+  }
 
   return (
-    <div
-      ref={containerRef}
-      className="h-11 bg-neutral-900/50 rounded overflow-hidden"
-      aria-label="Waveform with trim region"
-    />
+    <div className="relative select-none pt-3.5">
+      {/* Time labels — positioned over the handles, visible while dragging */}
+      <div
+        className={`pointer-events-none absolute inset-x-0 top-0 h-3 transition-opacity duration-150 ${
+          activeSide ? "opacity-100" : "opacity-0"
+        }`}
+      >
+        <TimeLabel pct={inPct} seconds={trimInSec} />
+        <TimeLabel pct={outPct} seconds={effectiveOut} />
+      </div>
+
+      <div ref={trackRef} className="relative h-11">
+        {/* Wave + dim overlays — clipped to the rounded track */}
+        <div className="absolute inset-0 rounded-md overflow-hidden bg-neutral-900/50">
+          <div ref={waveContainerRef} className="absolute inset-0" />
+          <div
+            className="absolute inset-y-0 left-0 bg-black/55 pointer-events-none"
+            style={{ width: `${inPct}%` }}
+          />
+          <div
+            className="absolute inset-y-0 right-0 bg-black/55 pointer-events-none"
+            style={{ width: `${100 - outPct}%` }}
+          />
+        </div>
+
+        {/* Yellow frame across the trim window */}
+        <div
+          className={`absolute inset-y-0 border-y-2 pointer-events-none transition-colors ${
+            activeSide
+              ? "border-amber-300"
+              : isTrimmed
+              ? "border-amber-400/85"
+              : "border-amber-400/55"
+          }`}
+          style={{ left: `${inPct}%`, right: `${100 - outPct}%` }}
+        />
+
+        <Handle
+          side="left"
+          pct={inPct}
+          active={activeSide === "left"}
+          ariaValue={trimInSec}
+          ariaMax={safeDuration}
+          onPointerDown={startDrag("left")}
+        />
+        <Handle
+          side="right"
+          pct={outPct}
+          active={activeSide === "right"}
+          ariaValue={effectiveOut}
+          ariaMax={safeDuration}
+          onPointerDown={startDrag("right")}
+        />
+      </div>
+    </div>
   );
+}
+
+function Handle({
+  side,
+  pct,
+  active,
+  ariaValue,
+  ariaMax,
+  onPointerDown,
+}: {
+  side: "left" | "right";
+  pct: number;
+  active: boolean;
+  ariaValue: number;
+  ariaMax: number;
+  onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => void;
+}) {
+  const roundedClass = side === "left" ? "rounded-l-md" : "rounded-r-md";
+  // Center the handle over the trim boundary so the grab target straddles it.
+  const left = `calc(${pct}% - ${HANDLE_WIDTH_PX / 2}px)`;
+  return (
+    <div
+      role="slider"
+      tabIndex={0}
+      aria-label={side === "left" ? "Trim start" : "Trim end"}
+      aria-valuemin={0}
+      aria-valuemax={ariaMax}
+      aria-valuenow={ariaValue}
+      onPointerDown={onPointerDown}
+      style={{ left, width: HANDLE_WIDTH_PX }}
+      className={`absolute -top-0.5 -bottom-0.5 ${roundedClass} bg-amber-400 cursor-ew-resize touch-none flex items-center justify-center transition-shadow ${
+        active
+          ? "shadow-[0_0_0_4px_rgba(251,191,36,0.28)]"
+          : "shadow-[0_2px_6px_rgba(0,0,0,0.4)]"
+      }`}
+    >
+      <div className="h-4 w-[2px] bg-black/55 rounded-full" />
+    </div>
+  );
+}
+
+function TimeLabel({ pct, seconds }: { pct: number; seconds: number }) {
+  return (
+    <span
+      className="absolute -translate-x-1/2 text-[10px] font-semibold tabular-nums text-amber-300 leading-none whitespace-nowrap"
+      style={{ left: `${pct}%` }}
+    >
+      {formatTime(seconds)}
+    </span>
+  );
+}
+
+function clampPct(p: number): number {
+  if (!isFinite(p)) return 0;
+  return Math.max(0, Math.min(100, p));
+}
+
+function formatTime(s: number): string {
+  if (!isFinite(s) || s < 0) s = 0;
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  const tenths = Math.floor((s - Math.floor(s)) * 10);
+  return `${m}:${sec.toString().padStart(2, "0")}.${tenths}`;
 }
