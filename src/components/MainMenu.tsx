@@ -1,8 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useCypher } from "@/state/store";
 import { estimateStorage, type StorageEstimate } from "@/persistence/db";
+
+interface PopupRect {
+  top: number;
+  right: number;
+  width: number;
+  maxHeight: number;
+}
+
+const POPUP_WIDTH = 320;
+const VIEWPORT_PADDING = 12;
 
 export function MainMenu() {
   const {
@@ -39,6 +50,8 @@ export function MainMenu() {
   const [draftName, setDraftName] = useState(currentProjectName);
   const [storage, setStorage] = useState<StorageEstimate | null>(null);
   const [, forceTick] = useState(0);
+  const [rect, setRect] = useState<PopupRect | null>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const exporting = exportProgress !== null;
 
@@ -59,11 +72,42 @@ export function MainMenu() {
     return () => clearInterval(id);
   }, [open]);
 
-  // Close on outside click + Escape.
+  // Position the portaled popover anchored to the trigger button, with the
+  // right edge inset from the viewport. Recompute on resize/scroll because
+  // the trigger sits in a sticky header that moves as the page scrolls.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const update = () => {
+      const el = buttonRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const viewportH = window.innerHeight;
+      const viewportW = window.innerWidth;
+      const gap = 6;
+      const width = Math.min(POPUP_WIDTH, viewportW - VIEWPORT_PADDING * 2);
+      const right = Math.max(VIEWPORT_PADDING, viewportW - r.right);
+      const top = r.bottom + gap;
+      const maxHeight = Math.max(200, viewportH - top - VIEWPORT_PADDING);
+      setRect({ top, right, width, maxHeight });
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [open]);
+
+  // Close on outside click + Escape. The popover lives in a portal at
+  // document.body, so the listener has to check the portal node too.
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
-      if (!popoverRef.current?.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      if (buttonRef.current?.contains(target)) return;
+      if (popoverRef.current?.contains(target)) return;
+      setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
@@ -77,8 +121,9 @@ export function MainMenu() {
   }, [open]);
 
   return (
-    <div className="relative" ref={popoverRef}>
+    <>
       <button
+        ref={buttonRef}
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
@@ -88,11 +133,20 @@ export function MainMenu() {
         <HamburgerIcon />
       </button>
 
-      {open && (
-        <div
-          role="menu"
-          className="absolute right-0 top-full mt-1 z-30 w-80 max-w-[calc(100vw-1.5rem)] max-h-[calc(100dvh-5rem)] overflow-y-auto overscroll-contain bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl"
-        >
+      {open && rect && typeof document !== "undefined" &&
+        createPortal(
+          <div
+            ref={popoverRef}
+            role="menu"
+            style={{
+              position: "fixed",
+              top: rect.top,
+              right: rect.right,
+              width: rect.width,
+              maxHeight: rect.maxHeight,
+            }}
+            className="z-50 overflow-y-auto overscroll-contain bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl"
+          >
           {/* Project name + rename */}
           <div className="px-3 py-2.5 border-b border-neutral-800">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">
@@ -349,9 +403,10 @@ export function MainMenu() {
               Stems · MP3 (one file per track)
             </MenuItem>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
-    </div>
+    </>
   );
 }
 
