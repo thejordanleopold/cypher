@@ -27,8 +27,8 @@ export function Transport() {
   const willRecordCount = armedCount > 0 ? armedCount : emptyCount;
 
   return (
-    <div className="sticky top-0 z-20 glass-overlay border-b border-[var(--border-subtle)]">
-      <div className="flex items-center gap-1.5 px-3 py-2.5 sm:gap-2 sm:px-4">
+    <div>
+      <div className="flex items-center gap-1.5 px-3 py-2 sm:gap-2 sm:px-4">
         <button
           onClick={() => (isPlaying ? pause() : play())}
           className="h-10 w-10 rounded-full bg-gradient-to-b from-[#7cb6ff] to-[#3b82f6] text-[#031024] flex items-center justify-center active:scale-95 shrink-0 shadow-[0_4px_14px_-4px_rgba(59,130,246,0.6)]"
@@ -99,6 +99,7 @@ export function Transport() {
         </button>
 
         <div className="flex-1" />
+        <div className="hidden sm:block h-7 w-px bg-[var(--border-subtle)]/80 mx-1" aria-hidden="true" />
 
         <label className="flex items-center gap-1.5 shrink-0">
           <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-faint)]">

@@ -71,20 +71,26 @@ export default function Home() {
 
   return (
     <main className="flex-1 flex flex-col text-[var(--text-primary)] min-h-[100dvh]">
-      <header className="px-3 sm:px-4 pt-[max(env(safe-area-inset-top),0.75rem)] pb-2 shrink-0 flex items-center gap-2">
-        <div className="flex items-baseline gap-2 min-w-0 flex-1">
-          <h1 className="font-[family-name:var(--font-bebas)] text-2xl tracking-[0.14em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
-            CYPHER
-          </h1>
-          <span aria-hidden="true" className="text-[var(--text-faint)]">/</span>
-          <p className="text-sm text-[var(--text-muted)] truncate min-w-0">
-            {projectName}
-          </p>
+      <div className="sticky top-0 z-20 glass-overlay border-b border-[var(--border-subtle)]">
+        <header className="px-3 sm:px-4 pt-[max(env(safe-area-inset-top),0.5rem)] pb-2 flex items-center gap-2">
+          <div className="flex items-baseline gap-2 min-w-0 flex-1">
+            <h1 className="font-[family-name:var(--font-bebas)] text-xl tracking-[0.16em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
+              CYPHER
+            </h1>
+            <span aria-hidden="true" className="text-[var(--text-faint)] text-sm leading-none">/</span>
+            <p className="text-[13px] text-[var(--text-muted)] truncate min-w-0 leading-none">
+              {projectName}
+            </p>
+          </div>
+          <MainMenu />
+        </header>
+        <div className="border-t border-[var(--border-subtle)]/60">
+          <Transport />
         </div>
-        <MainMenu />
-      </header>
-      <Transport />
-      <Timeline />
+        <div className="border-t border-[var(--border-subtle)]/60">
+          <Timeline />
+        </div>
+      </div>
       <div className="flex-1 overflow-y-auto px-3 pt-2 space-y-1.5 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
         {tracks.map((t) => (
           <TrackRow key={t.id} track={t} />

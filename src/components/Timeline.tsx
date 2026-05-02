@@ -78,7 +78,7 @@ export function Timeline() {
   const playPercent = hasAudio ? (position / duration) * 100 : 0;
 
   return (
-    <div className="px-3 py-2 border-b border-neutral-800 bg-neutral-950">
+    <div className="px-3 sm:px-4 py-1.5">
       <div className="flex items-center gap-2">
         <span className="text-[11px] tabular-nums text-[var(--accent)] w-10 text-right">
           {formatTime(position)}
@@ -112,12 +112,12 @@ export function Timeline() {
               seek(duration);
             }
           }}
-          className={`flex-1 h-9 relative rounded-md bg-neutral-900 overflow-hidden select-none ${
+          className={`flex-1 h-7 relative rounded-md bg-white/[0.04] border border-[var(--border-subtle)] overflow-hidden select-none ${
             hasAudio ? "cursor-pointer" : "cursor-default opacity-60"
           }`}
         >
           {/* Track lanes */}
-          <div className="absolute inset-0 flex flex-col">
+          <div className="absolute inset-0 flex flex-col gap-px">
             {tracks.length > 0 ? (
               tracks.slice(0, 4).map((t) => (
                 <TrackLane
@@ -152,7 +152,7 @@ export function Timeline() {
             </div>
           )}
         </div>
-        <span className="text-[11px] tabular-nums text-neutral-500 w-10">
+        <span className="text-[11px] tabular-nums text-[var(--text-faint)] w-10">
           {formatTime(duration)}
         </span>
       </div>
@@ -170,12 +170,12 @@ function TrackLane({
   endRatio: number;
 }) {
   if (!filled || endRatio <= startRatio) {
-    return <div className="flex-1 border-b border-neutral-900/80" />;
+    return <div className="flex-1" />;
   }
   return (
-    <div className="flex-1 relative border-b border-neutral-900/80">
+    <div className="flex-1 relative">
       <div
-        className="absolute top-0.5 bottom-0.5 bg-blue-500/25 rounded-sm"
+        className="absolute top-0.5 bottom-0.5 bg-[var(--accent)]/25 rounded-sm"
         style={{
           left: `${startRatio * 100}%`,
           width: `${(endRatio - startRatio) * 100}%`,
