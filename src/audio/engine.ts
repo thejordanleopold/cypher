@@ -176,8 +176,19 @@ function setAudioSessionType(type: AudioSessionType) {
   if (typeof navigator === "undefined") return;
   const nav = navigator as NavigatorWithAudioSession;
   if (!nav.audioSession) return;
+  // On iOS, every transition between "playback" and "play-and-record"
+  // forces the OS to reassign the output route (Playback → loud speaker;
+  // PlayAndRecord → receiver/earpiece). That manifests as audible
+  // re-routing the moment recording starts, then again when it stops.
+  // Pin the session to "play-and-record" if the API is available so the
+  // route stays stable across the entire app lifecycle. Quality of
+  // playback in PlayAndRecord on iOS 17+ is on par with Playback for
+  // music — the historical voice-profile downgrade only happens with
+  // the old "auto"/voice category.
+  const target: AudioSessionType =
+    type === "playback" ? "play-and-record" : type;
   try {
-    nav.audioSession.type = type;
+    nav.audioSession.type = target;
   } catch {
     // ignore — older browsers may treat the setter as read-only
   }
