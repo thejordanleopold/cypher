@@ -880,9 +880,14 @@ class AudioEngine {
   }
 
   private startSession(session: RecordingSession) {
-    // 100 ms timeslice flushes data periodically so a forced abort still
-    // surfaces something usable, and reduces final-blob assembly cost.
-    session.recorder.start(100);
+    // Don't pass a timeslice. With one, MediaRecorder fires `dataavailable`
+    // every N ms with a chunk and we concatenate them via new Blob([...]) at
+    // stop time — but on Safari/iOS the per-chunk MP4 fragments aren't
+    // reliably concatenable (only the first carries the moov header), so the
+    // decoder produces audible glitches at every boundary, heard as periodic
+    // clicks/clipping. Letting the recorder buffer the whole session and
+    // emit a single blob on stop keeps the container intact.
+    session.recorder.start();
   }
 
   private async finalizeSession(session: RecordingSession): Promise<AudioBuffer | null> {
