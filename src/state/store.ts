@@ -60,7 +60,7 @@ export interface TrackState {
   normalizationGain: number;
 }
 
-export const DEFAULT_INPUT_GAIN = 2;
+export const DEFAULT_INPUT_GAIN = 1;
 export const MAX_INPUT_GAIN = 6;
 
 interface CypherState {

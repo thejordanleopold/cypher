@@ -36,7 +36,7 @@ interface RecordingSession {
   routerEl: HTMLAudioElement | null;
 }
 
-const DEFAULT_RECORDER_BITRATE = 384_000;
+const DEFAULT_RECORDER_BITRATE = 512_000;
 // Decode recordings into a 48 kHz buffer so the saved WAV preserves the
 // mic's full bandwidth even on iOS Safari, where the live AudioContext
 // is often clamped to 24 kHz when the speaker route is active.
@@ -88,21 +88,39 @@ function createIosRouter(stream: MediaStream): HTMLAudioElement | null {
 }
 
 function softClipSample(v: number): number {
-  // Pass through unchanged below 0.7 (no audible coloration on normal
-  // signal), then asymptote toward ±1 above. Avoids the transient-killing
-  // pumping a brickwall compressor would impose during capture.
+  // Linear up to ±0.92 (so most music passes through bit-for-bit), then
+  // asymptote smoothly toward ±1.0 above that. Aggressive thresholds here
+  // squash transients and read as "muffled" or "smushed" — keep the curve
+  // mostly out of the way and only catch true overs.
   const a = v < 0 ? -v : v;
-  if (a <= 0.7) return v;
+  if (a <= 0.92) return v;
   const sign = v < 0 ? -1 : 1;
-  return sign * (0.7 + 0.3 * (1 - Math.exp(-(a - 0.7) / 0.3)));
+  return sign * (0.92 + 0.08 * (1 - Math.exp(-(a - 0.92) / 0.08)));
 }
 
 function applyInputGain(buf: AudioBuffer, gain: number): AudioBuffer {
   if (gain === 1) return buf;
+  // Probe peak first — if the gained signal stays inside ±1.0 there's no
+  // need to soft-clip at all, and we just multiply linearly. This prevents
+  // the soft-clip curve from coloring quiet recordings that the user
+  // boosted modestly.
+  let peak = 0;
   for (let c = 0; c < buf.numberOfChannels; c++) {
     const data = buf.getChannelData(c);
     for (let i = 0; i < data.length; i++) {
-      data[i] = softClipSample(data[i] * gain);
+      const a = Math.abs(data[i]);
+      if (a > peak) peak = a;
+    }
+  }
+  const willClip = peak * gain > 1.0;
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const data = buf.getChannelData(c);
+    if (willClip) {
+      for (let i = 0; i < data.length; i++) {
+        data[i] = softClipSample(data[i] * gain);
+      }
+    } else {
+      for (let i = 0; i < data.length; i++) data[i] = data[i] * gain;
     }
   }
   return buf;
@@ -749,12 +767,13 @@ class AudioEngine {
     };
 
     // iOS Safari workaround: when getUserMedia is active the audio session
-    // category flips to "play and record", which by default routes Web
-    // Audio output to the receiver (top earpiece) instead of the loud
-    // speaker. Mounting a muted <audio> element with the mic stream as
-    // srcObject keeps WebKit treating output as standard playback so the
-    // backing tracks stay on the speaker.
-    const routerEl = createIosRouter(stream);
+    // Speaker routing during recording is handled by the master output
+    // bridge (engine.start installs it as an <audio> element consuming the
+    // mix stream). The earlier mic-stream router was removed because
+    // consuming the mic stream through an HTMLAudioElement on iOS can flip
+    // the audio session into a low-rate voice profile that drags mic
+    // capture down to ~16 kHz.
+    const routerEl: HTMLAudioElement | null = null;
 
     return {
       trackId,
