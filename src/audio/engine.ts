@@ -743,14 +743,16 @@ class AudioEngine {
     };
     // Disable browser DSP — AGC chases the backing track and pumps the
     // noise floor, while echoCancellation/noiseSuppression add latency
-    // and color the signal. Fine for VOIP, bad for music. Sample rate
-    // and channel count are expressed as `ideal` so devices that can't
-    // hit 48 kHz (Bluetooth HFP mics top out at 16 kHz) still produce
-    // a stream instead of NotReadableError.
+    // and color the signal. Fine for VOIP, bad for music. Wrap each
+    // boolean in `{ exact: false }` so browsers that interpret the bare
+    // false as "don't care" still definitively disable the processing.
+    // Sample rate and channel count are expressed as `ideal` so devices
+    // that can't hit 48 kHz (Bluetooth HFP mics top out at 16 kHz) still
+    // produce a stream instead of NotReadableError.
     const audioConstraints: MediaTrackConstraints = {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
+      echoCancellation: { exact: false },
+      noiseSuppression: { exact: false },
+      autoGainControl: { exact: false },
       sampleRate: { ideal: 48_000 },
       channelCount: { ideal: 2 },
     };
@@ -767,17 +769,37 @@ class AudioEngine {
     if (this.nativeCtx && this.nativeCtx.state !== "running") {
       await this.nativeCtx.resume().catch(() => {});
     }
-    // Some browsers honor a follow-up applyConstraints when they ignored
-    // the initial ideal hint, so push once more before we start.
+    // Probe the device's actual ceiling and force it. getCapabilities()
+    // tells us the real maximum the OS will give us for this mic — for
+    // the iPhone built-in mic that's 48 kHz stereo, for AirPods over HFP
+    // it's 16 kHz mono (a hard Bluetooth-protocol limit), and for USB
+    // interfaces it can be 96 kHz.  Try `exact` first so the device is
+    // pushed to the top of its range; fall back to `ideal` so devices
+    // that refuse to be pinned still produce a stream.
     const audioTrack = stream.getAudioTracks()[0];
     if (audioTrack) {
+      type SampleRateRange = { max?: number };
+      type ChannelRange = { max?: number };
+      const caps = (audioTrack.getCapabilities?.() ?? {}) as MediaTrackCapabilities & {
+        sampleRate?: SampleRateRange;
+        channelCount?: ChannelRange;
+      };
+      const targetRate = Math.max(caps.sampleRate?.max ?? 0, 48_000);
+      const targetChannels = Math.min(2, caps.channelCount?.max ?? 2);
       try {
         await audioTrack.applyConstraints({
-          sampleRate: { ideal: 48_000 },
-          channelCount: { ideal: 2 },
+          sampleRate: { exact: targetRate },
+          channelCount: { exact: targetChannels },
         });
       } catch {
-        // Device can't move; the rate we already have stands.
+        try {
+          await audioTrack.applyConstraints({
+            sampleRate: { ideal: targetRate },
+            channelCount: { ideal: targetChannels },
+          });
+        } catch {
+          // Stuck at whatever the OS opened the stream at.
+        }
       }
     }
     const capturedSampleRate =
