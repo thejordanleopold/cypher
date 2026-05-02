@@ -29,6 +29,7 @@ interface RecordingSession {
   mimeType: string;
   startedAt: number;
   capturedSampleRate: number;
+  routerEl: HTMLAudioElement | null;
 }
 
 const DEFAULT_RECORDER_BITRATE = 256_000;
@@ -44,6 +45,41 @@ function disconnectSessionNodes(session: RecordingSession) {
     } catch {
       // ignore
     }
+  }
+  if (session.routerEl) {
+    try {
+      session.routerEl.pause();
+      session.routerEl.srcObject = null;
+      session.routerEl.remove();
+    } catch {
+      // ignore
+    }
+    session.routerEl = null;
+  }
+}
+
+function createIosRouter(stream: MediaStream): HTMLAudioElement | null {
+  if (typeof document === "undefined") return null;
+  try {
+    const el = document.createElement("audio");
+    el.muted = true;
+    el.autoplay = true;
+    el.setAttribute("playsinline", "");
+    el.setAttribute("webkit-playsinline", "");
+    el.srcObject = stream;
+    el.style.position = "fixed";
+    el.style.width = "0";
+    el.style.height = "0";
+    el.style.opacity = "0";
+    el.style.pointerEvents = "none";
+    document.body.appendChild(el);
+    el.play().catch(() => {
+      // Autoplay may be blocked off-gesture; the muted hint usually allows
+      // it, but failures here are non-fatal — we still capture audio.
+    });
+    return el;
+  } catch {
+    return null;
   }
 }
 
@@ -261,12 +297,20 @@ class AudioEngine {
     return this.tracks.get(id);
   }
 
+  private isCapturing(id: TrackId): boolean {
+    return this.recording?.trackId === id || this.multiRecording.has(id);
+  }
+
   async play() {
     await this.start();
     const transport = Tone.getTransport();
     if (transport.state === "started") return;
     const now = Tone.now() + 0.05;
     for (const t of this.tracks.values()) {
+      // Don't sound a track that's actively being recorded — the previous
+      // take would otherwise play back through the speaker and bleed into
+      // the mic, fighting the new take we're trying to capture.
+      if (this.isCapturing(t.id)) continue;
       if (t.player && t.buffer) {
         const offset = t.trimInSec + transport.seconds;
         const end = t.trimOutSec ?? t.buffer.duration;
@@ -318,6 +362,7 @@ class AudioEngine {
     if (wasPlaying) {
       const now = Tone.now() + 0.05;
       for (const t of this.tracks.values()) {
+        if (this.isCapturing(t.id)) continue;
         if (!t.player || !t.buffer) continue;
         const offset = t.trimInSec + transport.seconds;
         const end = t.trimOutSec ?? t.buffer.duration;
@@ -456,6 +501,13 @@ class AudioEngine {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: audioConstraints,
     });
+    // iOS suspends the AudioContext when it switches the audio session to
+    // "play and record" during getUserMedia.  Re-wake it here while we are
+    // still inside the getUserMedia resolution chain (iOS treats this as an
+    // extension of the original user gesture).
+    if (this.nativeCtx && this.nativeCtx.state !== "running") {
+      await this.nativeCtx.resume().catch(() => {});
+    }
     // Some browsers honor a follow-up applyConstraints when they ignored
     // the initial ideal hint, so push once more before we start.
     const audioTrack = stream.getAudioTracks()[0];
@@ -502,6 +554,14 @@ class AudioEngine {
       if (e.data && e.data.size > 0) chunks.push(e.data);
     };
 
+    // iOS Safari workaround: when getUserMedia is active the audio session
+    // category flips to "play and record", which by default routes Web
+    // Audio output to the receiver (top earpiece) instead of the loud
+    // speaker. Mounting a muted <audio> element with the mic stream as
+    // srcObject keeps WebKit treating output as standard playback so the
+    // backing tracks stay on the speaker.
+    const routerEl = createIosRouter(stream);
+
     return {
       trackId,
       stream,
@@ -514,6 +574,7 @@ class AudioEngine {
       mimeType: recorder.mimeType || mimeType || "audio/webm",
       startedAt: ctx.currentTime,
       capturedSampleRate,
+      routerEl,
     };
   }
 
@@ -637,6 +698,16 @@ class AudioEngine {
       throw err;
     }
     for (const s of sessions) this.multiRecording.set(s.trackId, s);
+    // Always restart playback from the beginning when recording starts.
+    // transport.pause() would keep the playhead at its current position:
+    // if the user played all the way to the end of their tracks and then
+    // pressed Record, transport.seconds could be past every track's end,
+    // making dur = 0 for all of them and producing silence.
+    // transport.stop() resets seconds to 0 so the offset calculation in
+    // play() always yields a positive duration.
+    const transport = Tone.getTransport();
+    transport.stop();
+    for (const t of this.tracks.values()) t.player?.stop();
     await this.play();
     for (const s of sessions) this.startSession(s);
   }
