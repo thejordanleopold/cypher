@@ -21,6 +21,10 @@ export function Transport() {
     countdownActive,
     countdownBeat,
     cancelCountdown,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
   } = useCypher();
   const armedCount = tracks.filter((t) => t.armed).length;
   const emptyCount = tracks.filter((t) => !t.hasAudio).length;
@@ -96,6 +100,32 @@ export function Transport() {
               }`}
             />
           )}
+        </button>
+
+        <div className="hidden sm:block h-7 w-px bg-[var(--border-subtle)]/80 mx-1" aria-hidden="true" />
+        <button
+          onClick={undo}
+          disabled={!canUndo}
+          aria-label="Undo"
+          title="Undo"
+          className="h-9 w-9 rounded-md bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)] flex items-center justify-center active:scale-95 shrink-0 transition-colors disabled:opacity-40 disabled:hover:bg-white/[0.05]"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M9 14L4 9l5-5" />
+            <path d="M4 9h11a5 5 0 0 1 0 10h-4" />
+          </svg>
+        </button>
+        <button
+          onClick={redo}
+          disabled={!canRedo}
+          aria-label="Redo"
+          title="Redo"
+          className="h-9 w-9 rounded-md bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)] flex items-center justify-center active:scale-95 shrink-0 transition-colors disabled:opacity-40 disabled:hover:bg-white/[0.05]"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M15 14l5-5-5-5" />
+            <path d="M20 9H9a5 5 0 0 0 0 10h4" />
+          </svg>
         </button>
 
         <div className="flex-1" />

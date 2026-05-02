@@ -135,9 +135,37 @@ interface CypherState {
   exportMix: (format: ExportFormat) => Promise<void>;
   exportStems: (format: ExportFormat) => Promise<void>;
 
+  // Undo / redo for non-destructive parameter changes (volume, pan, mute,
+  // solo, trim, normalize, input gain, BPM). Track add/remove, recording,
+  // import, and rename are intentionally NOT in history.
+  undoStack: HistorySnapshot[];
+  redoStack: HistorySnapshot[];
+  canUndo: boolean;
+  canRedo: boolean;
+  undo: () => void;
+  redo: () => void;
+
   toasts: Toast[];
   pushToast: (t: Omit<Toast, "id">) => void;
   dismissToast: (id: number) => void;
+}
+
+interface TrackParamSnapshot {
+  id: string;
+  volume: number;
+  pan: number;
+  muted: boolean;
+  soloed: boolean;
+  trimInSec: number;
+  trimOutSec: number | null;
+  normalized: boolean;
+  normalizationGain: number;
+  inputGain: number;
+}
+
+interface HistorySnapshot {
+  tracks: TrackParamSnapshot[];
+  bpm: number;
 }
 
 let trackCounter = 0;
@@ -171,6 +199,44 @@ export const useCypher = create<CypherState>((set, get) => ({
   countdownBeat: 0,
   latencyOffsetMs: 0,
   isCalibrating: false,
+  undoStack: [],
+  redoStack: [],
+  canUndo: false,
+  canRedo: false,
+
+  undo: () => {
+    const s = get();
+    if (s.undoStack.length === 0) return;
+    const current = captureHistorySnapshot(s);
+    const prev = s.undoStack[s.undoStack.length - 1];
+    const nextUndo = s.undoStack.slice(0, -1);
+    const nextRedo = [...s.redoStack, current];
+    set({
+      undoStack: nextUndo,
+      redoStack: nextRedo,
+      canUndo: nextUndo.length > 0,
+      canRedo: true,
+    });
+    applyHistorySnapshot(prev);
+    resetHistoryCoalesce();
+  },
+
+  redo: () => {
+    const s = get();
+    if (s.redoStack.length === 0) return;
+    const current = captureHistorySnapshot(s);
+    const next = s.redoStack[s.redoStack.length - 1];
+    const nextRedo = s.redoStack.slice(0, -1);
+    const nextUndo = [...s.undoStack, current];
+    set({
+      undoStack: nextUndo,
+      redoStack: nextRedo,
+      canUndo: true,
+      canRedo: nextRedo.length > 0,
+    });
+    applyHistorySnapshot(next);
+    resetHistoryCoalesce();
+  },
 
   setCountInBeats: (n) => set({ countInBeats: Math.max(0, Math.min(8, n)) }),
   cancelCountdown: () => {
@@ -370,6 +436,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   setVolume: (id, v) => {
+    pushHistory(get(), `volume:${id}`);
     getEngine().setVolume(id, v);
     set((s) => ({
       tracks: s.tracks.map((t) => (t.id === id ? { ...t, volume: v } : t)),
@@ -378,6 +445,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   setPan: (id, p) => {
+    pushHistory(get(), `pan:${id}`);
     getEngine().setPan(id, p);
     set((s) => ({
       tracks: s.tracks.map((t) => (t.id === id ? { ...t, pan: p } : t)),
@@ -388,6 +456,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   toggleMute: (id) => {
     const t = get().tracks.find((x) => x.id === id);
     if (!t) return;
+    pushHistory(get(), `mute:${id}`);
     const muted = !t.muted;
     set((s) => ({
       tracks: s.tracks.map((x) => (x.id === id ? { ...x, muted } : x)),
@@ -406,6 +475,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   setInputGain: (id, gain) => {
+    pushHistory(get(), `inputGain:${id}`);
     const clamped = Math.max(0, Math.min(MAX_INPUT_GAIN, gain));
     getEngine().setRecordingInputGain(id, clamped);
     set((s) => ({
@@ -470,6 +540,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   setTrim: (id, inSec, outSec) => {
+    pushHistory(get(), `trim:${id}`);
     getEngine().setTrim(id, inSec, outSec);
     set((s) => ({
       tracks: s.tracks.map((t) =>
@@ -482,6 +553,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   toggleSolo: (id) => {
     const t = get().tracks.find((x) => x.id === id);
     if (!t) return;
+    pushHistory(get(), `solo:${id}`);
     const soloed = !t.soloed;
     set((s) => ({
       tracks: s.tracks.map((x) => (x.id === id ? { ...x, soloed } : x)),
@@ -511,6 +583,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   setBpm: (bpm) => {
+    pushHistory(get(), "bpm");
     getEngine().setBpm(bpm);
     set({ bpm });
     schedulePersist(get());
@@ -628,6 +701,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   toggleNormalize: (id) => {
     const t = get().tracks.find((x) => x.id === id);
     if (!t || !t.hasAudio) return;
+    pushHistory(get(), `normalize:${id}`);
     const engine = getEngine();
     if (t.normalized) {
       // Revert to the original signal level.
@@ -896,6 +970,98 @@ async function flushPersist() {
   if (f) await f();
 }
 
+// ---- Undo / redo ----
+
+const MAX_HISTORY = 50;
+// Same-action edits within this window are coalesced into a single history
+// entry — dragging a volume slider would otherwise generate dozens of
+// snapshots and force the user to undo dozens of times to back out one move.
+const HISTORY_COALESCE_MS = 800;
+let lastHistoryAction = "";
+let lastHistoryTime = 0;
+
+function captureHistorySnapshot(state: CypherState): HistorySnapshot {
+  return {
+    bpm: state.bpm,
+    tracks: state.tracks.map((t) => ({
+      id: t.id,
+      volume: t.volume,
+      pan: t.pan,
+      muted: t.muted,
+      soloed: t.soloed,
+      trimInSec: t.trimInSec,
+      trimOutSec: t.trimOutSec,
+      normalized: t.normalized,
+      normalizationGain: t.normalizationGain,
+      inputGain: t.inputGain,
+    })),
+  };
+}
+
+function pushHistory(state: CypherState, action: string) {
+  const now = Date.now();
+  if (action === lastHistoryAction && now - lastHistoryTime < HISTORY_COALESCE_MS) {
+    lastHistoryTime = now;
+    return;
+  }
+  const snap = captureHistorySnapshot(state);
+  useCypher.setState((s) => {
+    const stack = [...s.undoStack, snap];
+    if (stack.length > MAX_HISTORY) stack.shift();
+    return {
+      undoStack: stack,
+      redoStack: [],
+      canUndo: true,
+      canRedo: false,
+    };
+  });
+  lastHistoryAction = action;
+  lastHistoryTime = now;
+}
+
+function resetHistoryCoalesce() {
+  lastHistoryAction = "";
+  lastHistoryTime = 0;
+}
+
+function applyHistorySnapshot(snap: HistorySnapshot) {
+  const engine = getEngine();
+  engine.setBpm(snap.bpm);
+  const byId = new Map(snap.tracks.map((t) => [t.id, t]));
+  useCypher.setState((s) => ({
+    bpm: snap.bpm,
+    tracks: s.tracks.map((t) => {
+      const snapT = byId.get(t.id);
+      if (!snapT) return t;
+      return {
+        ...t,
+        volume: snapT.volume,
+        pan: snapT.pan,
+        muted: snapT.muted,
+        soloed: snapT.soloed,
+        trimInSec: snapT.trimInSec,
+        trimOutSec: snapT.trimOutSec,
+        normalized: snapT.normalized,
+        normalizationGain: snapT.normalizationGain,
+        inputGain: snapT.inputGain,
+      };
+    }),
+  }));
+  for (const t of useCypher.getState().tracks) {
+    const snapT = byId.get(t.id);
+    if (!snapT) continue;
+    engine.setVolume(t.id, snapT.volume);
+    engine.setPan(t.id, snapT.pan);
+    engine.setTrim(t.id, snapT.trimInSec, snapT.trimOutSec);
+    engine.setNormalizationGain(
+      t.id,
+      snapT.normalized ? snapT.normalizationGain : 1,
+    );
+  }
+  applyMixState(useCypher.getState().tracks);
+  schedulePersist(useCypher.getState());
+}
+
 // Build a list of MixTrack values for export. Pulls volume/pan/trim/normalization
 // from the user-facing store state (so solo isn't interpreted as mute) and the
 // audio buffer from the engine.
@@ -1053,7 +1219,12 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
     isMultiRecording: false,
     recordingTrackId: null,
     isLoaded: true,
+    undoStack: [],
+    redoStack: [],
+    canUndo: false,
+    canRedo: false,
   });
+  resetHistoryCoalesce();
   applyMixState(restored);
 }
 
@@ -1088,7 +1259,12 @@ async function switchToProject(
     isMultiRecording: false,
     recordingTrackId: null,
     isLoaded: true,
+    undoStack: [],
+    redoStack: [],
+    canUndo: false,
+    canRedo: false,
   });
+  resetHistoryCoalesce();
   schedulePersist({
     currentProjectId: id,
     currentProjectName: name,
