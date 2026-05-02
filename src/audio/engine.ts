@@ -157,6 +157,32 @@ async function decodeRecording(
   }
 }
 
+// iOS 17+ Audio Session API — lets us pick the AVAudioSession category and
+// mode WebKit uses for the page. Without this, recording sessions default
+// to a voice profile that band-limits the mic (and on iPhone forces the
+// bottom voice mic regardless of orientation). Best-effort: silently
+// ignored on browsers without the API.
+type AudioSessionType =
+  | "auto"
+  | "playback"
+  | "transient"
+  | "transient-solo"
+  | "ambient"
+  | "play-and-record";
+type NavigatorWithAudioSession = Navigator & {
+  audioSession?: { type: AudioSessionType };
+};
+function setAudioSessionType(type: AudioSessionType) {
+  if (typeof navigator === "undefined") return;
+  const nav = navigator as NavigatorWithAudioSession;
+  if (!nav.audioSession) return;
+  try {
+    nav.audioSession.type = type;
+  } catch {
+    // ignore — older browsers may treat the setter as read-only
+  }
+}
+
 function pickRecorderMimeType(): string {
   const candidates = [
     "audio/webm;codecs=opus",
@@ -207,6 +233,11 @@ class AudioEngine {
       this.nativeCtx = new AudioContext({ latencyHint: "interactive" });
       Tone.setContext(this.nativeCtx);
     }
+    // Hint WebKit (iOS 17+) to use the high-fidelity Playback audio session
+    // when we're not actively recording. Without this, the default "auto"
+    // category often demotes the session to a voice profile (16 kHz,
+    // earpiece route) the moment the page touches anything mic-adjacent.
+    setAudioSessionType("playback");
     if (this.nativeCtx.state === "suspended") {
       try {
         await this.nativeCtx.resume();
@@ -657,8 +688,16 @@ class AudioEngine {
 
   async requestMicPermission(): Promise<void> {
     // Triggers the OS prompt so subsequent enumerateDevices() returns labels.
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach((t) => t.stop());
+    // Hint the high-fidelity record profile before the prompt so iOS doesn't
+    // demote the audio session, then immediately revert to playback once
+    // the probe stream is closed — we're not actually capturing here.
+    setAudioSessionType("play-and-record");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((t) => t.stop());
+    } finally {
+      setAudioSessionType("playback");
+    }
   }
 
   private async openRecordingSession(
@@ -672,6 +711,11 @@ class AudioEngine {
     if (typeof MediaRecorder === "undefined") {
       throw new Error("MediaRecorder is not supported in this browser");
     }
+    // Tell WebKit we are about to record. This selects the high-fidelity
+    // play-and-record profile rather than the voice-call category that iOS
+    // would otherwise default to (which forces the bottom mic and clamps
+    // bandwidth to ~8 kHz).
+    setAudioSessionType("play-and-record");
     // Engage the output bridge before getUserMedia so the audio session is
     // established with the loud-speaker route already in place on iOS.
     this.enableOutputBridge();
@@ -681,6 +725,9 @@ class AudioEngine {
         this.disableOutputBridge();
         bridgeOpen = false;
       }
+      // Restore the playback profile so output quality bounces back even
+      // if mic permission was denied or the device couldn't open.
+      setAudioSessionType("playback");
       throw err;
     };
     // Disable browser DSP — AGC chases the backing track and pumps the
@@ -819,6 +866,7 @@ class AudioEngine {
     disconnectSessionNodes(session);
     session.stream.getTracks().forEach((t) => t.stop());
     this.disableOutputBridge();
+    this.maybeRestorePlaybackSession();
 
     if (session.chunks.length === 0) {
       throw Object.assign(new Error("Recording captured no audio"), {
@@ -876,6 +924,16 @@ class AudioEngine {
       });
       this.disableOutputBridge();
     }
+    if (sessions.length > 0) this.maybeRestorePlaybackSession();
+  }
+
+  // Switch the iOS audio session back to high-fidelity playback once no
+  // session is left active. Guards against flipping while another track
+  // is still recording in a multi-record run.
+  private maybeRestorePlaybackSession() {
+    if (this.recording) return;
+    if (this.multiRecording.size > 0) return;
+    setAudioSessionType("playback");
   }
 
   async startRecording(
