@@ -21,28 +21,78 @@ interface RecordingSession {
   trackId: TrackId;
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
-  inputGain: GainNode;
-  limiter: DynamicsCompressorNode;
   analyser: AnalyserNode;
-  streamDest: MediaStreamAudioDestinationNode;
+  sink: GainNode;
+  inputGainValue: number;
   recorder: MediaRecorder;
   chunks: Blob[];
   mimeType: string;
   startedAt: number;
+  capturedSampleRate: number;
 }
 
-const DEFAULT_RECORDER_BITRATE = 192_000;
+const DEFAULT_RECORDER_BITRATE = 256_000;
+// Decode recordings into a 48 kHz buffer so the saved WAV preserves the
+// mic's full bandwidth even on iOS Safari, where the live AudioContext
+// is often clamped to 24 kHz when the speaker route is active.
+const DECODE_SAMPLE_RATE = 48_000;
 
 function disconnectSessionNodes(session: RecordingSession) {
-  for (const node of [
-    session.analyser,
-    session.limiter,
-    session.inputGain,
-    session.streamDest,
-    session.source,
-  ]) {
+  for (const node of [session.analyser, session.sink, session.source]) {
     try {
       node.disconnect();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function softClipSample(v: number): number {
+  // Pass through unchanged below 0.7 (no audible coloration on normal
+  // signal), then asymptote toward ±1 above. Avoids the transient-killing
+  // pumping a brickwall compressor would impose during capture.
+  const a = v < 0 ? -v : v;
+  if (a <= 0.7) return v;
+  const sign = v < 0 ? -1 : 1;
+  return sign * (0.7 + 0.3 * (1 - Math.exp(-(a - 0.7) / 0.3)));
+}
+
+function applyInputGain(buf: AudioBuffer, gain: number): AudioBuffer {
+  if (gain === 1) return buf;
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const data = buf.getChannelData(c);
+    for (let i = 0; i < data.length; i++) {
+      data[i] = softClipSample(data[i] * gain);
+    }
+  }
+  return buf;
+}
+
+async function decodeRecording(
+  arr: ArrayBuffer,
+  hintRate: number,
+): Promise<AudioBuffer> {
+  // Decode at the source rate when known so we don't bloat the WAV with
+  // empty resampled headroom. Clamp to OfflineAudioContext's valid range.
+  const targetRate = Math.max(
+    8_000,
+    Math.min(96_000, Math.round(hintRate) || DECODE_SAMPLE_RATE),
+  );
+  if (typeof OfflineAudioContext !== "undefined") {
+    try {
+      const oac = new OfflineAudioContext(1, 1, targetRate);
+      return await oac.decodeAudioData(arr.slice(0));
+    } catch {
+      // Some browsers refuse decodeAudioData on OfflineAudioContext;
+      // fall through to a real context.
+    }
+  }
+  const ctx = new AudioContext({ sampleRate: targetRate });
+  try {
+    return await ctx.decodeAudioData(arr.slice(0));
+  } finally {
+    try {
+      await ctx.close();
     } catch {
       // ignore
     }
@@ -387,15 +437,18 @@ class AudioEngine {
     if (typeof MediaRecorder === "undefined") {
       throw new Error("MediaRecorder is not supported in this browser");
     }
-    // Browser AGC tends to chase the backing track and pump the noise floor,
-    // so we leave it off and apply our own gain + soft limiter below. We
-    // also disable echoCancellation/noiseSuppression because they add
-    // latency and color the signal — fine for VOIP, bad for music.
+    // Disable browser DSP — AGC chases the backing track and pumps the
+    // noise floor, while echoCancellation/noiseSuppression add latency
+    // and color the signal. Fine for VOIP, bad for music. Sample rate
+    // and channel count are expressed as `ideal` so devices that can't
+    // hit 48 kHz (Bluetooth HFP mics top out at 16 kHz) still produce
+    // a stream instead of NotReadableError.
     const audioConstraints: MediaTrackConstraints = {
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
-      channelCount: 1,
+      sampleRate: { ideal: 48_000 },
+      channelCount: { ideal: 2 },
     };
     if (deviceId && deviceId !== "default") {
       audioConstraints.deviceId = { exact: deviceId };
@@ -403,34 +456,47 @@ class AudioEngine {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: audioConstraints,
     });
+    // Some browsers honor a follow-up applyConstraints when they ignored
+    // the initial ideal hint, so push once more before we start.
+    const audioTrack = stream.getAudioTracks()[0];
+    if (audioTrack) {
+      try {
+        await audioTrack.applyConstraints({
+          sampleRate: { ideal: 48_000 },
+          channelCount: { ideal: 2 },
+        });
+      } catch {
+        // Device can't move; the rate we already have stands.
+      }
+    }
+    const capturedSampleRate =
+      audioTrack?.getSettings().sampleRate ?? this.context().sampleRate;
 
     const ctx = this.context();
     const source = ctx.createMediaStreamSource(stream);
-    const inputGain = ctx.createGain();
-    inputGain.gain.value = Math.max(0, gainValue);
-    // Soft brickwall: catches the peaks that the boosted gain would
-    // otherwise clip, without audibly squashing the signal.
-    const limiter = ctx.createDynamicsCompressor();
-    limiter.threshold.value = -1;
-    limiter.knee.value = 6;
-    limiter.ratio.value = 12;
-    limiter.attack.value = 0.003;
-    limiter.release.value = 0.1;
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0;
-    const streamDest = ctx.createMediaStreamDestination();
-    source.connect(inputGain);
-    inputGain.connect(limiter);
-    limiter.connect(analyser);
-    analyser.connect(streamDest);
+    // Force the analyser to be pulled by the audio graph so it actually
+    // updates its time-domain buffer (used by the live waveform).
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    sink.connect(ctx.destination);
+    source.connect(analyser);
+    analyser.connect(sink);
 
+    // Recorder reads the raw mic stream — Web Audio is only used for the
+    // level meter / live waveform tap above. Routing the recording through
+    // the AudioContext would resample to its rate (24 kHz on iOS speaker
+    // route), gutting the high-frequency content. Gain is applied on the
+    // decoded buffer in finalizeSession instead, so we don't need a
+    // brickwall limiter to catch peaks during capture.
     const mimeType = pickRecorderMimeType();
     const options: MediaRecorderOptions = {
       audioBitsPerSecond: DEFAULT_RECORDER_BITRATE,
     };
     if (mimeType) options.mimeType = mimeType;
-    const recorder = new MediaRecorder(streamDest.stream, options);
+    const recorder = new MediaRecorder(stream, options);
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) chunks.push(e.data);
@@ -440,15 +506,23 @@ class AudioEngine {
       trackId,
       stream,
       source,
-      inputGain,
-      limiter,
       analyser,
-      streamDest,
+      sink,
+      inputGainValue: Math.max(0, gainValue),
       recorder,
       chunks,
       mimeType: recorder.mimeType || mimeType || "audio/webm",
       startedAt: ctx.currentTime,
+      capturedSampleRate,
     };
+  }
+
+  capturedSampleRate(trackId: TrackId): number | null {
+    const session =
+      this.recording?.trackId === trackId
+        ? this.recording
+        : this.multiRecording.get(trackId);
+    return session?.capturedSampleRate ?? null;
   }
 
   private startSession(session: RecordingSession) {
@@ -480,7 +554,7 @@ class AudioEngine {
     let buf: AudioBuffer;
     try {
       const arr = await blob.arrayBuffer();
-      buf = await this.context().decodeAudioData(arr.slice(0));
+      buf = await decodeRecording(arr, session.capturedSampleRate);
     } catch (err) {
       console.error("Failed to decode recording", err);
       throw Object.assign(
@@ -490,6 +564,7 @@ class AudioEngine {
         { name: "DecodeFailedError" },
       );
     }
+    buf = applyInputGain(buf, session.inputGainValue);
 
     const track = this.tracks.get(session.trackId);
     if (track) {
@@ -604,11 +679,7 @@ class AudioEngine {
         ? this.recording
         : this.multiRecording.get(trackId);
     if (!session) return;
-    session.inputGain.gain.setTargetAtTime(
-      Math.max(0, value),
-      session.inputGain.context.currentTime,
-      0.01,
-    );
+    session.inputGainValue = Math.max(0, value);
   }
 
   async stopRecording(): Promise<AudioBuffer | null> {

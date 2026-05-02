@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useCypher } from "@/state/store";
 import { getEngine } from "@/audio/engine";
 
@@ -8,6 +9,12 @@ interface Props {
   trackId: string;
   selectedDeviceId: string;
   disabled?: boolean;
+}
+
+interface PopupRect {
+  top: number;
+  left: number;
+  width: number;
 }
 
 export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
@@ -18,11 +25,46 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
   } = useCypher();
   const [open, setOpen] = useState(false);
   const [rescanning, setRescanning] = useState(false);
+  const [rect, setRect] = useState<PopupRect | null>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const popupRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
     refreshInputDevices();
   }, [open, refreshInputDevices]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const update = () => {
+      const el = buttonRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      setRect({ top: r.bottom + 4, left: r.left, width: r.width });
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (
+        buttonRef.current?.contains(e.target as Node) ||
+        popupRef.current?.contains(e.target as Node)
+      ) {
+        return;
+      }
+      setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [open]);
 
   const selected =
     inputDevices.find((d) => d.deviceId === selectedDeviceId) ?? null;
@@ -34,9 +76,6 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
   async function rescan() {
     setRescanning(true);
     try {
-      // Forcing a permission prompt is the only way to get labeled devices
-      // to appear when the user has granted "while using" permission and
-      // then plugged in AirPods or wired headphones.
       try {
         await getEngine().requestMicPermission();
       } catch {
@@ -51,6 +90,7 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
   return (
     <div className="relative w-full">
       <button
+        ref={buttonRef}
         onClick={() => setOpen((v) => !v)}
         disabled={disabled}
         className="h-9 w-full px-2.5 rounded-md bg-neutral-800 text-neutral-200 text-xs flex items-center gap-2 disabled:opacity-50 active:scale-[0.98]"
@@ -64,46 +104,56 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
           <path d="M6 9l6 6 6-6" />
         </svg>
       </button>
-      {open && (
-        <div
-          role="listbox"
-          className="absolute left-0 right-0 top-full mt-1 z-30 max-h-80 overflow-auto bg-neutral-900 border border-neutral-700 rounded-md shadow-xl"
-        >
-          <DeviceOption
-            label="Default mic (system)"
-            selected={selectedDeviceId === "default"}
-            onPick={() => {
-              setInputDevice(trackId, "default");
-              setOpen(false);
+      {open && rect && typeof document !== "undefined" &&
+        createPortal(
+          <div
+            ref={popupRef}
+            role="listbox"
+            style={{
+              position: "fixed",
+              top: rect.top,
+              left: rect.left,
+              width: rect.width,
+              maxHeight: `calc(100vh - ${rect.top + 16}px)`,
             }}
-          />
-          {inputDevices
-            .filter((d) => d.deviceId !== "default" && d.deviceId !== "")
-            .map((d) => (
-              <DeviceOption
-                key={d.deviceId}
-                label={d.label || `Mic ${d.deviceId.slice(0, 6)}`}
-                selected={selectedDeviceId === d.deviceId}
-                onPick={() => {
-                  setInputDevice(trackId, d.deviceId);
-                  setOpen(false);
-                }}
-              />
-            ))}
-          <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">
-            <button
-              onClick={rescan}
-              disabled={rescanning}
-              className="w-full h-8 rounded-md bg-neutral-800 hover:bg-neutral-700 text-neutral-100 text-xs font-medium active:scale-[0.98] disabled:opacity-50"
-            >
-              {rescanning ? "Scanning…" : "Rescan devices"}
-            </button>
-            <p className="text-[10px] text-neutral-500 leading-snug">
-              Wired headsets and USB mics show up here. Bluetooth like AirPods may not — iOS keeps that mic for phone calls only. To stop the speaker bleeding into the mic, plug in wired headphones.
-            </p>
-          </div>
-        </div>
-      )}
+            className="z-[80] overflow-auto bg-neutral-900 border border-neutral-700 rounded-md shadow-xl"
+          >
+            <DeviceOption
+              label="Default mic (system)"
+              selected={selectedDeviceId === "default"}
+              onPick={() => {
+                setInputDevice(trackId, "default");
+                setOpen(false);
+              }}
+            />
+            {inputDevices
+              .filter((d) => d.deviceId !== "default" && d.deviceId !== "")
+              .map((d) => (
+                <DeviceOption
+                  key={d.deviceId}
+                  label={d.label || `Mic ${d.deviceId.slice(0, 6)}`}
+                  selected={selectedDeviceId === d.deviceId}
+                  onPick={() => {
+                    setInputDevice(trackId, d.deviceId);
+                    setOpen(false);
+                  }}
+                />
+              ))}
+            <div className="border-t border-neutral-800 px-3 py-2.5 space-y-2">
+              <button
+                onClick={rescan}
+                disabled={rescanning}
+                className="w-full h-8 rounded-md bg-neutral-800 hover:bg-neutral-700 text-neutral-100 text-xs font-medium active:scale-[0.98] disabled:opacity-50"
+              >
+                {rescanning ? "Scanning…" : "Rescan devices"}
+              </button>
+              <p className="text-[10px] text-neutral-500 leading-snug">
+                Wired headsets and USB mics show up here. Bluetooth like AirPods may not — iOS keeps that mic for phone calls only. To stop the speaker bleeding into the mic, plug in wired headphones.
+              </p>
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
