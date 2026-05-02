@@ -18,6 +18,7 @@ interface WaveformProps {
 const HANDLE_WIDTH_PX = 12;
 const MIN_TRIM_GAP_SEC = 0.05;
 const SNAP_TO_END_SEC = 0.01;
+const DOUBLE_TAP_MS = 320;
 
 export function Waveform({
   trackId,
@@ -30,15 +31,18 @@ export function Waveform({
   const trackRef = useRef<HTMLDivElement>(null);
   const waveContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
+  const lastTapRef = useRef(0);
   const setTrim = useCypher((s) => s.setTrim);
   const [activeSide, setActiveSide] = useState<"left" | "right" | null>(null);
+  const [trimMode, setTrimMode] = useState(false);
 
   const safeDuration = durationSec > 0 ? durationSec : 1;
   const effectiveOut = trimOutSec ?? safeDuration;
   const inPct = clampPct((trimInSec / safeDuration) * 100);
   const outPct = clampPct((effectiveOut / safeDuration) * 100);
   const isTrimmed =
-    trimInSec > 0.001 || (trimOutSec !== null && trimOutSec < safeDuration - SNAP_TO_END_SEC);
+    trimInSec > 0.001 ||
+    (trimOutSec !== null && trimOutSec < safeDuration - SNAP_TO_END_SEC);
 
   useEffect(() => {
     if (!waveContainerRef.current) return;
@@ -69,9 +73,25 @@ export function Waveform({
     ws.loadBlob(audioBufferToWavBlob(buf)).catch(() => {});
   }, [trackId, hasAudio, bufferRevision]);
 
+  function onTrackPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    // Handle taps manage their own pointer events — ignore them here.
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-trim-handle]")) return;
+    const now = Date.now();
+    const delta = now - lastTapRef.current;
+    if (delta > 0 && delta < DOUBLE_TAP_MS) {
+      setTrimMode((m) => !m);
+      lastTapRef.current = 0;
+    } else {
+      lastTapRef.current = now;
+    }
+  }
+
   function startDrag(side: "left" | "right") {
     return (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
+      // Don't let the tap bubble into the parent's double-tap detection.
+      e.stopPropagation();
       e.currentTarget.setPointerCapture(e.pointerId);
       setActiveSide(side);
 
@@ -111,7 +131,7 @@ export function Waveform({
 
   return (
     <div className="relative select-none pt-3.5">
-      {/* Time labels — positioned over the handles, visible while dragging */}
+      {/* Time labels — visible while a handle is being dragged */}
       <div
         className={`pointer-events-none absolute inset-x-0 top-0 h-3 transition-opacity duration-150 ${
           activeSide ? "opacity-100" : "opacity-0"
@@ -121,48 +141,78 @@ export function Waveform({
         <TimeLabel pct={outPct} seconds={effectiveOut} />
       </div>
 
-      <div ref={trackRef} className="relative h-11">
+      <div
+        ref={trackRef}
+        onPointerDown={onTrackPointerDown}
+        className={`relative h-11 transition-shadow ${
+          trimMode ? "ring-1 ring-amber-400/40 rounded-md" : ""
+        }`}
+        title={trimMode ? "Double tap to exit trim" : "Double tap to trim"}
+      >
         {/* Wave + dim overlays — clipped to the rounded track */}
         <div className="absolute inset-0 rounded-md overflow-hidden bg-neutral-900/50">
           <div ref={waveContainerRef} className="absolute inset-0" />
           <div
-            className="absolute inset-y-0 left-0 bg-black/55 pointer-events-none"
+            className={`absolute inset-y-0 left-0 pointer-events-none transition-[background-color,width] ${
+              trimMode
+                ? "bg-black/55"
+                : isTrimmed
+                ? "bg-black/30"
+                : "bg-transparent"
+            }`}
             style={{ width: `${inPct}%` }}
           />
           <div
-            className="absolute inset-y-0 right-0 bg-black/55 pointer-events-none"
+            className={`absolute inset-y-0 right-0 pointer-events-none transition-[background-color,width] ${
+              trimMode
+                ? "bg-black/55"
+                : isTrimmed
+                ? "bg-black/30"
+                : "bg-transparent"
+            }`}
             style={{ width: `${100 - outPct}%` }}
           />
         </div>
 
-        {/* Yellow frame across the trim window */}
-        <div
-          className={`absolute inset-y-0 border-y-2 pointer-events-none transition-colors ${
-            activeSide
-              ? "border-amber-300"
-              : isTrimmed
-              ? "border-amber-400/85"
-              : "border-amber-400/55"
-          }`}
-          style={{ left: `${inPct}%`, right: `${100 - outPct}%` }}
-        />
-
-        <Handle
-          side="left"
-          pct={inPct}
-          active={activeSide === "left"}
-          ariaValue={trimInSec}
-          ariaMax={safeDuration}
-          onPointerDown={startDrag("left")}
-        />
-        <Handle
-          side="right"
-          pct={outPct}
-          active={activeSide === "right"}
-          ariaValue={effectiveOut}
-          ariaMax={safeDuration}
-          onPointerDown={startDrag("right")}
-        />
+        {trimMode ? (
+          <>
+            <div
+              className={`absolute inset-y-0 border-y-2 pointer-events-none transition-colors ${
+                activeSide ? "border-amber-300" : "border-amber-400/85"
+              }`}
+              style={{ left: `${inPct}%`, right: `${100 - outPct}%` }}
+            />
+            <Handle
+              side="left"
+              pct={inPct}
+              active={activeSide === "left"}
+              ariaValue={trimInSec}
+              ariaMax={safeDuration}
+              onPointerDown={startDrag("left")}
+            />
+            <Handle
+              side="right"
+              pct={outPct}
+              active={activeSide === "right"}
+              ariaValue={effectiveOut}
+              ariaMax={safeDuration}
+              onPointerDown={startDrag("right")}
+            />
+          </>
+        ) : (
+          isTrimmed && (
+            <>
+              <div
+                className="absolute inset-y-1 w-px bg-amber-400/55 pointer-events-none"
+                style={{ left: `${inPct}%` }}
+              />
+              <div
+                className="absolute inset-y-1 w-px bg-amber-400/55 pointer-events-none"
+                style={{ left: `${outPct}%` }}
+              />
+            </>
+          )
+        )}
       </div>
     </div>
   );
@@ -190,6 +240,7 @@ function Handle({
     <div
       role="slider"
       tabIndex={0}
+      data-trim-handle="true"
       aria-label={side === "left" ? "Trim start" : "Trim end"}
       aria-valuemin={0}
       aria-valuemax={ariaMax}
