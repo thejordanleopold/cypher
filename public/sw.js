@@ -1,7 +1,7 @@
 // Minimal service worker: cache the app shell so Cypher works offline after first load.
 // User audio is NOT cached — it lives in IndexedDB.
 
-const CACHE = "cypher-shell-v13";
+const CACHE = "cypher-shell-v14";
 // Paths resolve relative to the worker's scope, which Next.js sets to the
 // basePath under which the page was served (e.g. /cypher/ on GitHub Pages,
 // / locally).
