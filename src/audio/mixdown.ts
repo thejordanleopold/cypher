@@ -38,12 +38,17 @@ export async function mixdown(tracks: MixTrack[]): Promise<AudioBuffer> {
   const totalSamples = Math.max(1, Math.ceil(lengthSec * sampleRate));
   const ctx = new OfflineAudioContext(2, totalSamples, sampleRate);
 
+  // Soft peak ceiling: catch material above -1 dBFS without modulating the
+  // gain so fast that it pumps audibly. Brick-wall settings (ratio 20:1 +
+  // 10 ms release) modulate gain around 100 Hz on music that frequently
+  // crosses threshold, which reads as a metallic/"robotic" sheen on the
+  // exported mix. Match the engine's playback compressor.
   const limiter = ctx.createDynamicsCompressor();
   limiter.threshold.value = -1;
-  limiter.knee.value = 0;
-  limiter.ratio.value = 20;
-  limiter.attack.value = 0.001;
-  limiter.release.value = 0.05;
+  limiter.knee.value = 6;
+  limiter.ratio.value = 12;
+  limiter.attack.value = 0.005;
+  limiter.release.value = 0.25;
   limiter.connect(ctx.destination);
 
   for (const t of playable) {
