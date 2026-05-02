@@ -7,6 +7,9 @@ import { Timeline } from "@/components/Timeline";
 import { TrackRow } from "@/components/TrackRow";
 import { MainMenu } from "@/components/MainMenu";
 import { RecordingShield } from "@/components/RecordingShield";
+import { MixerView } from "@/components/MixerView";
+
+type ViewMode = "track" | "mixer";
 
 export default function Home() {
   const tracks = useCypher((s) => s.tracks);
@@ -15,12 +18,22 @@ export default function Home() {
   const addTrack = useCypher((s) => s.addTrack);
 
   const [splashDone, setSplashDone] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("track");
 
   useEffect(() => {
     initProject();
     const t = setTimeout(() => setSplashDone(true), 2500);
     return () => clearTimeout(t);
   }, [initProject]);
+
+  // Persist view choice locally so it survives reloads.
+  useEffect(() => {
+    const saved = localStorage.getItem("cypher.viewMode");
+    if (saved === "mixer" || saved === "track") setViewMode(saved);
+  }, []);
+  useEffect(() => {
+    localStorage.setItem("cypher.viewMode", viewMode);
+  }, [viewMode]);
 
   if (!splashDone) {
     const letters = "CYPHER".split("");
@@ -82,6 +95,7 @@ export default function Home() {
               {projectName}
             </p>
           </div>
+          <ViewToggle mode={viewMode} onChange={setViewMode} />
           <MainMenu />
         </header>
         <div className="border-t border-[var(--border-subtle)]/60">
@@ -91,22 +105,63 @@ export default function Home() {
           <Timeline />
         </div>
       </div>
-      <div className="flex-1 overflow-y-auto px-3 pt-2 space-y-1.5 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
-        {tracks.map((t) => (
-          <TrackRow key={t.id} track={t} />
-        ))}
-        <button
-          onClick={() => addTrack()}
-          className="glass block w-full rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
-          aria-label="Add new track"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          {tracks.length === 0 ? "Add your first track" : "Add track"}
-        </button>
-      </div>
+      {viewMode === "track" ? (
+        <div className="flex-1 overflow-y-auto px-3 pt-2 space-y-1.5 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
+          {tracks.map((t) => (
+            <TrackRow key={t.id} track={t} />
+          ))}
+          <button
+            onClick={() => addTrack()}
+            className="glass block w-full rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+            aria-label="Add new track"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            {tracks.length === 0 ? "Add your first track" : "Add track"}
+          </button>
+        </div>
+      ) : (
+        <MixerView />
+      )}
       <RecordingShield />
     </main>
+  );
+}
+
+function ViewToggle({
+  mode,
+  onChange,
+}: {
+  mode: ViewMode;
+  onChange: (m: ViewMode) => void;
+}) {
+  const next: ViewMode = mode === "track" ? "mixer" : "track";
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(next)}
+      aria-label={`Switch to ${next} view`}
+      title={`Switch to ${next} view`}
+      className="h-9 px-2.5 rounded-md bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-primary)] flex items-center gap-1.5 active:scale-95 transition-colors shrink-0"
+    >
+      {mode === "track" ? (
+        // Mixer icon: three vertical bars (channel strips)
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+          <path d="M6 4v16M12 4v16M18 4v16" />
+          <circle cx="6" cy="9" r="1.6" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="14" r="1.6" fill="currentColor" stroke="none" />
+          <circle cx="18" cy="7" r="1.6" fill="currentColor" stroke="none" />
+        </svg>
+      ) : (
+        // Track icon: horizontal stacked rows
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16" />
+        </svg>
+      )}
+      <span className="text-[10px] uppercase tracking-[0.16em] font-semibold">
+        {mode === "track" ? "Mixer" : "Tracks"}
+      </span>
+    </button>
   );
 }
