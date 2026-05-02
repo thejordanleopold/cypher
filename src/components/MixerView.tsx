@@ -1,7 +1,12 @@
 "use client";
 
+import { useCallback, useRef } from "react";
 import { useCypher, type TrackState } from "@/state/store";
 import { LevelMeter } from "@/components/LevelMeter";
+
+const VOL_MIN = 0;
+const VOL_MAX = 1.5;
+const STRIP_HEIGHT = 360; // px — caps mixer strip card height
 
 export function MixerView() {
   const tracks = useCypher((s) => s.tracks);
@@ -9,14 +14,15 @@ export function MixerView() {
 
   return (
     <div className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden">
-      <div className="flex items-stretch gap-1.5 px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] min-w-min h-full">
+      <div className="flex items-start gap-1.5 px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] min-w-min">
         {tracks.map((t) => (
           <ChannelStrip key={t.id} track={t} />
         ))}
         <button
           onClick={() => addTrack()}
           aria-label="Add new track"
-          className="glass shrink-0 w-12 max-h-[420px] rounded-xl text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] flex items-center justify-center transition-colors"
+          style={{ height: STRIP_HEIGHT }}
+          className="glass shrink-0 w-12 rounded-xl text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] flex items-center justify-center transition-colors"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
             <path d="M12 5v14M5 12h14" />
@@ -38,7 +44,8 @@ function ChannelStrip({ track }: { track: TrackState }) {
 
   return (
     <div
-      className={`glass shrink-0 w-[88px] h-full max-h-[420px] rounded-xl flex flex-col items-stretch gap-2 px-2 pt-2 pb-2.5 transition-colors ${
+      style={{ height: STRIP_HEIGHT }}
+      className={`glass shrink-0 w-[92px] rounded-xl flex flex-col gap-1.5 px-2 pt-2 pb-2.5 transition-colors ${
         isRecordingNow
           ? "!border-red-500/60 ring-1 ring-red-500/40"
           : track.armed
@@ -53,7 +60,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
       </div>
 
       {/* Pan */}
-      <label className="flex flex-col items-center gap-0.5">
+      <div className="flex flex-col items-center gap-0.5">
         <span className="text-[8px] uppercase tracking-[0.18em] text-[var(--text-faint)] leading-none">
           Pan
         </span>
@@ -74,7 +81,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
             ? `L${Math.round(-track.pan * 100)}`
             : `R${Math.round(track.pan * 100)}`}
         </span>
-      </label>
+      </div>
 
       {/* M / S / R */}
       <div className="grid grid-cols-3 gap-0.5">
@@ -106,7 +113,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
       </div>
 
       {/* Vertical fader + meter */}
-      <div className="flex-1 min-h-[160px] flex items-stretch justify-center gap-1.5 mt-1">
+      <div className="flex-1 min-h-0 flex justify-center gap-2 mt-1">
         <VerticalFader
           value={track.volume}
           onChange={(v) => setVolume(track.id, v)}
@@ -119,7 +126,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
 
       {/* Volume readout */}
       <div className="text-[10px] tabular-nums text-[var(--text-muted)] text-center leading-none">
-        {formatGain(track.volume)}
+        {formatGain(track.volume)} dB
       </div>
     </div>
   );
@@ -166,23 +173,93 @@ function VerticalFader({
   onChange: (v: number) => void;
   label: string;
 }) {
+  const railRef = useRef<HTMLDivElement>(null);
+
+  const updateFromY = useCallback(
+    (clientY: number) => {
+      const rail = railRef.current;
+      if (!rail) return;
+      const r = rail.getBoundingClientRect();
+      const ratio = 1 - Math.max(0, Math.min(1, (clientY - r.top) / r.height));
+      const v = VOL_MIN + ratio * (VOL_MAX - VOL_MIN);
+      onChange(Number(v.toFixed(3)));
+    },
+    [onChange],
+  );
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    railRef.current?.setPointerCapture(e.pointerId);
+    updateFromY(e.clientY);
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (!railRef.current?.hasPointerCapture(e.pointerId)) return;
+    updateFromY(e.clientY);
+  };
+  const onPointerUp = (e: React.PointerEvent) => {
+    railRef.current?.releasePointerCapture(e.pointerId);
+  };
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 0.1 : 0.02;
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      onChange(Math.min(VOL_MAX, value + step));
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      onChange(Math.max(VOL_MIN, value - step));
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      onChange(VOL_MIN);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      onChange(VOL_MAX);
+    }
+  };
+
+  // Position from bottom: 0 = bottom, max = top.
+  const ratio = (value - VOL_MIN) / (VOL_MAX - VOL_MIN);
+  const fromBottomPct = ratio * 100;
+  // Unity (1.0) gridline reference.
+  const unityPct = ((1 - VOL_MIN) / (VOL_MAX - VOL_MIN)) * 100;
+
   return (
-    <input
-      type="range"
-      min={0}
-      max={1.5}
-      step={0.01}
-      value={value}
-      onChange={(e) => onChange(Number(e.target.value))}
+    <div
+      ref={railRef}
+      role="slider"
       aria-label={label}
-      className="vertical-fader"
-      style={{
-        writingMode: "vertical-lr",
-        direction: "rtl",
-        height: "100%",
-        width: 24,
-      }}
-    />
+      aria-valuemin={VOL_MIN}
+      aria-valuemax={VOL_MAX}
+      aria-valuenow={value}
+      tabIndex={0}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onKeyDown={onKeyDown}
+      className="relative w-7 h-full select-none touch-none cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] rounded"
+    >
+      {/* Track */}
+      <div className="absolute left-1/2 top-1 bottom-1 -translate-x-1/2 w-1 rounded-full bg-white/[0.08] border border-[var(--border-subtle)]" />
+      {/* Filled portion */}
+      <div
+        className="absolute left-1/2 -translate-x-1/2 w-1 rounded-full bg-gradient-to-t from-[var(--accent-deep)] to-[var(--accent)]"
+        style={{
+          bottom: `calc(0.25rem)`,
+          height: `calc((100% - 0.5rem) * ${ratio})`,
+        }}
+      />
+      {/* Unity tick */}
+      <div
+        className="absolute left-0 right-0 h-px bg-[var(--border-strong)]"
+        style={{ bottom: `calc(0.25rem + (100% - 0.5rem) * ${unityPct / 100})` }}
+        aria-hidden="true"
+      />
+      {/* Thumb */}
+      <div
+        className="absolute left-1/2 -translate-x-1/2 -translate-y-1/2 w-6 h-3 rounded-[3px] bg-gradient-to-b from-[#cfe1ff] to-[var(--accent)] border border-[#0a1228] shadow-[0_2px_6px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.4)] pointer-events-none"
+        style={{ bottom: `calc(0.25rem + (100% - 0.5rem) * ${fromBottomPct / 100})` }}
+      />
+    </div>
   );
 }
 
