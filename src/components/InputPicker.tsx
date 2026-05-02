@@ -12,10 +12,17 @@ interface Props {
 }
 
 interface PopupRect {
-  top: number;
+  // Distance from the top of the viewport (measured in dvh units via
+  // window.innerHeight, which on iOS reflects the visible area).
+  top?: number;
+  bottom?: number;
   left: number;
   width: number;
+  maxHeight: number;
 }
+
+const MIN_POPUP_HEIGHT = 200;
+const VIEWPORT_PADDING = 12;
 
 export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
   const {
@@ -40,7 +47,29 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
       const el = buttonRef.current;
       if (!el) return;
       const r = el.getBoundingClientRect();
-      setRect({ top: r.bottom + 4, left: r.left, width: r.width });
+      // window.innerHeight tracks the visible viewport on iOS (matches
+      // 100dvh), so measurements stay correct as the URL bar shows/hides.
+      const viewportH = window.innerHeight;
+      const gap = 4;
+      const spaceBelow = viewportH - r.bottom - VIEWPORT_PADDING - gap;
+      const spaceAbove = r.top - VIEWPORT_PADDING - gap;
+      // Prefer below; flip above when there's not enough room and the
+      // upward gap is bigger.
+      if (spaceBelow >= MIN_POPUP_HEIGHT || spaceBelow >= spaceAbove) {
+        setRect({
+          top: r.bottom + gap,
+          left: r.left,
+          width: r.width,
+          maxHeight: Math.max(MIN_POPUP_HEIGHT, spaceBelow),
+        });
+      } else {
+        setRect({
+          bottom: viewportH - r.top + gap,
+          left: r.left,
+          width: r.width,
+          maxHeight: Math.max(MIN_POPUP_HEIGHT, spaceAbove),
+        });
+      }
     };
     update();
     window.addEventListener("resize", update);
@@ -112,9 +141,10 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
             style={{
               position: "fixed",
               top: rect.top,
+              bottom: rect.bottom,
               left: rect.left,
               width: rect.width,
-              maxHeight: `calc(100vh - ${rect.top + 16}px)`,
+              maxHeight: rect.maxHeight,
             }}
             className="z-[80] overflow-auto bg-neutral-900 border border-neutral-700 rounded-md shadow-xl"
           >

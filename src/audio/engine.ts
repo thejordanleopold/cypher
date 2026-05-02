@@ -261,12 +261,20 @@ class AudioEngine {
     return this.tracks.get(id);
   }
 
+  private isCapturing(id: TrackId): boolean {
+    return this.recording?.trackId === id || this.multiRecording.has(id);
+  }
+
   async play() {
     await this.start();
     const transport = Tone.getTransport();
     if (transport.state === "started") return;
     const now = Tone.now() + 0.05;
     for (const t of this.tracks.values()) {
+      // Don't sound a track that's actively being recorded — the previous
+      // take would otherwise play back through the speaker and bleed into
+      // the mic, fighting the new take we're trying to capture.
+      if (this.isCapturing(t.id)) continue;
       if (t.player && t.buffer) {
         const offset = t.trimInSec + transport.seconds;
         const end = t.trimOutSec ?? t.buffer.duration;
@@ -318,6 +326,7 @@ class AudioEngine {
     if (wasPlaying) {
       const now = Tone.now() + 0.05;
       for (const t of this.tracks.values()) {
+        if (this.isCapturing(t.id)) continue;
         if (!t.player || !t.buffer) continue;
         const offset = t.trimInSec + transport.seconds;
         const end = t.trimOutSec ?? t.buffer.duration;
