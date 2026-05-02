@@ -91,7 +91,7 @@ export function MainMenu() {
       {open && (
         <div
           role="menu"
-          className="absolute right-0 top-full mt-1 z-30 w-80 max-w-[calc(100vw-1.5rem)] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden"
+          className="absolute right-0 top-full mt-1 z-30 w-80 max-w-[calc(100vw-1.5rem)] max-h-[calc(100dvh-5rem)] overflow-y-auto overscroll-contain bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl"
         >
           {/* Project name + rename */}
           <div className="px-3 py-2.5 border-b border-neutral-800">
