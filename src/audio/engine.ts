@@ -162,6 +162,14 @@ class AudioEngine {
   private metronomeLoop: Tone.Loop | null = null;
   private metronomeOn = false;
   private toneStartCalled = false;
+  // Output bridge: while a mic is open on iOS Safari the AudioContext's
+  // destination gets routed to the receiver/earpiece (or muted entirely on
+  // some headphone profiles). Pulling the mix through an HTMLAudioElement
+  // forces the loud-speaker / standard playback route. Activated only while
+  // recording so non-recording playback stays on the regular ctx.destination.
+  private outputBridgeStreamNode: MediaStreamAudioDestinationNode | null = null;
+  private outputBridgeEl: HTMLAudioElement | null = null;
+  private outputBridgeRefs = 0;
 
   async start() {
     // Idempotent. Safe to call from any user gesture or even non-gesture
@@ -203,6 +211,67 @@ class AudioEngine {
 
   isStarted() {
     return this.started;
+  }
+
+  private enableOutputBridge() {
+    this.outputBridgeRefs += 1;
+    if (this.outputBridgeStreamNode || !this.nativeCtx || !this.limiter) return;
+    try {
+      const streamNode = this.nativeCtx.createMediaStreamDestination();
+      // Keep the regular destination route AND add the audio-element route.
+      // On iOS the audio element is what reaches the loud speaker; on desktop
+      // the audio element matches ctx.destination so muting it avoids a
+      // double-output. We mute on browsers where ctx.destination already
+      // works (i.e. anywhere setSinkId is supported); otherwise leave it
+      // unmuted so iOS hears the mix.
+      this.limiter.connect(streamNode);
+      const el = document.createElement("audio");
+      el.srcObject = streamNode.stream;
+      el.autoplay = true;
+      el.setAttribute("playsinline", "");
+      el.setAttribute("webkit-playsinline", "");
+      el.style.position = "fixed";
+      el.style.width = "0";
+      el.style.height = "0";
+      el.style.opacity = "0";
+      el.style.pointerEvents = "none";
+      const ctx = this.nativeCtx as AudioContext & {
+        setSinkId?: (id: string) => Promise<void>;
+      };
+      const desktopRouteWorks = typeof ctx.setSinkId === "function";
+      el.muted = desktopRouteWorks; // avoid double-audio on desktop
+      document.body.appendChild(el);
+      el.play().catch(() => {
+        // Autoplay may be blocked off-gesture; non-fatal.
+      });
+      this.outputBridgeStreamNode = streamNode;
+      this.outputBridgeEl = el;
+    } catch {
+      // ignore — fall back to ctx.destination route
+    }
+  }
+
+  private disableOutputBridge() {
+    this.outputBridgeRefs = Math.max(0, this.outputBridgeRefs - 1);
+    if (this.outputBridgeRefs > 0) return;
+    if (this.outputBridgeStreamNode) {
+      try {
+        this.limiter?.disconnect(this.outputBridgeStreamNode);
+      } catch {
+        // ignore
+      }
+      this.outputBridgeStreamNode = null;
+    }
+    if (this.outputBridgeEl) {
+      try {
+        this.outputBridgeEl.pause();
+        this.outputBridgeEl.srcObject = null;
+        this.outputBridgeEl.remove();
+      } catch {
+        // ignore
+      }
+      this.outputBridgeEl = null;
+    }
   }
 
   context(): AudioContext {
@@ -494,6 +563,17 @@ class AudioEngine {
     if (typeof MediaRecorder === "undefined") {
       throw new Error("MediaRecorder is not supported in this browser");
     }
+    // Engage the output bridge before getUserMedia so the audio session is
+    // established with the loud-speaker route already in place on iOS.
+    this.enableOutputBridge();
+    let bridgeOpen = true;
+    const releaseBridgeOnError = (err: unknown) => {
+      if (bridgeOpen) {
+        this.disableOutputBridge();
+        bridgeOpen = false;
+      }
+      throw err;
+    };
     // Disable browser DSP — AGC chases the backing track and pumps the
     // noise floor, while echoCancellation/noiseSuppression add latency
     // and color the signal. Fine for VOIP, bad for music. Sample rate
@@ -510,9 +590,9 @@ class AudioEngine {
     if (deviceId && deviceId !== "default") {
       audioConstraints.deviceId = { exact: deviceId };
     }
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: audioConstraints,
-    });
+    const stream = await navigator.mediaDevices
+      .getUserMedia({ audio: audioConstraints })
+      .catch(releaseBridgeOnError) as MediaStream;
     // iOS suspends the AudioContext when it switches the audio session to
     // "play and record" during getUserMedia.  Re-wake it here while we are
     // still inside the getUserMedia resolution chain (iOS treats this as an
@@ -628,6 +708,7 @@ class AudioEngine {
     }
     disconnectSessionNodes(session);
     session.stream.getTracks().forEach((t) => t.stop());
+    this.disableOutputBridge();
 
     if (session.chunks.length === 0) {
       throw Object.assign(new Error("Recording captured no audio"), {
@@ -683,6 +764,7 @@ class AudioEngine {
           // ignore
         }
       });
+      this.disableOutputBridge();
     }
   }
 
