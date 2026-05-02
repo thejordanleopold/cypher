@@ -73,12 +73,12 @@ export default function Home() {
     <main className="flex-1 flex flex-col text-[var(--text-primary)] min-h-[100dvh]">
       <div className="sticky top-0 z-20 glass-overlay border-b border-[var(--border-subtle)]">
         <header className="px-3 sm:px-4 pt-[max(env(safe-area-inset-top),0.5rem)] pb-2 flex items-center gap-2">
-          <div className="flex items-baseline gap-2 min-w-0 flex-1">
-            <h1 className="font-[family-name:var(--font-bebas)] text-xl tracking-[0.16em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
+          <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
+            <h1 className="font-[family-name:var(--font-bebas)] text-3xl sm:text-[2rem] tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
               CYPHER
             </h1>
-            <span aria-hidden="true" className="text-[var(--text-faint)] text-sm leading-none">/</span>
-            <p className="text-[13px] text-[var(--text-muted)] truncate min-w-0 leading-none">
+            <span aria-hidden="true" className="text-[var(--text-faint)] text-[11px] leading-none">/</span>
+            <p className="text-[11px] text-[var(--text-muted)] truncate min-w-0 leading-none">
               {projectName}
             </p>
           </div>
