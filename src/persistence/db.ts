@@ -24,6 +24,13 @@ export interface PersistedTrack {
   armed?: boolean;
   normalized?: boolean;
   normalizationGain?: number;
+  mode?: 'audio' | 'sampler';
+  samplerPads?: Array<{
+    id: string;
+    startSec: number;
+    endSec: number;
+    label: string;
+  }>;
 }
 
 export interface PersistedProject {

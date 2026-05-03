@@ -41,6 +41,13 @@ let toastSeq = 0;
 
 const DEFAULT_PROJECT_ID = "default";
 
+export interface SamplerPad {
+  id: string;
+  startSec: number;
+  endSec: number;
+  label: string;
+}
+
 export interface TrackState {
   id: string;
   name: string;
@@ -60,6 +67,8 @@ export interface TrackState {
   armed: boolean;
   normalized: boolean;
   normalizationGain: number;
+  mode: 'audio' | 'sampler';
+  samplerPads: SamplerPad[];
 }
 
 export const DEFAULT_INPUT_GAIN = 1;
@@ -118,6 +127,8 @@ interface CypherState {
   stopRecording: () => Promise<void>;
   toggleArm: (id: string) => void;
   toggleNormalize: (id: string) => void;
+  setTrackMode: (id: string, mode: 'audio' | 'sampler') => void;
+  setSamplerPads: (id: string, pads: SamplerPad[]) => void;
   isMultiRecording: boolean;
 
   countInBeats: number; // 0 = disabled, otherwise N beats of click before record
@@ -399,6 +410,28 @@ export const useCypher = create<CypherState>((set, get) => ({
     // Don't delete the audio blob here — a snapshot in undoStack still
     // references it. gcOrphanedAudio() cleans up once nothing does.
     set((s) => ({ tracks: s.tracks.filter((x) => x.id !== id) }));
+    schedulePersist(get());
+  },
+
+  setTrackMode: (id, mode) => {
+    const track = get().tracks.find((t) => t.id === id);
+    if (!track || track.mode === mode) return;
+    const pads =
+      mode === 'sampler' && track.hasAudio && track.samplerPads.length === 0
+        ? autoChopPads(track)
+        : track.samplerPads;
+    set((s) => ({
+      tracks: s.tracks.map((t) =>
+        t.id === id ? { ...t, mode, samplerPads: pads } : t,
+      ),
+    }));
+    schedulePersist(get());
+  },
+
+  setSamplerPads: (id, pads) => {
+    set((s) => ({
+      tracks: s.tracks.map((t) => (t.id === id ? { ...t, samplerPads: pads } : t)),
+    }));
     schedulePersist(get());
   },
 
@@ -890,7 +923,23 @@ function emptyTrack(id: string, name: string): TrackState {
     armed: false,
     normalized: false,
     normalizationGain: 1,
+    mode: 'audio',
+    samplerPads: [],
   };
+}
+
+function autoChopPads(track: TrackState): SamplerPad[] {
+  const startSec = track.trimInSec;
+  const endSec = track.trimOutSec ?? track.durationSec;
+  const total = Math.max(0.001, endSec - startSec);
+  const num = 8;
+  const dur = total / num;
+  return Array.from({ length: num }, (_, i) => ({
+    id: `${track.id}-p${i}`,
+    startSec: startSec + i * dur,
+    endSec: startSec + (i + 1) * dur,
+    label: String(i + 1),
+  }));
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -928,6 +977,8 @@ function buildPersisted(state: PersistInput): PersistedProject {
       armed: t.armed,
       normalized: t.normalized,
       normalizationGain: t.normalizationGain,
+      mode: t.mode,
+      samplerPads: t.samplerPads,
     })),
     createdAt: 0, // filled in by flush — preserves existing createdAt if present.
     updatedAt: Date.now(),
@@ -1218,6 +1269,8 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
       armed: pt.armed ?? false,
       normalized: pt.normalized ?? false,
       normalizationGain: pt.normalizationGain ?? 1,
+      mode: pt.mode ?? 'audio',
+      samplerPads: pt.samplerPads ?? [],
     });
     if (hasAudio && pt.normalized && pt.normalizationGain && pt.normalizationGain !== 1) {
       engine.setNormalizationGain(pt.id, pt.normalizationGain);

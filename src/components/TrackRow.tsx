@@ -6,6 +6,7 @@ import { Waveform } from "@/components/Waveform";
 import { LiveWaveform } from "@/components/LiveWaveform";
 import { InputPicker } from "@/components/InputPicker";
 import { LevelMeter } from "@/components/LevelMeter";
+import { SamplerPads } from "@/components/SamplerPads";
 
 export function TrackRow({ track }: { track: TrackState }) {
   const {
@@ -18,12 +19,38 @@ export function TrackRow({ track }: { track: TrackState }) {
     toggleArm,
     toggleNormalize,
     removeTrack,
+    setTrackMode,
     isMultiRecording,
   } = useCypher();
   const fileRef = useRef<HTMLInputElement>(null);
   const [collapsed, setCollapsed] = useState(false);
   const armDisabled = isMultiRecording;
   const isRecordingNow = isMultiRecording && track.armed;
+  const swipeRef = useRef<{ x: number; y: number; id: number } | null>(null);
+
+  function onSwipeStart(e: React.PointerEvent) {
+    if ((e.target as HTMLElement).closest('button, input, [role="slider"], [data-trim-handle]')) return;
+    swipeRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
+  }
+
+  function onSwipeMove(e: React.PointerEvent) {
+    const sw = swipeRef.current;
+    if (!sw || sw.id !== e.pointerId) return;
+    const dx = e.clientX - sw.x;
+    const dy = e.clientY - sw.y;
+    if (Math.abs(dx) > 64 && Math.abs(dy) < 36) {
+      swipeRef.current = null;
+      if (dx > 0 && track.mode === 'audio' && track.hasAudio) {
+        setTrackMode(track.id, 'sampler');
+      } else if (dx < 0 && track.mode === 'sampler') {
+        setTrackMode(track.id, 'audio');
+      }
+    }
+  }
+
+  function onSwipeEnd() {
+    swipeRef.current = null;
+  }
 
   return (
     <article
@@ -70,6 +97,16 @@ export function TrackRow({ track }: { track: TrackState }) {
           </div>
         </div>
         {isRecordingNow && <LevelMeter trackId={track.id} />}
+        {track.mode === 'sampler' && (
+          <button
+            onClick={() => setTrackMode(track.id, 'audio')}
+            className="h-7 px-1.5 rounded-md bg-violet-500/20 border border-violet-500/40 text-violet-300 text-[9px] font-bold uppercase tracking-widest shrink-0 active:scale-95 transition-colors hover:bg-violet-500/30"
+            aria-label="Exit sampler mode"
+            title="Exit sampler — swipe left to exit"
+          >
+            SMPLR
+          </button>
+        )}
         <ToggleButton
           active={track.muted}
           activeClass="bg-amber-500 text-black"
@@ -196,10 +233,18 @@ export function TrackRow({ track }: { track: TrackState }) {
         </div>
       </div>
 
-      {/* Waveform — always visible so collapsed cards still tell you what's there */}
-      <div className="px-2.5 pb-2">
+      {/* Waveform / Sampler — always visible so collapsed cards still show audio */}
+      <div
+        className="px-2.5 pb-2 touch-pan-y"
+        onPointerDown={onSwipeStart}
+        onPointerMove={onSwipeMove}
+        onPointerUp={onSwipeEnd}
+        onPointerCancel={onSwipeEnd}
+      >
         {isRecordingNow ? (
           <LiveWaveform trackId={track.id} />
+        ) : track.mode === 'sampler' && track.hasAudio ? (
+          <SamplerPads track={track} />
         ) : (
           track.hasAudio && (
             <Waveform

@@ -1094,6 +1094,41 @@ class AudioEngine {
   recordingTrackId() {
     return this.recording?.trackId ?? null;
   }
+
+  // Fire-and-forget polyphonic pad playback. Creates a native AudioBufferSourceNode
+  // so multiple pads can play simultaneously without stopping the Tone.Player.
+  playPad(
+    trackId: TrackId,
+    startSec: number,
+    endSec: number,
+    volume: number,
+    normGain: number,
+    pan: number,
+  ): void {
+    const t = this.tracks.get(trackId);
+    if (!t || !t.buffer || !this.nativeCtx || !this.master) return;
+    const ctx = this.nativeCtx;
+    const src = ctx.createBufferSource();
+    src.buffer = t.buffer;
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = t.muted ? 0 : volume * normGain;
+    const panNode = ctx.createStereoPanner();
+    panNode.pan.value = pan;
+    src.connect(gainNode);
+    gainNode.connect(panNode);
+    panNode.connect(this.master.input as AudioNode);
+    const dur = Math.max(0.01, endSec - startSec);
+    src.start(ctx.currentTime, startSec, dur);
+    src.onended = () => {
+      try {
+        src.disconnect();
+        gainNode.disconnect();
+        panNode.disconnect();
+      } catch {
+        // ignore
+      }
+    };
+  }
 }
 
 let _engine: AudioEngine | null = null;
