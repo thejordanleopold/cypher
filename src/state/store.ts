@@ -46,6 +46,7 @@ const DEFAULT_PROJECT_ID = "default";
 export type TrackKind = "audio" | "sampler";
 
 export const SAMPLER_PAD_COUNT = 8;
+export const SAMPLER_STEP_COUNT = 16;
 
 export interface SamplerPadState {
   hasAudio: boolean;
@@ -76,6 +77,7 @@ export interface TrackState {
   normalized: boolean;
   normalizationGain: number;
   pads: SamplerPadState[];
+  pattern: boolean[][];
 }
 
 export const DEFAULT_INPUT_GAIN = 1;
@@ -88,6 +90,10 @@ interface CypherState {
   positionSec: number;
   metronomeOn: boolean;
   recordingTrackId: string | null;
+  recordingPad: { trackId: string; padIdx: number } | null;
+  // trackId of the sampler currently in live pattern-record mode (pad taps → grid),
+  // or null when not recording.
+  patternRecording: string | null;
 
   // Library
   currentProjectId: string;
@@ -110,6 +116,12 @@ interface CypherState {
   loadPadSample: (trackId: string, padIdx: number, file: File) => Promise<void>;
   clearPadSample: (trackId: string, padIdx: number) => Promise<void>;
   triggerPad: (trackId: string, padIdx: number) => Promise<void>;
+  startPadRecording: (trackId: string, padIdx: number) => Promise<void>;
+  stopPadRecording: () => Promise<void>;
+  togglePatternRecording: (trackId: string) => void;
+  togglePatternStep: (trackId: string, padIdx: number, step: number) => void;
+  clearPattern: (trackId: string) => void;
+  copyTrackToPad: (sourceTrackId: string, targetTrackId: string, padIdx: number) => Promise<void>;
   setVolume: (id: string, v: number) => void;
   setPan: (id: string, p: number) => void;
   toggleMute: (id: string) => void;
@@ -192,6 +204,8 @@ export const useCypher = create<CypherState>((set, get) => ({
   positionSec: 0,
   metronomeOn: false,
   recordingTrackId: null,
+  recordingPad: null,
+  patternRecording: null,
   exportProgress: null,
   inputDevices: [],
   defaultInputDeviceId: "default",
@@ -413,6 +427,9 @@ export const useCypher = create<CypherState>((set, get) => ({
     const baseName = kind === "sampler" ? "Sampler" : "Track";
     const name = `${baseName} ${get().tracks.length + 1}`;
     await getEngine().addTrack(id, name, kind);
+    if (kind === "sampler") {
+      getEngine().addSequencer(id);
+    }
     const t = emptyTrack(id, name, kind);
     t.inputDeviceId = get().defaultInputDeviceId;
     set((s) => ({ tracks: [...s.tracks, t] }));
@@ -491,6 +508,133 @@ export const useCypher = create<CypherState>((set, get) => ({
     // anything else — iOS Safari treats post-await work as out-of-gesture.
     await getEngine().start();
     getEngine().triggerPad(trackId, padIdx);
+    // If this sampler is in pattern-record mode and the transport is playing,
+    // quantize the hit to the nearest 16th step and latch it into the grid.
+    const s = get();
+    if (s.patternRecording === trackId && s.isPlaying) {
+      const stepDuration = 60 / s.bpm / 4; // 16th note in seconds
+      const transportSec = getEngine().seconds();
+      const rawStep = Math.round(transportSec / stepDuration);
+      const step = ((rawStep % SAMPLER_STEP_COUNT) + SAMPLER_STEP_COUNT) % SAMPLER_STEP_COUNT;
+      const track = s.tracks.find((t) => t.id === trackId);
+      if (track && !track.pattern[padIdx]?.[step]) {
+        getEngine().setPatternStep(trackId, padIdx, step, true);
+        set((prev) => ({
+          tracks: prev.tracks.map((t) => {
+            if (t.id !== trackId) return t;
+            const pattern = t.pattern.map((row) => [...row]);
+            if (pattern[padIdx]) pattern[padIdx][step] = true;
+            return { ...t, pattern };
+          }),
+        }));
+        schedulePersist(get());
+      }
+    }
+  },
+
+  togglePatternRecording: (trackId) => {
+    set((s) => ({
+      patternRecording: s.patternRecording === trackId ? null : trackId,
+    }));
+  },
+
+  startPadRecording: async (trackId, padIdx) => {
+    void getEngine().start();
+    const t = get().tracks.find((x) => x.id === trackId);
+    const deviceId = t?.inputDeviceId;
+    try {
+      await getEngine().startPadRecording(trackId, padIdx, deviceId);
+      set({ recordingPad: { trackId, padIdx } });
+    } catch (err) {
+      get().pushToast(toastFromMicError(err));
+    }
+  },
+
+  stopPadRecording: async () => {
+    const pr = get().recordingPad;
+    if (!pr) return;
+    let buf: AudioBuffer | null = null;
+    try {
+      buf = await getEngine().stopPadRecording();
+    } catch (err) {
+      get().pushToast(toastFromCaptureError(err));
+    }
+    set({ recordingPad: null });
+    if (!buf || !pr) return;
+    const audioKey = makePadAudioKey(get().currentProjectId, pr.trackId, pr.padIdx);
+    await saveAudio(audioKey, audioBufferToWavBlob(buf));
+    const finalBuf = buf;
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== pr.trackId) return t;
+        const pads = t.pads.slice();
+        pads[pr.padIdx] = {
+          hasAudio: true,
+          fileName: "Recording",
+          durationSec: finalBuf.duration,
+          audioKey,
+          bufferRevision: (pads[pr.padIdx]?.bufferRevision ?? 0) + 1,
+        };
+        return { ...t, pads };
+      }),
+    }));
+    schedulePersist(get());
+    await flushPersist();
+  },
+
+  togglePatternStep: (trackId, padIdx, step) => {
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const pattern = t.pattern.map((row) => [...row]);
+        if (padIdx < 0 || padIdx >= pattern.length) return t;
+        if (step < 0 || step >= pattern[padIdx].length) return t;
+        pattern[padIdx][step] = !pattern[padIdx][step];
+        getEngine().setPatternStep(trackId, padIdx, step, pattern[padIdx][step]);
+        return { ...t, pattern };
+      }),
+    }));
+    schedulePersist(get());
+  },
+
+  clearPattern: (trackId) => {
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const emptyGrid = Array.from({ length: SAMPLER_PAD_COUNT }, () =>
+          Array(SAMPLER_STEP_COUNT).fill(false),
+        );
+        getEngine().loadPattern(trackId, emptyGrid);
+        return { ...t, pattern: emptyGrid };
+      }),
+    }));
+    schedulePersist(get());
+  },
+
+  copyTrackToPad: async (sourceTrackId, targetTrackId, padIdx) => {
+    const engine = getEngine();
+    const srcTrack = engine.getTrack(sourceTrackId);
+    if (!srcTrack?.buffer) return;
+    const buf = srcTrack.buffer;
+    const audioKey = makePadAudioKey(get().currentProjectId, targetTrackId, padIdx);
+    await saveAudio(audioKey, audioBufferToWavBlob(buf));
+    engine.setPadBuffer(targetTrackId, padIdx, buf);
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== targetTrackId) return t;
+        const pads = t.pads.slice();
+        pads[padIdx] = {
+          hasAudio: true,
+          fileName: s.tracks.find((x) => x.id === sourceTrackId)?.fileName ?? "audio",
+          durationSec: buf.duration,
+          audioKey,
+          bufferRevision: (pads[padIdx]?.bufferRevision ?? 0) + 1,
+        };
+        return { ...t, pads };
+      }),
+    }));
+    schedulePersist(get());
+    await flushPersist();
   },
 
   removeTrack: async (id) => {
@@ -1017,6 +1161,12 @@ function emptyTrack(
     normalized: false,
     normalizationGain: 1,
     pads: kind === "sampler" ? emptyPads() : [],
+    pattern:
+      kind === "sampler"
+        ? Array.from({ length: SAMPLER_PAD_COUNT }, () =>
+            Array(SAMPLER_STEP_COUNT).fill(false),
+          )
+        : [],
   };
 }
 
@@ -1093,6 +1243,7 @@ function buildPersisted(state: PersistInput): PersistedProject {
             durationSec: p.durationSec,
           }))
         : undefined,
+      pattern: t.kind === "sampler" ? t.pattern : undefined,
     })),
     createdAt: 0, // filled in by flush — preserves existing createdAt if present.
     updatedAt: Date.now(),
@@ -1141,13 +1292,14 @@ let lastHistoryTime = 0;
 let historyApplyInFlight = false;
 
 function captureHistorySnapshot(state: CypherState): HistorySnapshot {
-  // TrackState is mostly primitives plus the pads array, which we deep-clone
-  // so a snapshot can't be mutated by later pad edits.
+  // TrackState is mostly primitives plus the pads array and pattern, which we
+  // deep-clone so a snapshot can't be mutated by later pad/pattern edits.
   return {
     bpm: state.bpm,
     tracks: state.tracks.map((t) => ({
       ...t,
       pads: t.pads.map((p) => ({ ...p })),
+      pattern: t.pattern.map((row) => [...row]),
     })),
   };
 }
@@ -1231,6 +1383,12 @@ async function applyHistorySnapshot(snap: HistorySnapshot) {
             }
           }),
         );
+        // Restore sequencer pattern. addSequencer is idempotent (it calls
+        // removeSequencer first), so this is safe even if one already exists.
+        if (!engine.getPattern(snapT.id)) {
+          engine.addSequencer(snapT.id);
+        }
+        engine.loadPattern(snapT.id, snapT.pattern);
       }
     }),
   );
@@ -1256,6 +1414,7 @@ async function applyHistorySnapshot(snap: HistorySnapshot) {
         ...p,
         bufferRevision: revBase + i * 1000 + j,
       })),
+      pattern: t.pattern.map((row) => [...row]),
     })),
   });
   applyMixState(useCypher.getState().tracks);
@@ -1416,6 +1575,7 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
     }
     const bufferRevision = hasAudio ? 1 : 0;
     let pads: SamplerPadState[] = [];
+    let pattern: boolean[][] = [];
     if (kind === "sampler") {
       const persistedPads = pt.pads ?? [];
       pads = emptyPads();
@@ -1439,6 +1599,14 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
           // Leave as empty; user can reload the sample.
         }
       }
+      // Set up the sequencer and restore its pattern.
+      engine.addSequencer(pt.id);
+      const emptyGrid = Array.from({ length: SAMPLER_PAD_COUNT }, () =>
+        Array(SAMPLER_STEP_COUNT).fill(false),
+      );
+      const persistedPattern = pt.pattern ?? emptyGrid;
+      engine.loadPattern(pt.id, persistedPattern);
+      pattern = persistedPattern.map((row) => [...row]);
     }
     restored.push({
       id: pt.id,
@@ -1461,6 +1629,7 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
       normalized: pt.normalized ?? false,
       normalizationGain: pt.normalizationGain ?? 1,
       pads,
+      pattern,
     });
     if (hasAudio && pt.normalized && pt.normalizationGain && pt.normalizationGain !== 1) {
       engine.setNormalizationGain(pt.id, pt.normalizationGain);

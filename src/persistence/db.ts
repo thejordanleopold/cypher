@@ -35,6 +35,8 @@ export interface PersistedTrack {
   // Indexed by pad slot (0..N-1). Slots without a sample carry a null audioKey
   // but are still emitted so pad order is stable across saves.
   pads?: PersistedSamplerPad[];
+  // Step-sequencer pattern: outer index = pad, inner index = step.
+  pattern?: boolean[][];
 }
 
 export interface PersistedProject {

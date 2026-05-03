@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import {
   useCypher,
   SAMPLER_PAD_COUNT,
+  SAMPLER_STEP_COUNT,
   type SamplerPadState,
   type TrackState,
 } from "@/state/store";
@@ -111,6 +112,7 @@ export function SamplerRow({ track }: { track: TrackState }) {
               />
             </div>
             <PadGrid trackId={track.id} pads={track.pads} />
+            <PatternGrid trackId={track.id} pattern={track.pattern} />
           </div>
         </div>
       </div>
@@ -147,9 +149,17 @@ function Pad({
   const loadPadSample = useCypher((s) => s.loadPadSample);
   const clearPadSample = useCypher((s) => s.clearPadSample);
   const pushToast = useCypher((s) => s.pushToast);
+  const startPadRecording = useCypher((s) => s.startPadRecording);
+  const stopPadRecording = useCypher((s) => s.stopPadRecording);
+  const recordingPad = useCypher((s) => s.recordingPad);
+  const patternRecording = useCypher((s) => s.patternRecording);
   const fileRef = useRef<HTMLInputElement>(null);
   const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
+
+  const isCapturing = patternRecording === trackId;
+  const isMicRecording =
+    recordingPad?.trackId === trackId && recordingPad?.padIdx === padIdx;
 
   const handleFile = async (file: File) => {
     try {
@@ -171,10 +181,6 @@ function Pad({
     const isDoubleTap = now - lastTapRef.current < 300;
     lastTapRef.current = now;
     if (isDoubleTap) {
-      // Second tap within the double-tap window opens the file picker so the
-      // user can load (or replace) the pad's sample. The first tap already
-      // triggered the existing sample if there was one — that's fine; the
-      // brief overlap is the cost of keeping single-tap latency near zero.
       lastTapRef.current = 0;
       fileRef.current?.click();
       return;
@@ -203,6 +209,8 @@ function Pad({
         className={`w-full aspect-square rounded-lg border text-[10px] font-medium flex flex-col items-center justify-center gap-0.5 transition-colors select-none touch-none ${
           active
             ? "bg-[var(--accent)] text-[#031024] border-[var(--accent)]"
+            : isCapturing && pad.hasAudio
+            ? "bg-white/[0.08] hover:bg-white/[0.12] border-red-500/50 text-[var(--text-primary)] ring-1 ring-red-500/30"
             : pad.hasAudio
             ? "bg-white/[0.08] hover:bg-white/[0.12] border-[var(--border-subtle)] text-[var(--text-primary)]"
             : "bg-white/[0.03] hover:bg-white/[0.06] border-dashed border-[var(--border-subtle)] text-[var(--text-faint)]"
@@ -215,11 +223,9 @@ function Pad({
           {pad.hasAudio ? padLabel(pad.fileName) : "+"}
         </span>
       </button>
+      {/* Upload button — top-left */}
       <button
         onPointerDown={(e) => {
-          // Stop the underlying pad's pointerdown from firing — without this
-          // both buttons get a hit and the pad would trigger right before
-          // the file picker opened.
           e.stopPropagation();
         }}
         onClick={(e) => {
@@ -237,6 +243,7 @@ function Pad({
           <path d="M12 16V4M6 10l6-6 6 6M4 20h16" />
         </svg>
       </button>
+      {/* Clear button — top-right */}
       {pad.hasAudio && (
         <button
           onPointerDown={(e) => e.stopPropagation()}
@@ -257,11 +264,8 @@ function Pad({
         className="sr-only"
         onChange={async (e) => {
           const f = e.target.files?.[0];
-          // Capture before any await — on iOS Safari clearing the input before
-          // file.arrayBuffer() completes can close the underlying file handle.
           const input = e.target;
           if (f) await handleFile(f);
-          // Reset after processing so the user can re-pick the same file.
           input.value = "";
         }}
       />
@@ -269,9 +273,97 @@ function Pad({
   );
 }
 
+function PatternGrid({
+  trackId,
+  pattern,
+}: {
+  trackId: string;
+  pattern: boolean[][];
+}) {
+  const togglePatternStep = useCypher((s) => s.togglePatternStep);
+  const clearPattern = useCypher((s) => s.clearPattern);
+  const togglePatternRecording = useCypher((s) => s.togglePatternRecording);
+  const patternRecording = useCypher((s) => s.patternRecording);
+  const isPlaying = useCypher((s) => s.isPlaying);
+  const isRecording = patternRecording === trackId;
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className="text-[9px] uppercase tracking-[0.16em] text-[var(--text-faint)] flex-1">
+          Pattern
+        </span>
+        {/* REC button — captures live pad taps into the grid while playing */}
+        <button
+          onClick={() => togglePatternRecording(trackId)}
+          aria-pressed={isRecording}
+          aria-label={
+            isRecording
+              ? "Stop pattern recording"
+              : "Record pad hits into pattern"
+          }
+          title={
+            isRecording
+              ? "Stop recording pad hits"
+              : isPlaying
+              ? "Tap pads to record hits into the pattern"
+              : "Start transport first, then tap pads to record"
+          }
+          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${
+            isRecording
+              ? "bg-red-600 text-white animate-pulse"
+              : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
+          }`}
+        >
+          <span className={`block w-1.5 h-1.5 rounded-full ${isRecording ? "bg-white" : "bg-red-500"}`} />
+          REC
+        </button>
+        <button
+          onClick={() => clearPattern(trackId)}
+          className="text-[9px] uppercase tracking-[0.1em] text-[var(--text-faint)] hover:text-[var(--text-primary)] px-1.5 py-0.5 rounded hover:bg-white/[0.06] border border-transparent hover:border-[var(--border-subtle)] transition-colors"
+        >
+          Clear
+        </button>
+      </div>
+      {/* Scrollable 8×16 grid */}
+      <div className="overflow-x-auto -mx-0.5 px-0.5">
+        <div className="inline-block min-w-full">
+          {Array.from({ length: SAMPLER_PAD_COUNT }, (_, padIdx) => (
+            <div key={padIdx} className="flex items-center gap-0.5 mb-0.5">
+              <span className="text-[8px] text-[var(--text-faint)] w-3 shrink-0 text-right tabular-nums">
+                {padIdx + 1}
+              </span>
+              <div className="flex gap-0.5 ml-0.5">
+                {Array.from({ length: SAMPLER_STEP_COUNT }, (_, step) => {
+                  const on = pattern[padIdx]?.[step] ?? false;
+                  const beatStart = step % 4 === 0;
+                  return (
+                    <button
+                      key={step}
+                      onClick={() => togglePatternStep(trackId, padIdx, step)}
+                      aria-label={`Pad ${padIdx + 1} step ${step + 1} ${on ? "on" : "off"}`}
+                      aria-pressed={on}
+                      className={`w-5 h-5 rounded-sm transition-colors shrink-0 ${
+                        on
+                          ? "bg-[var(--accent)] hover:opacity-80"
+                          : beatStart
+                          ? "bg-white/[0.09] hover:bg-white/[0.16] border border-[var(--border-subtle)]"
+                          : "bg-white/[0.04] hover:bg-white/[0.10] border border-[var(--border-subtle)]/50"
+                      }`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function padLabel(fileName: string | null): string {
   if (!fileName) return "sample";
-  // Strip extension and shrink to a chip-friendly width.
   const dot = fileName.lastIndexOf(".");
   const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
   return stem.length > 10 ? `${stem.slice(0, 9)}…` : stem;

@@ -249,6 +249,9 @@ class AudioEngine {
   private nativeCtx: AudioContext | null = null;
   private recording: RecordingSession | null = null;
   private multiRecording = new Map<TrackId, RecordingSession>();
+  private sequences = new Map<TrackId, Tone.Sequence<number>>();
+  private patterns = new Map<TrackId, boolean[][]>();
+  private padRecording: { session: RecordingSession; trackId: TrackId; padIdx: number } | null = null;
   private metronomeSynth: Tone.MembraneSynth | null = null;
   private metronomeLoop: Tone.Loop | null = null;
   private metronomeOn = false;
@@ -491,6 +494,7 @@ class AudioEngine {
     t.panner.dispose();
     t.pads.clear();
     this.tracks.delete(id);
+    this.removeSequencer(id);
   }
 
   clearAllTracks() {
@@ -503,6 +507,11 @@ class AudioEngine {
       t.pads.clear();
     }
     this.tracks.clear();
+    for (const seq of this.sequences.values()) {
+      try { seq.dispose(); } catch { /* ignore */ }
+    }
+    this.sequences.clear();
+    this.patterns.clear();
   }
 
   async loadFileToTrack(id: TrackId, file: File): Promise<AudioBuffer> {
@@ -1000,7 +1009,7 @@ class AudioEngine {
     session.recorder.start();
   }
 
-  private async finalizeSession(session: RecordingSession): Promise<AudioBuffer | null> {
+  private async decodeSession(session: RecordingSession): Promise<AudioBuffer> {
     if (session.recorder.state !== "inactive") {
       await new Promise<void>((resolve) => {
         session.recorder.onstop = () => resolve();
@@ -1036,6 +1045,11 @@ class AudioEngine {
       );
     }
     buf = applyInputGain(buf, session.inputGainValue);
+    return buf;
+  }
+
+  private async finalizeSession(session: RecordingSession): Promise<AudioBuffer | null> {
+    const buf = await this.decodeSession(session);
 
     const track = this.tracks.get(session.trackId);
     if (track) {
@@ -1190,6 +1204,120 @@ class AudioEngine {
 
   recordingTrackId() {
     return this.recording?.trackId ?? null;
+  }
+
+  // ---- Step Sequencer ----
+
+  addSequencer(id: TrackId, padCount = 8, stepCount = 16): void {
+    this.removeSequencer(id);
+    const steps = Array.from({ length: stepCount }, (_, i) => i);
+    const grid: boolean[][] = Array.from({ length: padCount }, () =>
+      Array(stepCount).fill(false),
+    );
+    this.patterns.set(id, grid);
+    const seq = new Tone.Sequence<number>(
+      (time: number, step: number) => {
+        const pattern = this.patterns.get(id);
+        if (!pattern) return;
+        const t = this.tracks.get(id);
+        if (!t || !this.nativeCtx) return;
+        for (let padIdx = 0; padIdx < pattern.length; padIdx++) {
+          if (pattern[padIdx][step]) {
+            const buf = t.pads.get(padIdx);
+            if (!buf) continue;
+            const src = this.nativeCtx.createBufferSource();
+            src.buffer = buf;
+            const gainInput = (t.gain as unknown as { input: AudioNode }).input;
+            src.connect(gainInput);
+            src.start(time);
+          }
+        }
+      },
+      steps,
+      "16n",
+    );
+    seq.start(0);
+    this.sequences.set(id, seq);
+  }
+
+  removeSequencer(id: TrackId): void {
+    const seq = this.sequences.get(id);
+    if (seq) {
+      try { seq.dispose(); } catch { /* ignore */ }
+      this.sequences.delete(id);
+    }
+    this.patterns.delete(id);
+  }
+
+  setPatternStep(id: TrackId, padIdx: number, step: number, on: boolean): void {
+    const pattern = this.patterns.get(id);
+    if (!pattern || padIdx < 0 || padIdx >= pattern.length) return;
+    if (step < 0 || step >= pattern[padIdx].length) return;
+    pattern[padIdx][step] = on;
+  }
+
+  loadPattern(id: TrackId, grid: boolean[][]): void {
+    const pattern = this.patterns.get(id);
+    if (!pattern) {
+      this.patterns.set(id, grid.map((row) => [...row]));
+      return;
+    }
+    for (let i = 0; i < grid.length && i < pattern.length; i++) {
+      for (let j = 0; j < grid[i].length && j < pattern[i].length; j++) {
+        pattern[i][j] = grid[i][j];
+      }
+    }
+  }
+
+  getPattern(id: TrackId): boolean[][] | null {
+    const pattern = this.patterns.get(id);
+    if (!pattern) return null;
+    return pattern.map((row) => [...row]);
+  }
+
+  // ---- Pad Recording ----
+
+  async startPadRecording(trackId: TrackId, padIdx: number, deviceId?: string): Promise<void> {
+    // Abort any existing pad recording
+    if (this.padRecording) {
+      try {
+        const old = this.padRecording.session;
+        this.padRecording = null;
+        if (old.recorder.state !== "inactive") old.recorder.stop();
+        disconnectSessionNodes(old);
+        old.stream.getTracks().forEach((t) => t.stop());
+        this.disableOutputBridge();
+      } catch { /* ignore */ }
+    }
+    const session = await this.openRecordingSession(trackId, deviceId, 1);
+    this.padRecording = { session, trackId, padIdx };
+    this.startSession(session);
+  }
+
+  async stopPadRecording(): Promise<AudioBuffer | null> {
+    const pr = this.padRecording;
+    if (!pr) return null;
+    this.padRecording = null;
+    let buf: AudioBuffer;
+    try {
+      buf = await this.decodeSession(pr.session);
+    } catch {
+      return null;
+    }
+    const t = this.tracks.get(pr.trackId);
+    if (t) {
+      t.pads.set(pr.padIdx, buf);
+    }
+    return buf;
+  }
+
+  isPadRecording(): boolean {
+    return this.padRecording !== null;
+  }
+
+  padRecordingTarget(): { trackId: TrackId; padIdx: number } | null {
+    if (!this.padRecording) return null;
+    return { trackId: this.padRecording.trackId, padIdx: this.padRecording.padIdx };
   }
 }
 

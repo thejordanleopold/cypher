@@ -1,7 +1,8 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { useCypher, MAX_INPUT_GAIN, type TrackState } from "@/state/store";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { useCypher, MAX_INPUT_GAIN, SAMPLER_PAD_COUNT, type TrackState } from "@/state/store";
 import { Waveform } from "@/components/Waveform";
 import { LiveWaveform } from "@/components/LiveWaveform";
 import { InputPicker } from "@/components/InputPicker";
@@ -19,10 +20,13 @@ export function TrackRow({ track }: { track: TrackState }) {
     toggleNormalize,
     removeTrack,
     isMultiRecording,
+    copyTrackToPad,
+    tracks,
   } = useCypher();
   const fileRef = useRef<HTMLInputElement>(null);
   const [collapsed, setCollapsed] = useState(false);
   const armDisabled = isMultiRecording;
+  const samplerTracks = tracks.filter((t) => t.kind === "sampler");
   const isRecordingNow = isMultiRecording && track.armed;
 
   return (
@@ -197,19 +201,30 @@ export function TrackRow({ track }: { track: TrackState }) {
       </div>
 
       {/* Waveform — always visible so collapsed cards still tell you what's there */}
-      <div className="px-2.5 pb-2">
+      <div className="px-2.5 pb-2 relative">
         {isRecordingNow ? (
           <LiveWaveform trackId={track.id} />
         ) : (
           track.hasAudio && (
-            <Waveform
-              trackId={track.id}
-              hasAudio={track.hasAudio}
-              bufferRevision={track.bufferRevision}
-              trimInSec={track.trimInSec}
-              trimOutSec={track.trimOutSec}
-              durationSec={track.durationSec}
-            />
+            <>
+              <Waveform
+                trackId={track.id}
+                hasAudio={track.hasAudio}
+                bufferRevision={track.bufferRevision}
+                trimInSec={track.trimInSec}
+                trimOutSec={track.trimOutSec}
+                durationSec={track.durationSec}
+              />
+              {samplerTracks.length > 0 && (
+                <SendToPadButton
+                  sourceTrackId={track.id}
+                  samplerTracks={samplerTracks}
+                  onSend={(targetTrackId, padIdx) =>
+                    void copyTrackToPad(track.id, targetTrackId, padIdx)
+                  }
+                />
+              )}
+            </>
           )
         )}
       </div>
@@ -287,5 +302,99 @@ function SliderRow({
         {formatValue(value)}
       </span>
     </label>
+  );
+}
+
+// ---- Send to Pad ----
+
+function SendToPadButton({
+  sourceTrackId,
+  samplerTracks,
+  onSend,
+}: {
+  sourceTrackId: string;
+  samplerTracks: TrackState[];
+  onSend: (targetTrackId: string, padIdx: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    if (!open || !btnRef.current) return;
+    const r = btnRef.current.getBoundingClientRect();
+    setPos({ top: r.bottom + 4, left: r.right });
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!btnRef.current?.contains(e.target as Node) && !popRef.current?.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const popover = open && pos ? createPortal(
+    <div
+      ref={popRef}
+      role="menu"
+      aria-label="Send audio to pad"
+      style={{ position: "fixed", top: pos.top, left: pos.left, transform: "translateX(-100%)", zIndex: 9999 }}
+      className="w-52 glass-raised rounded-xl p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
+    >
+      <p className="px-2.5 py-1 text-[10px] uppercase tracking-[0.14em] text-[var(--text-faint)]">
+        Send to pad
+      </p>
+      {samplerTracks.map((st) =>
+        Array.from({ length: SAMPLER_PAD_COUNT }, (_, padIdx) => (
+          <button
+            key={`${st.id}-${padIdx}`}
+            role="menuitem"
+            onClick={() => {
+              onSend(st.id, padIdx);
+              setOpen(false);
+            }}
+            className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-white/[0.06] flex items-center justify-between transition-colors"
+          >
+            <span className="text-[12px] text-[var(--text-primary)]">
+              {st.name} · Pad {padIdx + 1}
+            </span>
+            {st.pads[padIdx]?.hasAudio && (
+              <span className="text-[9px] text-amber-400">replace</span>
+            )}
+          </button>
+        ))
+      )}
+    </div>,
+    document.body,
+  ) : null;
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        onClick={() => setOpen((v) => !v)}
+        aria-label="Send audio to a sampler pad"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Send this clip to a sampler pad"
+        className="absolute top-0 right-0 h-5 px-1.5 rounded text-[9px] font-medium uppercase tracking-[0.1em] bg-black/50 hover:bg-black/70 text-[var(--text-faint)] hover:text-[var(--text-primary)] flex items-center gap-1 transition-colors"
+      >
+        <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M5 12h14M13 6l6 6-6 6" />
+        </svg>
+        Pad
+      </button>
+      {popover}
+    </>
   );
 }
