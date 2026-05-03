@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   useCypher,
   SAMPLER_PAD_COUNT,
@@ -8,6 +8,7 @@ import {
   type SamplerPadState,
   type TrackState,
 } from "@/state/store";
+import { getEngine } from "@/audio/engine";
 
 export function SamplerRow({ track }: { track: TrackState }) {
   const setVolume = useCypher((s) => s.setVolume);
@@ -16,6 +17,7 @@ export function SamplerRow({ track }: { track: TrackState }) {
   const toggleSolo = useCypher((s) => s.toggleSolo);
   const removeTrack = useCypher((s) => s.removeTrack);
   const [collapsed, setCollapsed] = useState(false);
+  const [selectedPad, setSelectedPad] = useState<number | null>(null);
 
   return (
     <article className="glass rounded-xl" aria-label={track.name}>
@@ -111,8 +113,30 @@ export function SamplerRow({ track }: { track: TrackState }) {
                 }
               />
             </div>
-            <PadGrid trackId={track.id} pads={track.pads} />
-            <PatternGrid trackId={track.id} pattern={track.pattern} />
+
+            <PadGrid
+              trackId={track.id}
+              pads={track.pads}
+              selectedPad={selectedPad}
+              onSelectPad={setSelectedPad}
+            />
+
+            {selectedPad !== null ? (
+              <PadStepEditor
+                trackId={track.id}
+                padIdx={selectedPad}
+                steps={track.pattern[selectedPad] ?? Array(SAMPLER_STEP_COUNT).fill(false)}
+                padName={track.pads[selectedPad]?.fileName ?? null}
+                onClose={() => setSelectedPad(null)}
+              />
+            ) : (
+              <PatternOverview
+                trackId={track.id}
+                pattern={track.pattern}
+                pads={track.pads}
+                onSelectPad={setSelectedPad}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -120,17 +144,30 @@ export function SamplerRow({ track }: { track: TrackState }) {
   );
 }
 
+// ---- Pad grid ----
+
 function PadGrid({
   trackId,
   pads,
+  selectedPad,
+  onSelectPad,
 }: {
   trackId: string;
   pads: SamplerPadState[];
+  selectedPad: number | null;
+  onSelectPad: (idx: number | null) => void;
 }) {
   return (
     <div className="grid grid-cols-4 gap-1.5">
       {pads.map((pad, i) => (
-        <Pad key={i} trackId={trackId} padIdx={i} pad={pad} />
+        <Pad
+          key={i}
+          trackId={trackId}
+          padIdx={i}
+          pad={pad}
+          selected={selectedPad === i}
+          onSelect={() => onSelectPad(selectedPad === i ? null : i)}
+        />
       ))}
     </div>
   );
@@ -140,36 +177,34 @@ function Pad({
   trackId,
   padIdx,
   pad,
+  selected,
+  onSelect,
 }: {
   trackId: string;
   padIdx: number;
   pad: SamplerPadState;
+  selected: boolean;
+  onSelect: () => void;
 }) {
   const triggerPad = useCypher((s) => s.triggerPad);
   const loadPadSample = useCypher((s) => s.loadPadSample);
   const clearPadSample = useCypher((s) => s.clearPadSample);
   const pushToast = useCypher((s) => s.pushToast);
   const patternRecording = useCypher((s) => s.patternRecording);
-  const startPadRecording = useCypher((s) => s.startPadRecording);
-  const stopPadRecording = useCypher((s) => s.stopPadRecording);
-  const recordingPad = useCypher((s) => s.recordingPad);
   const fileRef = useRef<HTMLInputElement>(null);
   const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
 
   const isCapturing = patternRecording === trackId;
-  const isMicRecording = recordingPad?.trackId === trackId && recordingPad?.padIdx === padIdx;
 
   const handleFile = async (file: File) => {
     try {
       await loadPadSample(trackId, padIdx, file);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Could not load that file";
       pushToast({
         variant: "error",
         title: `Pad ${padIdx + 1}: load failed`,
-        message,
+        message: err instanceof Error ? err.message : "Could not load that file",
         ttlMs: 8000,
       });
     }
@@ -179,15 +214,23 @@ function Pad({
     const now = performance.now();
     const isDoubleTap = now - lastTapRef.current < 300;
     lastTapRef.current = now;
+
     if (isDoubleTap) {
       lastTapRef.current = 0;
-      fileRef.current?.click();
+      if (pad.hasAudio) {
+        // Double-tap loaded pad → open step sequencer for this pad
+        onSelect();
+      } else {
+        fileRef.current?.click();
+      }
       return;
     }
+
     if (!pad.hasAudio) {
       fileRef.current?.click();
       return;
     }
+
     setActive(true);
     void triggerPad(trackId, padIdx);
     window.setTimeout(() => setActive(false), 120);
@@ -202,47 +245,61 @@ function Pad({
         }}
         aria-label={
           pad.hasAudio
-            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"} (double-tap to replace)`
+            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"} — double-tap to edit steps`
             : `Pad ${padIdx + 1} — tap to load a sample`
         }
-        className={`w-full aspect-square rounded-lg border text-[10px] font-medium flex flex-col items-center justify-center gap-0.5 transition-colors select-none touch-none ${
+        className={`w-full rounded-lg border text-[10px] font-medium flex flex-col items-start justify-between transition-colors select-none touch-none overflow-hidden ${
           active
             ? "bg-[var(--accent)] text-[#031024] border-[var(--accent)]"
+            : selected
+            ? "bg-[var(--accent)]/10 border-[var(--accent)]/60 ring-1 ring-[var(--accent)]/40 text-[var(--text-primary)]"
             : isCapturing && pad.hasAudio
-            ? "bg-white/[0.08] hover:bg-white/[0.12] border-red-500/50 text-[var(--text-primary)] ring-1 ring-red-500/30"
+            ? "bg-white/[0.08] border-red-500/50 text-[var(--text-primary)] ring-1 ring-red-500/30"
             : pad.hasAudio
             ? "bg-white/[0.08] hover:bg-white/[0.12] border-[var(--border-subtle)] text-[var(--text-primary)]"
             : "bg-white/[0.03] hover:bg-white/[0.06] border-dashed border-[var(--border-subtle)] text-[var(--text-faint)]"
         }`}
       >
-        <span className="text-[9px] uppercase tracking-[0.16em] opacity-70">
-          {padIdx + 1}
-        </span>
-        <span className="px-1 truncate max-w-full text-[10px] leading-tight">
-          {pad.hasAudio ? padLabel(pad.fileName) : "+"}
-        </span>
+        <div className="flex items-center justify-between w-full px-1.5 pt-1.5 pb-0.5">
+          <span className="text-[9px] uppercase tracking-[0.16em] opacity-70 leading-none">
+            {padIdx + 1}
+          </span>
+          <span className="px-0 truncate max-w-[70%] text-[9px] leading-none opacity-80 text-right">
+            {pad.hasAudio ? padLabel(pad.fileName) : "+"}
+          </span>
+        </div>
+        {/* Waveform area — double-tap hint when loaded */}
+        <div className="w-full px-1 pb-1.5 min-h-[28px]">
+          {pad.hasAudio ? (
+            <PadWaveform
+              trackId={trackId}
+              padIdx={padIdx}
+              bufferRevision={pad.bufferRevision}
+              active={active}
+              selected={selected}
+            />
+          ) : (
+            <div className="h-6" />
+          )}
+        </div>
       </button>
-      {/* Upload button — top-left */}
+
+      {/* Upload button — top-left corner */}
       <button
-        onPointerDown={(e) => {
-          e.stopPropagation();
-        }}
+        onPointerDown={(e) => e.stopPropagation()}
         onClick={(e) => {
           e.stopPropagation();
           fileRef.current?.click();
         }}
-        aria-label={
-          pad.hasAudio
-            ? `Replace sample on pad ${padIdx + 1}`
-            : `Load sample to pad ${padIdx + 1}`
-        }
+        aria-label={pad.hasAudio ? `Replace sample on pad ${padIdx + 1}` : `Load sample to pad ${padIdx + 1}`}
         className="absolute top-0.5 left-0.5 w-4 h-4 rounded text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-black/40 flex items-center justify-center"
       >
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M12 16V4M6 10l6-6 6 6M4 20h16" />
         </svg>
       </button>
-      {/* Clear button — top-right */}
+
+      {/* Clear button — top-right corner */}
       {pad.hasAudio && (
         <button
           onPointerDown={(e) => e.stopPropagation()}
@@ -256,36 +313,7 @@ function Pad({
           ×
         </button>
       )}
-      {/* Mic record button — bottom-left */}
-      <button
-        onPointerDown={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          if (isMicRecording) {
-            void stopPadRecording();
-          } else {
-            void startPadRecording(trackId, padIdx);
-          }
-        }}
-        aria-label={isMicRecording ? `Stop recording into pad ${padIdx + 1}` : `Record mic into pad ${padIdx + 1}`}
-        aria-pressed={isMicRecording}
-        className={`absolute bottom-0.5 left-0.5 w-4 h-4 rounded flex items-center justify-center ${
-          isMicRecording
-            ? "bg-red-500 animate-pulse text-white"
-            : "text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-black/40"
-        }`}
-      >
-        {isMicRecording ? (
-          <svg width="8" height="8" viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="12" cy="12" r="8" fill="currentColor" />
-          </svg>
-        ) : (
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <rect x="9" y="2" width="6" height="12" rx="3" />
-            <path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8" />
-          </svg>
-        )}
-      </button>
+
       <input
         ref={fileRef}
         type="file"
@@ -302,18 +330,190 @@ function Pad({
   );
 }
 
-function PatternGrid({
+// ---- Pad waveform ----
+
+function PadWaveform({
   trackId,
-  pattern,
+  padIdx,
+  bufferRevision,
+  active,
+  selected,
 }: {
   trackId: string;
-  pattern: boolean[][];
+  padIdx: number;
+  bufferRevision: number;
+  active: boolean;
+  selected: boolean;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const buf = getEngine().getPadBuffer(trackId, padIdx);
+    if (!buf) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.offsetWidth || 80;
+    const h = canvas.offsetHeight || 24;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.scale(dpr, dpr);
+
+    const data = buf.getChannelData(0);
+    const samplesPerPx = data.length / w;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = active ? "rgba(3,16,36,0.7)" : selected ? "rgba(124,182,255,0.8)" : "rgba(124,182,255,0.5)";
+
+    for (let x = 0; x < w; x++) {
+      const start = Math.floor(x * samplesPerPx);
+      const end = Math.min(data.length, Math.floor((x + 1) * samplesPerPx));
+      let peak = 0;
+      for (let i = start; i < end; i++) {
+        const abs = Math.abs(data[i]);
+        if (abs > peak) peak = abs;
+      }
+      const barH = Math.max(1, peak * h * 0.9);
+      ctx.fillRect(x, (h - barH) / 2, 1, barH);
+    }
+  }, [trackId, padIdx, bufferRevision, active, selected]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="w-full h-6 rounded-sm"
+      aria-hidden="true"
+    />
+  );
+}
+
+// ---- Per-pad step editor ----
+
+function PadStepEditor({
+  trackId,
+  padIdx,
+  steps,
+  padName,
+  onClose,
+}: {
+  trackId: string;
+  padIdx: number;
+  steps: boolean[];
+  padName: string | null;
+  onClose: () => void;
 }) {
   const togglePatternStep = useCypher((s) => s.togglePatternStep);
   const clearPattern = useCypher((s) => s.clearPattern);
   const togglePatternRecording = useCypher((s) => s.togglePatternRecording);
   const patternRecording = useCypher((s) => s.patternRecording);
-  const isPlaying = useCypher((s) => s.isPlaying);
+  const isRecording = patternRecording === trackId;
+
+  return (
+    <div className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/5 p-2 space-y-2">
+      {/* Header */}
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-medium text-[var(--text-primary)] flex-1 truncate">
+          Pad {padIdx + 1}{padName ? ` · ${padLabel(padName)}` : ""}
+        </span>
+        <button
+          onClick={() => togglePatternRecording(trackId)}
+          aria-pressed={isRecording}
+          aria-label={isRecording ? "Stop pattern recording" : "Record pad hits into pattern"}
+          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${
+            isRecording
+              ? "bg-red-600 text-white animate-pulse"
+              : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
+          }`}
+        >
+          <span className={`block w-1.5 h-1.5 rounded-full ${isRecording ? "bg-white" : "bg-red-500"}`} />
+          REC
+        </button>
+        <button
+          onClick={() => clearPattern(trackId)}
+          title="Clear this row"
+          className="text-[9px] uppercase tracking-[0.1em] text-[var(--text-faint)] hover:text-[var(--text-primary)] px-1.5 py-0.5 rounded hover:bg-white/[0.06] border border-transparent hover:border-[var(--border-subtle)] transition-colors"
+        >
+          Clear
+        </button>
+        <button
+          onClick={onClose}
+          aria-label="Close step editor"
+          className="w-5 h-5 rounded flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-white/[0.06]"
+        >
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden="true">
+            <path d="M18 6L6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+
+      {/* 16 steps grouped into 4 beats */}
+      <div className="flex gap-1">
+        {[0, 1, 2, 3].map((beat) => (
+          <div key={beat} className="flex gap-0.5 flex-1">
+            {[0, 1, 2, 3].map((sub) => {
+              const step = beat * 4 + sub;
+              const on = steps[step] ?? false;
+              return (
+                <button
+                  key={step}
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    togglePatternStep(trackId, padIdx, step);
+                  }}
+                  aria-label={`Step ${step + 1} ${on ? "on" : "off"}`}
+                  aria-pressed={on}
+                  className={`flex-1 h-10 rounded-sm transition-colors touch-none select-none ${
+                    on
+                      ? "bg-[var(--accent)] hover:opacity-80"
+                      : sub === 0
+                      ? "bg-white/[0.10] hover:bg-white/[0.18] border border-[var(--border-subtle)]"
+                      : "bg-white/[0.05] hover:bg-white/[0.12] border border-[var(--border-subtle)]/60"
+                  }`}
+                />
+              );
+            })}
+          </div>
+        ))}
+      </div>
+
+      {/* Step number labels */}
+      <div className="flex gap-1 px-px">
+        {[0, 1, 2, 3].map((beat) => (
+          <div key={beat} className="flex gap-0.5 flex-1">
+            {[0, 1, 2, 3].map((sub) => {
+              const step = beat * 4 + sub;
+              return (
+                <span key={step} className="flex-1 text-center text-[7px] text-[var(--text-faint)] tabular-nums">
+                  {step + 1}
+                </span>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---- Pattern overview ----
+
+function PatternOverview({
+  trackId,
+  pattern,
+  pads,
+  onSelectPad,
+}: {
+  trackId: string;
+  pattern: boolean[][];
+  pads: SamplerPadState[];
+  onSelectPad: (idx: number) => void;
+}) {
+  const togglePatternStep = useCypher((s) => s.togglePatternStep);
+  const togglePatternRecording = useCypher((s) => s.togglePatternRecording);
+  const clearPattern = useCypher((s) => s.clearPattern);
+  const patternRecording = useCypher((s) => s.patternRecording);
   const isRecording = patternRecording === trackId;
 
   return (
@@ -322,22 +522,10 @@ function PatternGrid({
         <span className="text-[9px] uppercase tracking-[0.16em] text-[var(--text-faint)] flex-1">
           Pattern
         </span>
-        {/* REC button — captures live pad taps into the grid while playing */}
         <button
           onClick={() => togglePatternRecording(trackId)}
           aria-pressed={isRecording}
-          aria-label={
-            isRecording
-              ? "Stop pattern recording"
-              : "Record pad hits into pattern"
-          }
-          title={
-            isRecording
-              ? "Stop recording pad hits"
-              : isPlaying
-              ? "Tap pads to record hits into the pattern"
-              : "Start transport first, then tap pads to record"
-          }
+          aria-label={isRecording ? "Stop pattern recording" : "Record pad hits into pattern"}
           className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${
             isRecording
               ? "bg-red-600 text-white animate-pulse"
@@ -354,42 +542,56 @@ function PatternGrid({
           Clear
         </button>
       </div>
-      {/* Scrollable 8×16 grid */}
+
       <div className="overflow-x-auto -mx-0.5 px-0.5">
         <div className="inline-block min-w-full">
-          {Array.from({ length: SAMPLER_PAD_COUNT }, (_, padIdx) => (
-            <div key={padIdx} className="flex items-center gap-0.5 mb-0.5">
-              <span className="text-[8px] text-[var(--text-faint)] w-3 shrink-0 text-right tabular-nums">
-                {padIdx + 1}
-              </span>
-              <div className="flex gap-0.5 ml-0.5">
-                {Array.from({ length: SAMPLER_STEP_COUNT }, (_, step) => {
-                  const on = pattern[padIdx]?.[step] ?? false;
-                  const beatStart = step % 4 === 0;
-                  return (
-                    <button
-                      key={step}
-                      onClick={() => togglePatternStep(trackId, padIdx, step)}
-                      aria-label={`Pad ${padIdx + 1} step ${step + 1} ${on ? "on" : "off"}`}
-                      aria-pressed={on}
-                      className={`w-5 h-5 rounded-sm transition-colors shrink-0 ${
-                        on
-                          ? "bg-[var(--accent)] hover:opacity-80"
-                          : beatStart
-                          ? "bg-white/[0.09] hover:bg-white/[0.16] border border-[var(--border-subtle)]"
-                          : "bg-white/[0.04] hover:bg-white/[0.10] border border-[var(--border-subtle)]/50"
-                      }`}
-                    />
-                  );
-                })}
+          {Array.from({ length: SAMPLER_PAD_COUNT }, (_, padIdx) => {
+            const hasAudio = pads[padIdx]?.hasAudio;
+            return (
+              <div key={padIdx} className="flex items-center gap-0.5 mb-0.5">
+                {/* Pad label — tap to open step editor */}
+                <button
+                  onClick={() => onSelectPad(padIdx)}
+                  title={`Edit steps for pad ${padIdx + 1}`}
+                  className={`text-[8px] w-5 shrink-0 text-right tabular-nums rounded px-0.5 transition-colors ${
+                    hasAudio
+                      ? "text-[var(--text-primary)] hover:text-[var(--accent)] hover:bg-white/[0.06]"
+                      : "text-[var(--text-faint)]"
+                  }`}
+                >
+                  {padIdx + 1}
+                </button>
+                <div className="flex gap-0.5">
+                  {Array.from({ length: SAMPLER_STEP_COUNT }, (_, step) => {
+                    const on = pattern[padIdx]?.[step] ?? false;
+                    const beatStart = step % 4 === 0;
+                    return (
+                      <button
+                        key={step}
+                        onClick={() => togglePatternStep(trackId, padIdx, step)}
+                        aria-label={`Pad ${padIdx + 1} step ${step + 1} ${on ? "on" : "off"}`}
+                        aria-pressed={on}
+                        className={`w-5 h-4 rounded-sm transition-colors shrink-0 ${
+                          on
+                            ? "bg-[var(--accent)] hover:opacity-80"
+                            : beatStart
+                            ? "bg-white/[0.09] hover:bg-white/[0.16] border border-[var(--border-subtle)]"
+                            : "bg-white/[0.04] hover:bg-white/[0.10] border border-[var(--border-subtle)]/50"
+                        }`}
+                      />
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>
   );
 }
+
+// ---- Helpers ----
 
 function padLabel(fileName: string | null): string {
   if (!fileName) return "sample";
