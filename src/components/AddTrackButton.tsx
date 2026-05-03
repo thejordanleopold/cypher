@@ -1,27 +1,59 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useCypher, type TrackKind } from "@/state/store";
 
 type Variant = "wide" | "strip";
 
 interface Props {
   variant: Variant;
-  /** Mixer "strip" variant pins to a fixed strip height so the popover lines
-   * up with the channel strip cards. */
   stripHeight?: number;
+}
+
+interface PopoverPos {
+  top: number;
+  left: number;
+  width: number;
 }
 
 export function AddTrackButton({ variant, stripHeight }: Props) {
   const addTrack = useCypher((s) => s.addTrack);
   const tracks = useCypher((s) => s.tracks);
   const [open, setOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<PopoverPos | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+
+  // Measure trigger position so the portal-rendered popover lines up.
+  useLayoutEffect(() => {
+    if (!open || !btnRef.current) return;
+    const update = () => {
+      const r = btnRef.current!.getBoundingClientRect();
+      setPos({
+        top: r.bottom + 6,
+        left: variant === "strip" ? r.right + 8 : r.left + r.width / 2,
+        width: r.width,
+      });
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [open, variant]);
 
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+      if (
+        !btnRef.current?.contains(e.target as Node) &&
+        !popRef.current?.contains(e.target as Node)
+      ) {
+        setOpen(false);
+      }
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
@@ -39,16 +71,44 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
     void addTrack(kind);
   };
 
-  return (
+  const popover = open && pos ? (
     <div
-      ref={wrapRef}
-      className={
-        variant === "wide" ? "relative w-full" : "relative shrink-0"
+      ref={popRef}
+      role="menu"
+      aria-label="Choose track type"
+      style={
+        variant === "strip"
+          ? { position: "fixed", top: pos.top, left: pos.left, zIndex: 9999 }
+          : {
+              position: "fixed",
+              top: pos.top,
+              left: pos.left,
+              transform: "translateX(-50%)",
+              zIndex: 9999,
+            }
       }
-      style={variant === "strip" && stripHeight ? { height: stripHeight } : undefined}
+      className="w-56 glass-raised rounded-xl p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
     >
-      {variant === "wide" ? (
+      <MenuOption
+        onClick={() => choose("audio")}
+        title="Audio Track"
+        subtitle="Record or import a clip"
+        icon={<WaveIcon />}
+      />
+      <MenuOption
+        onClick={() => choose("sampler")}
+        title="Sampler"
+        subtitle="Drum-pad style sample player"
+        icon={<PadGridIcon />}
+      />
+    </div>
+  ) : null;
+
+  if (variant === "wide") {
+    return (
+      <>
         <button
+          ref={btnRef}
           onClick={() => setOpen((v) => !v)}
           className="glass block w-full rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
           aria-label="Add new track"
@@ -58,44 +118,26 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
           <PlusIcon />
           {tracks.length === 0 ? "Add your first track" : "Add track"}
         </button>
-      ) : (
-        <button
-          onClick={() => setOpen((v) => !v)}
-          aria-label="Add new track"
-          aria-haspopup="menu"
-          aria-expanded={open}
-          style={stripHeight ? { height: stripHeight } : undefined}
-          className="glass shrink-0 w-12 h-full rounded-xl text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] flex items-center justify-center transition-colors"
-        >
-          <PlusIcon size={16} />
-        </button>
-      )}
+        {typeof document !== "undefined" && createPortal(popover, document.body)}
+      </>
+    );
+  }
 
-      {open && (
-        <div
-          role="menu"
-          aria-label="Choose track type"
-          className={
-            variant === "wide"
-              ? "absolute left-1/2 -translate-x-1/2 bottom-full mb-2 z-30 w-56 glass-raised rounded-xl p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
-              : "absolute left-full ml-2 top-0 z-30 w-56 glass-raised rounded-xl p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
-          }
-        >
-          <MenuOption
-            onClick={() => choose("audio")}
-            title="Audio Track"
-            subtitle="Record or import a clip"
-            icon={<WaveIcon />}
-          />
-          <MenuOption
-            onClick={() => choose("sampler")}
-            title="Sampler"
-            subtitle="Drum-pad style sample player"
-            icon={<PadGridIcon />}
-          />
-        </div>
-      )}
-    </div>
+  return (
+    <>
+      <button
+        ref={btnRef}
+        onClick={() => setOpen((v) => !v)}
+        aria-label="Add new track"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        style={stripHeight ? { height: stripHeight } : undefined}
+        className="glass shrink-0 w-12 rounded-xl text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] flex items-center justify-center transition-colors"
+      >
+        <PlusIcon size={16} />
+      </button>
+      {typeof document !== "undefined" && createPortal(popover, document.body)}
+    </>
   );
 }
 
