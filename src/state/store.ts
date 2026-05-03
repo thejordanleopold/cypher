@@ -97,7 +97,7 @@ interface CypherState {
   lastSavedAt: number | null;
 
   initProject: () => Promise<void>;
-  addTrack: () => Promise<void>;
+  addTrack: (mode?: 'audio' | 'sampler') => Promise<void>;
   removeTrack: (id: string) => Promise<void>;
   importFile: (id: string, file: File) => Promise<void>;
   setVolume: (id: string, v: number) => void;
@@ -394,12 +394,13 @@ export const useCypher = create<CypherState>((set, get) => ({
     await get().refreshProjects();
   },
 
-  addTrack: async () => {
+  addTrack: async (mode = 'audio') => {
     const id = nextId();
     const name = `Track ${get().tracks.length + 1}`;
     await getEngine().addTrack(id, name);
     const t = emptyTrack(id, name);
     t.inputDeviceId = get().defaultInputDeviceId;
+    t.mode = mode;
     set((s) => ({ tracks: [...s.tracks, t] }));
     schedulePersist(get());
   },
@@ -441,20 +442,25 @@ export const useCypher = create<CypherState>((set, get) => ({
     const audioKey = makeAudioKey(get().currentProjectId, id);
     await saveAudio(audioKey, audioBufferToWavBlob(buf));
     set((s) => ({
-      tracks: s.tracks.map((t) =>
-        t.id === id
-          ? {
-              ...t,
-              hasAudio: true,
-              fileName: file.name,
-              durationSec: buf.duration,
-              bufferRevision: t.bufferRevision + 1,
-              audioKey,
-              trimInSec: 0,
-              trimOutSec: null,
-            }
-          : t,
-      ),
+      tracks: s.tracks.map((t) => {
+        if (t.id !== id) return t;
+        const updated: TrackState = {
+          ...t,
+          hasAudio: true,
+          fileName: file.name,
+          durationSec: buf.duration,
+          bufferRevision: t.bufferRevision + 1,
+          audioKey,
+          trimInSec: 0,
+          trimOutSec: null,
+        };
+        // Sampler tracks auto-chop on every fresh import — old pad
+        // boundaries don't make sense against a different sample.
+        if (updated.mode === 'sampler') {
+          updated.samplerPads = autoChopPads(updated);
+        }
+        return updated;
+      }),
     }));
     schedulePersist(get());
   },
@@ -850,7 +856,7 @@ export const useCypher = create<CypherState>((set, get) => ({
           const u = updates.get(t.id);
           if (!u) return t;
           const trimIn = Math.max(0, Math.min(u.duration, latencySec));
-          return {
+          const updated: TrackState = {
             ...t,
             hasAudio: true,
             fileName: "Recording",
@@ -860,6 +866,10 @@ export const useCypher = create<CypherState>((set, get) => ({
             trimInSec: trimIn,
             trimOutSec: null,
           };
+          if (updated.mode === 'sampler') {
+            updated.samplerPads = autoChopPads(updated);
+          }
+          return updated;
         }),
       }));
       schedulePersist(get());
@@ -882,21 +892,25 @@ export const useCypher = create<CypherState>((set, get) => ({
       const latencySec = get().latencyOffsetMs / 1000;
       const trimIn = Math.max(0, Math.min(buf.duration, latencySec));
       getEngine().setTrim(id, trimIn, null);
+      const newBuf = buf;
       set((s) => ({
-        tracks: s.tracks.map((t) =>
-          t.id === id
-            ? {
-                ...t,
-                hasAudio: true,
-                fileName: "Recording",
-                durationSec: buf.duration,
-                bufferRevision: t.bufferRevision + 1,
-                audioKey,
-                trimInSec: trimIn,
-                trimOutSec: null,
-              }
-            : t,
-        ),
+        tracks: s.tracks.map((t) => {
+          if (t.id !== id) return t;
+          const updated: TrackState = {
+            ...t,
+            hasAudio: true,
+            fileName: "Recording",
+            durationSec: newBuf.duration,
+            bufferRevision: t.bufferRevision + 1,
+            audioKey,
+            trimInSec: trimIn,
+            trimOutSec: null,
+          };
+          if (updated.mode === 'sampler') {
+            updated.samplerPads = autoChopPads(updated);
+          }
+          return updated;
+        }),
       }));
       schedulePersist(get());
     }

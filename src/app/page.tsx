@@ -108,22 +108,49 @@ export default function Home() {
           {tracks.map((t) => (
             <TrackRow key={t.id} track={t} />
           ))}
-          <button
-            onClick={() => addTrack()}
-            className="glass block w-full rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
-            aria-label="Add new track"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-            {tracks.length === 0 ? "Add your first track" : "Add track"}
-          </button>
+          <AddTrackChooser onAdd={addTrack} firstTrack={tracks.length === 0} />
         </div>
       ) : (
         <MixerView />
       )}
       <RecordingShield />
     </main>
+  );
+}
+
+function AddTrackChooser({
+  onAdd,
+  firstTrack,
+}: {
+  onAdd: (mode?: 'audio' | 'sampler') => Promise<void>;
+  firstTrack: boolean;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-1.5">
+      <button
+        onClick={() => onAdd('audio')}
+        className="glass rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-3 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+        aria-label={firstTrack ? "Add your first audio track" : "Add audio track"}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M3 12h2l3-7 4 14 3-9 2 4h4" />
+        </svg>
+        {firstTrack ? "Audio track" : "Audio"}
+      </button>
+      <button
+        onClick={() => onAdd('sampler')}
+        className="glass rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-violet-500/40 px-3 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+        aria-label={firstTrack ? "Add your first sampler track" : "Add sampler track"}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <rect x="3" y="3" width="7" height="7" rx="1.5" />
+          <rect x="14" y="3" width="7" height="7" rx="1.5" />
+          <rect x="3" y="14" width="7" height="7" rx="1.5" />
+          <rect x="14" y="14" width="7" height="7" rx="1.5" />
+        </svg>
+        {firstTrack ? "Sampler track" : "Sampler"}
+      </button>
+    </div>
   );
 }
 

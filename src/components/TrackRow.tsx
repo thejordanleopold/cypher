@@ -26,39 +26,7 @@ export function TrackRow({ track }: { track: TrackState }) {
   const [collapsed, setCollapsed] = useState(false);
   const armDisabled = isMultiRecording;
   const isRecordingNow = isMultiRecording && track.armed;
-  const swipeRef = useRef<{ x: number; y: number; id: number } | null>(null);
-
-  function onSwipeStart(e: React.PointerEvent) {
-    const el = e.target as HTMLElement;
-    if (el.closest('input, [role="slider"], [data-trim-handle]')) return;
-    // In audio mode, ignore button-originated swipes so taps on header
-    // controls don't sometimes register as a mode switch. In sampler mode,
-    // pads ARE buttons — allow swipes from them so users can swipe back to
-    // audio mode without hunting for the gap between pads (the pad still
-    // triggers on pointerdown; the mode switch only fires past 64px of
-    // horizontal motion, well beyond a tap).
-    if (track.mode === 'audio' && el.closest('button')) return;
-    swipeRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
-  }
-
-  function onSwipeMove(e: React.PointerEvent) {
-    const sw = swipeRef.current;
-    if (!sw || sw.id !== e.pointerId) return;
-    const dx = e.clientX - sw.x;
-    const dy = e.clientY - sw.y;
-    if (Math.abs(dx) > 64 && Math.abs(dy) < 36) {
-      swipeRef.current = null;
-      if (dx > 0 && track.mode === 'audio' && track.hasAudio) {
-        setTrackMode(track.id, 'sampler');
-      } else if (dx < 0 && track.mode === 'sampler') {
-        setTrackMode(track.id, 'audio');
-      }
-    }
-  }
-
-  function onSwipeEnd() {
-    swipeRef.current = null;
-  }
+  const isSampler = track.mode === 'sampler';
 
   return (
     <article
@@ -105,12 +73,12 @@ export function TrackRow({ track }: { track: TrackState }) {
           </div>
         </div>
         {isRecordingNow && <LevelMeter trackId={track.id} />}
-        {track.mode === 'sampler' && (
+        {isSampler && (
           <button
             onClick={() => setTrackMode(track.id, 'audio')}
             className="h-7 px-1.5 rounded-md bg-violet-500/20 border border-violet-500/40 text-violet-300 text-[9px] font-bold uppercase tracking-widest shrink-0 active:scale-95 transition-colors hover:bg-violet-500/30"
-            aria-label="Exit sampler mode"
-            title="Exit sampler — swipe left to exit"
+            aria-label="Convert sampler track to audio track"
+            title="Sampler track — tap to convert to audio"
           >
             SMPLR
           </button>
@@ -242,17 +210,17 @@ export function TrackRow({ track }: { track: TrackState }) {
       </div>
 
       {/* Waveform / Sampler — always visible so collapsed cards still show audio */}
-      <div
-        className="px-2.5 pb-2 touch-pan-y"
-        onPointerDown={onSwipeStart}
-        onPointerMove={onSwipeMove}
-        onPointerUp={onSwipeEnd}
-        onPointerCancel={onSwipeEnd}
-      >
+      <div className="px-2.5 pb-2">
         {isRecordingNow ? (
           <LiveWaveform trackId={track.id} />
-        ) : track.mode === 'sampler' && track.hasAudio ? (
-          <SamplerPads track={track} />
+        ) : isSampler ? (
+          track.hasAudio ? (
+            <SamplerPads track={track} />
+          ) : (
+            <div className="rounded-xl bg-black/30 ring-1 ring-violet-500/20 px-3 py-4 text-center text-[11px] text-[var(--text-faint)] leading-snug">
+              Import audio or arm and record to chop into pads.
+            </div>
+          )
         ) : (
           track.hasAudio && (
             <Waveform
