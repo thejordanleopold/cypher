@@ -15,10 +15,18 @@ export function SamplerRow({ track }: { track: TrackState }) {
   const setPan = useCypher((s) => s.setPan);
   const toggleMute = useCypher((s) => s.toggleMute);
   const toggleSolo = useCypher((s) => s.toggleSolo);
+  const toggleArm = useCypher((s) => s.toggleArm);
   const removeTrack = useCypher((s) => s.removeTrack);
+  const isMultiRecording = useCypher((s) => s.isMultiRecording);
+  const patternRecording = useCypher((s) => s.patternRecording);
   const [collapsed, setCollapsed] = useState(false);
   const [selectedPad, setSelectedPad] = useState<number | null>(null);
   const [patternEditorOpen, setPatternEditorOpen] = useState(false);
+
+  // The sampler is "live recording" pad hits when either the manual REC toggle
+  // is on, or the global transport is recording and this sampler is armed.
+  const isRecording =
+    patternRecording === track.id || (isMultiRecording && track.armed);
 
   const openEditorForPad = (padIdx: number) => {
     setSelectedPad(padIdx);
@@ -26,7 +34,16 @@ export function SamplerRow({ track }: { track: TrackState }) {
   };
 
   return (
-    <article className="glass rounded-xl" aria-label={track.name}>
+    <article
+      className={`glass rounded-xl transition-colors ${
+        isRecording
+          ? "!border-red-500/60 ring-1 ring-red-500/40"
+          : track.armed
+          ? "!border-red-500/30"
+          : ""
+      }`}
+      aria-label={track.name}
+    >
       <header className="flex items-center gap-1 px-2.5 pt-1.5 pb-1">
         <button
           onClick={() => setCollapsed((v) => !v)}
@@ -72,6 +89,15 @@ export function SamplerRow({ track }: { track: TrackState }) {
           onClick={() => toggleSolo(track.id)}
         >
           S
+        </ToggleButton>
+        <ToggleButton
+          active={track.armed}
+          activeClass="bg-red-600 text-white"
+          ariaLabel="Arm for recording — pad hits get captured to the pattern when the transport records"
+          disabled={isMultiRecording}
+          onClick={() => toggleArm(track.id)}
+        >
+          R
         </ToggleButton>
         <button
           onClick={() => removeTrack(track.id)}
@@ -131,6 +157,8 @@ export function SamplerRow({ track }: { track: TrackState }) {
             <PatternPreview
               trackId={track.id}
               pattern={track.pattern}
+              isRecording={isRecording}
+              armed={track.armed}
               onEdit={() => setPatternEditorOpen(true)}
             />
 
@@ -140,6 +168,7 @@ export function SamplerRow({ track }: { track: TrackState }) {
                 pattern={track.pattern}
                 pads={track.pads}
                 selectedPad={selectedPad}
+                isRecording={isRecording}
                 onSelectPad={setSelectedPad}
                 onClose={() => {
                   setPatternEditorOpen(false);
@@ -338,14 +367,38 @@ function Pad({
           e.target.value = "";
           if (!f) return;
           const name = f.name;
-          // FileReader.readAsArrayBuffer reads from the native file path and
-          // does not touch iOS Safari's IDB-backed blob URL registry.
-          // fetch(URL.createObjectURL(f)) fails after bfcache restoration
-          // because the blob: URL's backing store is IDB-based and gets
-          // invalidated when the tab is backgrounded during the file picker.
+          // iOS Safari (browser mode) backs File/Blob data with an internal
+          // IDB store that gets torn down when the tab is bfcache'd during
+          // the file picker. After restoration, fetch(blob:url) and
+          // readAsArrayBuffer both fail with "Error preparing Blob/File data
+          // to be stored in object store" because they hand off blob-backed
+          // ArrayBuffers that the IDB serializer rejects.
+          //
+          // readAsDataURL returns a plain JS string (base64). Decoding it
+          // with atob() and copying byte-by-byte into a fresh Uint8Array
+          // gives us an ArrayBuffer that lives entirely in the JS heap with
+          // no connection to any blob backing store — safe to decode and to
+          // store in IDB.
           const reader = new FileReader();
           reader.onload = () => {
-            void handleFile(reader.result as ArrayBuffer, name);
+            try {
+              const dataUrl = reader.result as string;
+              const commaIdx = dataUrl.indexOf(",");
+              const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+              const binary = atob(base64);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              void handleFile(bytes.buffer, name);
+            } catch (err) {
+              pushToast({
+                variant: "error",
+                title: `Pad ${padIdx + 1}: load failed`,
+                message: err instanceof Error ? err.message : "Could not decode file",
+                ttlMs: 8000,
+              });
+            }
           };
           reader.onerror = () => {
             pushToast({
@@ -355,7 +408,7 @@ function Pad({
               ttlMs: 8000,
             });
           };
-          reader.readAsArrayBuffer(f);
+          reader.readAsDataURL(f);
         }}
       />
     </div>
@@ -426,59 +479,72 @@ function PadWaveform({
 function PatternPreview({
   trackId,
   pattern,
+  isRecording,
+  armed,
   onEdit,
 }: {
   trackId: string;
   pattern: boolean[][];
+  isRecording: boolean;
+  armed: boolean;
   onEdit: () => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const lastTapRef = useRef(0);
-  const togglePatternRecording = useCypher((s) => s.togglePatternRecording);
-  const patternRecording = useCypher((s) => s.patternRecording);
-  const isRecording = patternRecording === trackId;
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.offsetWidth || 300;
-    const h = canvas.offsetHeight || 48;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, w, h);
+    const draw = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      if (w === 0 || h === 0) return; // ResizeObserver will fire again with real dims
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
 
-    const rowH = h / SAMPLER_PAD_COUNT;
-    const colW = w / SAMPLER_STEP_COUNT;
-    const activeColor = isRecording ? "rgba(239,68,68,0.85)" : "rgba(124,182,255,0.85)";
+      const rowH = h / SAMPLER_PAD_COUNT;
+      const colW = w / SAMPLER_STEP_COUNT;
+      const activeColor = isRecording
+        ? "rgba(239,68,68,0.9)"
+        : "rgba(124,182,255,0.9)";
 
-    for (let r = 0; r < SAMPLER_PAD_COUNT; r++) {
-      for (let c = 0; c < SAMPLER_STEP_COUNT; c++) {
-        const on = pattern[r]?.[c] ?? false;
-        const beatStart = c % 4 === 0;
-        ctx.fillStyle = on
-          ? activeColor
-          : beatStart
-          ? "rgba(255,255,255,0.07)"
-          : "rgba(255,255,255,0.03)";
-        ctx.fillRect(
-          c * colW + 0.5,
-          r * rowH + 0.5,
-          colW - 1,
-          rowH - 1,
-        );
+      for (let r = 0; r < SAMPLER_PAD_COUNT; r++) {
+        for (let c = 0; c < SAMPLER_STEP_COUNT; c++) {
+          const on = pattern[r]?.[c] ?? false;
+          const beatStart = c % 4 === 0;
+          ctx.fillStyle = on
+            ? activeColor
+            : beatStart
+            ? "rgba(255,255,255,0.10)"
+            : "rgba(255,255,255,0.05)";
+          ctx.fillRect(
+            c * colW + 0.5,
+            r * rowH + 0.5,
+            Math.max(1, colW - 1),
+            Math.max(1, rowH - 1),
+          );
+        }
       }
-    }
 
-    // Subtle beat-boundary vertical lines
-    ctx.fillStyle = "rgba(0,0,0,0.35)";
-    for (let c = 4; c < SAMPLER_STEP_COUNT; c += 4) {
-      ctx.fillRect(c * colW, 0, 1, h);
-    }
+      // Beat-boundary vertical lines
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      for (let c = 4; c < SAMPLER_STEP_COUNT; c += 4) {
+        ctx.fillRect(c * colW, 0, 1, h);
+      }
+    };
+
+    draw();
+
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(draw);
+    observer.observe(canvas);
+    return () => observer.disconnect();
   }, [pattern, isRecording]);
 
   const onTap = () => {
@@ -494,56 +560,49 @@ function PatternPreview({
   const hasAnyStep = pattern.some((row) => row.some(Boolean));
 
   return (
-    <div className="relative group">
-      <canvas
-        ref={canvasRef}
+    <div className="relative">
+      <div className="flex items-center justify-between mb-1 px-0.5">
+        <span className="text-[9px] uppercase tracking-[0.16em] text-[var(--text-faint)]">
+          Sequencer
+        </span>
+        <span className="text-[8px] uppercase tracking-[0.1em] text-[var(--text-faint)]/70">
+          {isRecording
+            ? "● recording — hits land on grid"
+            : armed
+            ? "armed · transport REC will capture"
+            : "double-tap to edit"}
+        </span>
+      </div>
+      <button
         onPointerDown={(e) => {
           e.preventDefault();
           onTap();
         }}
-        className={`w-full rounded-lg cursor-pointer border transition-colors ${
+        onClick={onEdit}
+        aria-label="Open step sequencer editor"
+        className={`block w-full rounded-lg cursor-pointer border transition-colors p-0 overflow-hidden ${
           isRecording
-            ? "border-red-500/50 ring-1 ring-red-500/20"
-            : "border-[var(--border-subtle)] hover:border-[var(--accent)]/40"
-        }`}
-        style={{ height: "48px", display: "block" }}
-        aria-label="Pattern preview — double-tap to edit"
-      />
-
-      {/* Hint — visible on hover (desktop) or always when no steps */}
-      {!hasAnyStep && !isRecording && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <span className="text-[9px] text-[var(--text-faint)] opacity-60 tracking-wide">
-            double-tap to edit · tap REC to record
-          </span>
-        </div>
-      )}
-      <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity">
-        {hasAnyStep && (
-          <span className="text-[8px] uppercase tracking-[0.12em] text-[var(--accent)]/70 bg-black/50 px-1.5 py-0.5 rounded">
-            double-tap to edit
-          </span>
-        )}
-      </div>
-
-      {/* REC toggle */}
-      <button
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={() => togglePatternRecording(trackId)}
-        aria-pressed={isRecording}
-        aria-label={isRecording ? "Stop recording" : "Record pad hits into pattern"}
-        className={`absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1 px-1.5 py-1 rounded text-[8px] font-bold uppercase tracking-[0.08em] transition-colors ${
-          isRecording
-            ? "bg-red-600 text-white animate-pulse"
-            : "bg-black/60 hover:bg-black/80 text-[var(--text-faint)] hover:text-[var(--text-primary)]"
+            ? "border-red-500/60 ring-1 ring-red-500/30 bg-red-950/10"
+            : armed
+            ? "border-red-500/30 hover:border-red-500/50 bg-white/[0.02]"
+            : "border-[var(--border-subtle)] hover:border-[var(--accent)]/50 bg-white/[0.02]"
         }`}
       >
-        <span
-          className={`block w-1.5 h-1.5 rounded-full shrink-0 ${
-            isRecording ? "bg-white" : "bg-red-500"
-          }`}
+        <canvas
+          ref={canvasRef}
+          className="w-full block"
+          style={{ height: "56px" }}
+          aria-hidden="true"
         />
-        REC
+        {!hasAnyStep && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <span className="text-[10px] text-[var(--text-faint)] opacity-70 tracking-wide">
+              {isRecording
+                ? "● Hit a pad to record a step"
+                : "double-tap to edit beats"}
+            </span>
+          </div>
+        )}
       </button>
     </div>
   );
@@ -556,6 +615,7 @@ function PatternEditor({
   pattern,
   pads,
   selectedPad,
+  isRecording,
   onSelectPad,
   onClose,
 }: {
@@ -563,6 +623,7 @@ function PatternEditor({
   pattern: boolean[][];
   pads: SamplerPadState[];
   selectedPad: number | null;
+  isRecording: boolean;
   onSelectPad: (idx: number | null) => void;
   onClose: () => void;
 }) {
@@ -570,7 +631,7 @@ function PatternEditor({
   const clearPattern = useCypher((s) => s.clearPattern);
   const togglePatternRecording = useCypher((s) => s.togglePatternRecording);
   const patternRecording = useCypher((s) => s.patternRecording);
-  const isRecording = patternRecording === trackId;
+  const isManualRec = patternRecording === trackId;
 
   return (
     <div
@@ -591,17 +652,18 @@ function PatternEditor({
         </span>
         <button
           onClick={() => togglePatternRecording(trackId)}
-          aria-pressed={isRecording}
-          aria-label={isRecording ? "Stop recording" : "Record pad hits into pattern"}
+          aria-pressed={isManualRec}
+          aria-label={isManualRec ? "Stop manual recording" : "Manually record pad hits without the transport"}
+          title="Manual record — captures pad hits even without the global transport. Arm the track and use the transport REC for normal recording."
           className={`flex items-center gap-1 px-2 py-1 rounded text-[9px] font-bold uppercase tracking-[0.08em] transition-colors ${
-            isRecording
+            isManualRec
               ? "bg-red-600 text-white animate-pulse"
               : "bg-white/[0.05] hover:bg-white/[0.10] border border-[var(--border-subtle)] text-[var(--text-muted)]"
           }`}
         >
           <span
             className={`block w-1.5 h-1.5 rounded-full shrink-0 ${
-              isRecording ? "bg-white" : "bg-red-500"
+              isManualRec ? "bg-white" : "bg-red-500"
             }`}
           />
           REC

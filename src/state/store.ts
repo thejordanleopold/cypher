@@ -536,16 +536,21 @@ export const useCypher = create<CypherState>((set, get) => ({
     // anything else — iOS Safari treats post-await work as out-of-gesture.
     await getEngine().start();
     getEngine().triggerPad(trackId, padIdx);
-    // If this sampler is in pattern-record mode and the transport is playing,
-    // quantize the hit to the nearest 16th step and latch it into the grid.
+    // Capture the hit into the step grid if EITHER:
+    //   (a) the user manually toggled REC on this sampler, OR
+    //   (b) the sampler is armed and the global transport is recording.
+    // The hit is quantized to the nearest 16th note.
     const s = get();
-    if (s.patternRecording === trackId && s.isPlaying) {
+    const hitTrack = s.tracks.find((t) => t.id === trackId);
+    const isManualRec = s.patternRecording === trackId;
+    const isTransportRec =
+      s.isMultiRecording && hitTrack?.armed === true && hitTrack.kind === "sampler";
+    if ((isManualRec || isTransportRec) && s.isPlaying) {
       const stepDuration = 60 / s.bpm / 4; // 16th note in seconds
       const transportSec = getEngine().seconds();
       const rawStep = Math.round(transportSec / stepDuration);
       const step = ((rawStep % SAMPLER_STEP_COUNT) + SAMPLER_STEP_COUNT) % SAMPLER_STEP_COUNT;
-      const track = s.tracks.find((t) => t.id === trackId);
-      if (track && !track.pattern[padIdx]?.[step]) {
+      if (hitTrack && !hitTrack.pattern[padIdx]?.[step]) {
         getEngine().setPatternStep(trackId, padIdx, step, true);
         set((prev) => ({
           tracks: prev.tracks.map((t) => {
@@ -961,7 +966,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   toggleArm: (id) => {
     set((s) => ({
       tracks: s.tracks.map((t) =>
-        t.id === id && t.kind !== "sampler" ? { ...t, armed: !t.armed } : t,
+        t.id === id ? { ...t, armed: !t.armed } : t,
       ),
     }));
   },
