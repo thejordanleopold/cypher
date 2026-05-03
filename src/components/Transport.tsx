@@ -32,10 +32,10 @@ export function Transport() {
 
   return (
     <div>
-      <div className="flex items-center gap-1.5 px-3 py-2 sm:gap-2 sm:px-4">
+      <div className="flex items-center gap-1 px-2 py-2 sm:gap-2 sm:px-4">
         <button
           onClick={() => (isPlaying ? pause() : play())}
-          className="h-10 w-10 rounded-full bg-gradient-to-b from-[#7cb6ff] to-[#3b82f6] text-[#031024] flex items-center justify-center active:scale-95 shrink-0 shadow-[0_4px_14px_-4px_rgba(59,130,246,0.6)]"
+          className="h-9 w-9 sm:h-10 sm:w-10 rounded-full bg-gradient-to-b from-[#7cb6ff] to-[#3b82f6] text-[#031024] flex items-center justify-center active:scale-95 shrink-0 shadow-[0_4px_14px_-4px_rgba(59,130,246,0.6)]"
           aria-label={isPlaying ? "Pause" : "Play"}
         >
           {isPlaying ? (
@@ -51,7 +51,7 @@ export function Transport() {
         </button>
         <button
           onClick={() => stop()}
-          className="h-10 w-10 rounded-full bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-primary)] flex items-center justify-center active:scale-95 shrink-0 transition-colors"
+          className="h-9 w-9 sm:h-10 sm:w-10 rounded-full bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-primary)] flex items-center justify-center active:scale-95 shrink-0 transition-colors"
           aria-label="Stop"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -81,7 +81,7 @@ export function Transport() {
                 }`
               : "Play (no empty tracks to record on — arm a track with R or add a new one)"
           }
-          className={`h-10 w-10 rounded-full flex items-center justify-center active:scale-95 shrink-0 transition-colors ${
+          className={`h-9 w-9 sm:h-10 sm:w-10 rounded-full flex items-center justify-center active:scale-95 shrink-0 transition-colors ${
             isMultiRecording
               ? "bg-red-600 text-white animate-pulse ring-2 ring-red-400/60 ring-offset-2 ring-offset-[#050a18]"
               : countdownActive
@@ -115,8 +115,8 @@ export function Transport() {
         <div className="flex-1" />
         <div className="hidden sm:block h-7 w-px bg-[var(--border-subtle)]/80 mx-1" aria-hidden="true" />
 
-        <label className="flex items-center gap-1.5 shrink-0">
-          <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-faint)]">
+        <label className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+          <span className="hidden sm:inline text-[10px] uppercase tracking-[0.18em] text-[var(--text-faint)]">
             BPM
           </span>
           <input
@@ -125,7 +125,7 @@ export function Transport() {
             max={240}
             value={bpm}
             onChange={(e) => setBpm(Number(e.target.value) || 120)}
-            className="w-12 h-9 bg-white/[0.05] border border-[var(--border-subtle)] rounded-md px-1 text-sm text-[var(--text-primary)] tabular-nums text-center focus:border-[var(--accent)] outline-none transition-colors"
+            className="w-11 sm:w-12 h-7 sm:h-9 bg-white/[0.05] border border-[var(--border-subtle)] rounded-md px-1 text-sm text-[var(--text-primary)] tabular-nums text-center focus:border-[var(--accent)] outline-none transition-colors"
             aria-label="Tempo in beats per minute"
           />
         </label>
@@ -136,7 +136,7 @@ export function Transport() {
           }}
           aria-label={`Count-in: ${countInBeats === 0 ? "off" : `${countInBeats} beat${countInBeats === 1 ? "" : "s"}`}`}
           title="Pre-record count-in"
-          className={`h-9 px-2 rounded-md text-xs font-bold flex items-center justify-center active:scale-95 shrink-0 tabular-nums transition-colors ${
+          className={`h-7 w-7 sm:h-9 sm:w-auto sm:px-2 rounded-md text-[11px] sm:text-xs font-bold flex items-center justify-center active:scale-95 shrink-0 tabular-nums transition-colors ${
             countInBeats > 0
               ? "bg-amber-500 text-black"
               : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
@@ -148,7 +148,7 @@ export function Transport() {
           onClick={toggleMetronome}
           aria-pressed={metronomeOn}
           aria-label="Metronome"
-          className={`h-9 w-9 rounded-md flex items-center justify-center active:scale-95 shrink-0 transition-colors ${
+          className={`h-7 w-7 sm:h-9 sm:w-9 rounded-md flex items-center justify-center active:scale-95 shrink-0 transition-colors ${
             metronomeOn
               ? "bg-[var(--accent)] text-[#031024]"
               : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
@@ -181,11 +181,11 @@ function HistoryButton({
       disabled={disabled}
       aria-label={label}
       title={label}
-      className="h-9 w-9 rounded-md bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)] flex items-center justify-center active:scale-95 shrink-0 transition-colors disabled:opacity-40 disabled:hover:bg-white/[0.05]"
+      className="h-7 w-7 sm:h-9 sm:w-9 rounded-md bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)] flex items-center justify-center active:scale-95 shrink-0 transition-colors disabled:opacity-40 disabled:hover:bg-white/[0.05]"
     >
       <svg
-        width="14"
-        height="14"
+        width="12"
+        height="12"
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
