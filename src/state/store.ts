@@ -108,7 +108,7 @@ interface CypherState {
   removeTrack: (id: string) => Promise<void>;
   importFile: (id: string, file: File) => Promise<void>;
   loadPadSample: (trackId: string, padIdx: number, file: File) => Promise<void>;
-  clearPadSample: (trackId: string, padIdx: number) => void;
+  clearPadSample: (trackId: string, padIdx: number) => Promise<void>;
   triggerPad: (trackId: string, padIdx: number) => Promise<void>;
   setVolume: (id: string, v: number) => void;
   setPan: (id: string, p: number) => void;
@@ -434,10 +434,16 @@ export const useCypher = create<CypherState>((set, get) => ({
         return { ...t, pads };
       }),
     }));
+    // Flush immediately rather than wait for the 400 ms autosave debounce.
+    // The audio blob is already in IDB; if the user reloads the page (or
+    // backgrounds the app on mobile, where pagehide doesn't reliably wait
+    // for async IDB writes) before the project metadata flushes, the pad's
+    // audioKey reference is lost and the blob looks empty on next load.
     schedulePersist(get());
+    await flushPersist();
   },
 
-  clearPadSample: (trackId, padIdx) => {
+  clearPadSample: async (trackId, padIdx) => {
     const track = get().tracks.find((t) => t.id === trackId);
     if (!track || track.kind !== "sampler") return;
     if (!track.pads[padIdx]?.hasAudio) return;
@@ -452,6 +458,7 @@ export const useCypher = create<CypherState>((set, get) => ({
       }),
     }));
     schedulePersist(get());
+    await flushPersist();
   },
 
   triggerPad: async (trackId, padIdx) => {
