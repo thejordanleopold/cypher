@@ -416,8 +416,27 @@ export const useCypher = create<CypherState>((set, get) => ({
   loadPadSample: async (trackId, padIdx, file) => {
     const track = get().tracks.find((t) => t.id === trackId);
     if (!track || track.kind !== "sampler") return;
+    // Wake the AudioContext before decoding. iOS Safari leaves the context
+    // suspended until a user gesture; `decodeAudioData` works on a suspended
+    // context, but addTrack defers Tone.start() and we want a fully-running
+    // graph the moment the pad is triggered.
+    await getEngine().start();
     pushHistory(get(), `padSample:${trackId}:${padIdx}`);
-    const buf = await getEngine().loadFileToPad(trackId, padIdx, file);
+    let buf: AudioBuffer;
+    try {
+      buf = await getEngine().loadFileToPad(trackId, padIdx, file);
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "Error";
+      const msg = err instanceof Error ? err.message : String(err);
+      throw Object.assign(
+        new Error(
+          name === "EncodingError" || /decode/i.test(msg)
+            ? "Couldn't decode that file. Try a WAV, MP3, or M4A."
+            : msg,
+        ),
+        { name },
+      );
+    }
     const audioKey = makePadAudioKey(get().currentProjectId, trackId, padIdx);
     await saveAudio(audioKey, audioBufferToWavBlob(buf));
     set((s) => ({
