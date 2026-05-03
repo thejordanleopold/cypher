@@ -146,9 +146,25 @@ function Pad({
   const triggerPad = useCypher((s) => s.triggerPad);
   const loadPadSample = useCypher((s) => s.loadPadSample);
   const clearPadSample = useCypher((s) => s.clearPadSample);
+  const pushToast = useCypher((s) => s.pushToast);
   const fileRef = useRef<HTMLInputElement>(null);
   const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
+
+  const handleFile = async (file: File) => {
+    try {
+      await loadPadSample(trackId, padIdx, file);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Could not load that file";
+      pushToast({
+        variant: "error",
+        title: `Pad ${padIdx + 1}: load failed`,
+        message,
+        ttlMs: 8000,
+      });
+    }
+  };
 
   const onTap = () => {
     const now = performance.now();
@@ -238,11 +254,15 @@ function Pad({
         ref={fileRef}
         type="file"
         accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/ogg,audio/*"
-        className="hidden"
+        className="sr-only"
         onChange={async (e) => {
           const f = e.target.files?.[0];
-          if (f) await loadPadSample(trackId, padIdx, f);
+          // Reset BEFORE awaiting so re-picking the same file fires a fresh
+          // change event (browsers suppress duplicate selections), and so a
+          // failure mid-load doesn't strand the input in a state that
+          // refuses subsequent picks.
           e.target.value = "";
+          if (f) await handleFile(f);
         }}
       />
     </div>
