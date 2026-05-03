@@ -23,6 +23,8 @@ export function Transport() {
     cancelCountdown,
     undo,
     redo,
+    screenLockOnRecord,
+    toggleScreenLockOnRecord,
   } = useCypher();
   const canUndo = useCypher((s) => s.undoStack.length > 0);
   const canRedo = useCypher((s) => s.redoStack.length > 0);
@@ -100,6 +102,24 @@ export function Transport() {
               }`}
             />
           )}
+        </button>
+
+        <button
+          onClick={toggleScreenLockOnRecord}
+          aria-pressed={screenLockOnRecord}
+          aria-label={screenLockOnRecord ? "Screen wake lock on while recording" : "Screen wake lock off while recording"}
+          title={screenLockOnRecord ? "Screen stays on while recording (tap to disable)" : "Screen may sleep while recording (tap to keep it on)"}
+          className={`h-9 w-9 sm:h-10 sm:w-10 rounded-full flex items-center justify-center active:scale-95 shrink-0 transition-colors ${
+            screenLockOnRecord
+              ? "bg-amber-500/20 border border-amber-500/60 text-amber-400"
+              : "bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-faint)]"
+          }`}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+            <circle cx="12" cy="12" r="3" />
+            {!screenLockOnRecord && <line x1="2" y1="2" x2="22" y2="22" />}
+          </svg>
         </button>
 
         <div className="hidden sm:block h-7 w-px bg-[var(--border-subtle)]/80 mx-1" aria-hidden="true" />

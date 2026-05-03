@@ -166,6 +166,9 @@ interface CypherState {
   undo: () => Promise<void>;
   redo: () => Promise<void>;
 
+  screenLockOnRecord: boolean;
+  toggleScreenLockOnRecord: () => void;
+
   toasts: Toast[];
   pushToast: (t: Omit<Toast, "id">) => void;
   dismissToast: (id: number) => void;
@@ -205,6 +208,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   countInBeats: 0,
   countdownActive: false,
   countdownBeat: 0,
+  screenLockOnRecord: false,
   latencyOffsetMs: 0,
   isCalibrating: false,
   undoStack: [],
@@ -252,6 +256,8 @@ export const useCypher = create<CypherState>((set, get) => ({
   cancelCountdown: () => {
     countInCancelled = true;
   },
+  toggleScreenLockOnRecord: () =>
+    set((s) => ({ screenLockOnRecord: !s.screenLockOnRecord })),
   setLatencyOffsetMs: (ms) =>
     set({ latencyOffsetMs: Math.max(-200, Math.min(500, Math.round(ms))) }),
 
@@ -694,6 +700,7 @@ export const useCypher = create<CypherState>((set, get) => ({
         t?.inputGain ?? DEFAULT_INPUT_GAIN,
       );
       set({ recordingTrackId: trackId, isMultiRecording: false });
+      if (get().screenLockOnRecord) void acquireWakeLock();
       maybeWarnAboutLowSampleRate(
         getEngine().capturedSampleRate(trackId),
         get().pushToast,
@@ -851,6 +858,7 @@ export const useCypher = create<CypherState>((set, get) => ({
           })),
         );
         set({ isMultiRecording: true, isPlaying: true, recordingTrackId: null });
+        if (get().screenLockOnRecord) void acquireWakeLock();
         const rates = targets
           .map((t) => getEngine().capturedSampleRate(t.id))
           .filter((r): r is number => typeof r === "number");
@@ -882,6 +890,7 @@ export const useCypher = create<CypherState>((set, get) => ({
       get().pushToast(toastFromCaptureError(err));
     }
     set({ isMultiRecording: false, isPlaying: false });
+    releaseWakeLock();
     for (const [trackId, err] of errors) {
       const t = get().tracks.find((x) => x.id === trackId);
       const toast = toastFromCaptureError(err);
@@ -938,6 +947,7 @@ export const useCypher = create<CypherState>((set, get) => ({
     } catch (err) {
       get().pushToast(toastFromCaptureError(err));
     }
+    releaseWakeLock();
     set({ recordingTrackId: null });
     if (id && buf) {
       pushHistory(get(), `recording:${id}`);
@@ -1008,6 +1018,36 @@ function emptyTrack(
     normalizationGain: 1,
     pads: kind === "sampler" ? emptyPads() : [],
   };
+}
+
+// ---- Screen Wake Lock ----
+// Keeps the screen from auto-dimming or locking during long recording sessions.
+// Best-effort: silently skipped on browsers that don't support the API.
+interface WakeLockSentinel extends EventTarget {
+  release(): Promise<void>;
+}
+let _wakeLock: WakeLockSentinel | null = null;
+
+async function acquireWakeLock(): Promise<void> {
+  if (typeof navigator === "undefined") return;
+  const nav = navigator as Navigator & {
+    wakeLock?: { request: (type: "screen") => Promise<WakeLockSentinel> };
+  };
+  if (!nav.wakeLock) return;
+  try {
+    _wakeLock = await nav.wakeLock.request("screen");
+    _wakeLock.addEventListener("release", () => {
+      _wakeLock = null;
+    });
+  } catch {
+    // Permission denied or API unavailable — recording continues without lock.
+  }
+}
+
+function releaseWakeLock(): void {
+  if (!_wakeLock) return;
+  void _wakeLock.release();
+  _wakeLock = null;
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1318,7 +1358,16 @@ function installLifecycleHooks() {
     void flushPersist();
   };
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flush();
+    if (document.visibilityState === "hidden") {
+      flush();
+    } else {
+      // Re-acquire if we come back to the foreground mid-recording (OS releases
+      // wake locks automatically when the page is hidden).
+      const s = useCypher.getState();
+      if (s.screenLockOnRecord && (s.isMultiRecording || s.recordingTrackId !== null)) {
+        void acquireWakeLock();
+      }
+    }
   });
   // pagehide is more reliable than beforeunload on mobile Safari, but cover
   // both for desktop browsers that don't fire pagehide for normal closes.
