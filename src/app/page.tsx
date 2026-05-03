@@ -5,9 +5,11 @@ import { useCypher } from "@/state/store";
 import { Transport } from "@/components/Transport";
 import { Timeline } from "@/components/Timeline";
 import { TrackRow } from "@/components/TrackRow";
+import { SamplerRow } from "@/components/SamplerRow";
 import { MainMenu } from "@/components/MainMenu";
 import { RecordingShield } from "@/components/RecordingShield";
 import { MixerView } from "@/components/MixerView";
+import { AddTrackButton } from "@/components/AddTrackButton";
 
 type ViewMode = "track" | "mixer";
 
@@ -15,7 +17,6 @@ export default function Home() {
   const tracks = useCypher((s) => s.tracks);
   const projectName = useCypher((s) => s.currentProjectName);
   const initProject = useCypher((s) => s.initProject);
-  const addTrack = useCypher((s) => s.addTrack);
 
   const [splashDone, setSplashDone] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("track");
@@ -105,19 +106,14 @@ export default function Home() {
       </div>
       {viewMode === "track" ? (
         <div className="flex-1 overflow-y-auto px-3 pt-2 space-y-1.5 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
-          {tracks.map((t) => (
-            <TrackRow key={t.id} track={t} />
-          ))}
-          <button
-            onClick={() => addTrack()}
-            className="glass block w-full rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
-            aria-label="Add new track"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" aria-hidden="true">
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-            {tracks.length === 0 ? "Add your first track" : "Add track"}
-          </button>
+          {tracks.map((t) =>
+            t.kind === "sampler" ? (
+              <SamplerRow key={t.id} track={t} />
+            ) : (
+              <TrackRow key={t.id} track={t} />
+            ),
+          )}
+          <AddTrackButton variant="wide" />
         </div>
       ) : (
         <MixerView />

@@ -6,6 +6,12 @@ const PROJECT_STORE = "projects";
 const AUDIO_STORE = "audio";
 const META_STORE = "meta";
 
+export interface PersistedSamplerPad {
+  audioKey: string | null;
+  fileName: string | null;
+  durationSec: number;
+}
+
 export interface PersistedTrack {
   id: string;
   name: string;
@@ -24,6 +30,11 @@ export interface PersistedTrack {
   armed?: boolean;
   normalized?: boolean;
   normalizationGain?: number;
+  // "audio" (default for legacy projects) or "sampler" (drum-pad track).
+  kind?: "audio" | "sampler";
+  // Indexed by pad slot (0..N-1). Slots without a sample carry a null audioKey
+  // but are still emitted so pad order is stable across saves.
+  pads?: PersistedSamplerPad[];
 }
 
 export interface PersistedProject {
@@ -136,7 +147,23 @@ export async function duplicateProject(
         await db.put(AUDIO_STORE, blob, newAudioKey);
       }
     }
-    newTracks.push({ ...t, audioKey: newAudioKey });
+    let newPads: PersistedSamplerPad[] | undefined;
+    if (t.pads?.length) {
+      newPads = [];
+      for (let i = 0; i < t.pads.length; i++) {
+        const p = t.pads[i];
+        let padKey: string | null = null;
+        if (p.audioKey) {
+          const blob = (await db.get(AUDIO_STORE, p.audioKey)) as Blob | undefined;
+          if (blob) {
+            padKey = `audio:${newId}:${t.id}:pad${i}:${now}`;
+            await db.put(AUDIO_STORE, blob, padKey);
+          }
+        }
+        newPads.push({ ...p, audioKey: padKey });
+      }
+    }
+    newTracks.push({ ...t, audioKey: newAudioKey, pads: newPads });
   }
 
   const copy: PersistedProject = {
@@ -174,6 +201,14 @@ export function audioKeyPrefix(projectId: string): string {
 
 export function makeAudioKey(projectId: string, trackId: string): string {
   return `${audioKeyPrefix(projectId)}${trackId}:${Date.now()}`;
+}
+
+export function makePadAudioKey(
+  projectId: string,
+  trackId: string,
+  padIdx: number,
+): string {
+  return `${audioKeyPrefix(projectId)}${trackId}:pad${padIdx}:${Date.now()}`;
 }
 
 export async function listAudioKeysForProject(projectId: string): Promise<string[]> {

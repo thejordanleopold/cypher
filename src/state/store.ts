@@ -11,6 +11,7 @@ import {
   deleteAudio,
   listAudioKeysForProject,
   makeAudioKey,
+  makePadAudioKey,
   listProjects,
   deleteProject as dbDeleteProject,
   duplicateProject,
@@ -21,6 +22,7 @@ import {
   getDefaultInputDeviceId,
   setDefaultInputDeviceId,
   type PersistedProject,
+  type PersistedSamplerPad,
   type PersistedTrack,
   type ProjectSummary,
 } from "@/persistence/db";
@@ -41,9 +43,22 @@ let toastSeq = 0;
 
 const DEFAULT_PROJECT_ID = "default";
 
+export type TrackKind = "audio" | "sampler";
+
+export const SAMPLER_PAD_COUNT = 8;
+
+export interface SamplerPadState {
+  hasAudio: boolean;
+  fileName: string | null;
+  durationSec: number;
+  audioKey: string | null;
+  bufferRevision: number;
+}
+
 export interface TrackState {
   id: string;
   name: string;
+  kind: TrackKind;
   hasAudio: boolean;
   fileName: string | null;
   durationSec: number;
@@ -60,6 +75,7 @@ export interface TrackState {
   armed: boolean;
   normalized: boolean;
   normalizationGain: number;
+  pads: SamplerPadState[];
 }
 
 export const DEFAULT_INPUT_GAIN = 1;
@@ -88,9 +104,12 @@ interface CypherState {
   lastSavedAt: number | null;
 
   initProject: () => Promise<void>;
-  addTrack: () => Promise<void>;
+  addTrack: (kind?: TrackKind) => Promise<void>;
   removeTrack: (id: string) => Promise<void>;
   importFile: (id: string, file: File) => Promise<void>;
+  loadPadSample: (trackId: string, padIdx: number, file: File) => Promise<void>;
+  clearPadSample: (trackId: string, padIdx: number) => void;
+  triggerPad: (trackId: string, padIdx: number) => Promise<void>;
   setVolume: (id: string, v: number) => void;
   setPan: (id: string, p: number) => void;
   toggleMute: (id: string) => void;
@@ -383,14 +402,63 @@ export const useCypher = create<CypherState>((set, get) => ({
     await get().refreshProjects();
   },
 
-  addTrack: async () => {
+  addTrack: async (kind: TrackKind = "audio") => {
     const id = nextId();
-    const name = `Track ${get().tracks.length + 1}`;
-    await getEngine().addTrack(id, name);
-    const t = emptyTrack(id, name);
+    const baseName = kind === "sampler" ? "Sampler" : "Track";
+    const name = `${baseName} ${get().tracks.length + 1}`;
+    await getEngine().addTrack(id, name, kind);
+    const t = emptyTrack(id, name, kind);
     t.inputDeviceId = get().defaultInputDeviceId;
     set((s) => ({ tracks: [...s.tracks, t] }));
     schedulePersist(get());
+  },
+
+  loadPadSample: async (trackId, padIdx, file) => {
+    const track = get().tracks.find((t) => t.id === trackId);
+    if (!track || track.kind !== "sampler") return;
+    pushHistory(get(), `padSample:${trackId}:${padIdx}`);
+    const buf = await getEngine().loadFileToPad(trackId, padIdx, file);
+    const audioKey = makePadAudioKey(get().currentProjectId, trackId, padIdx);
+    await saveAudio(audioKey, audioBufferToWavBlob(buf));
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const pads = t.pads.slice();
+        pads[padIdx] = {
+          hasAudio: true,
+          fileName: file.name,
+          durationSec: buf.duration,
+          audioKey,
+          bufferRevision: (pads[padIdx]?.bufferRevision ?? 0) + 1,
+        };
+        return { ...t, pads };
+      }),
+    }));
+    schedulePersist(get());
+  },
+
+  clearPadSample: (trackId, padIdx) => {
+    const track = get().tracks.find((t) => t.id === trackId);
+    if (!track || track.kind !== "sampler") return;
+    if (!track.pads[padIdx]?.hasAudio) return;
+    pushHistory(get(), `padClear:${trackId}:${padIdx}`);
+    getEngine().setPadBuffer(trackId, padIdx, null);
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const pads = t.pads.slice();
+        pads[padIdx] = emptyPad();
+        return { ...t, pads };
+      }),
+    }));
+    schedulePersist(get());
+  },
+
+  triggerPad: async (trackId, padIdx) => {
+    // Wake the AudioContext from inside the user gesture before doing
+    // anything else — iOS Safari treats post-await work as out-of-gesture.
+    await getEngine().start();
+    getEngine().triggerPad(trackId, padIdx);
   },
 
   removeTrack: async (id) => {
@@ -684,7 +752,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   toggleArm: (id) => {
     set((s) => ({
       tracks: s.tracks.map((t) =>
-        t.id === id ? { ...t, armed: !t.armed } : t,
+        t.id === id && t.kind !== "sampler" ? { ...t, armed: !t.armed } : t,
       ),
     }));
   },
@@ -730,11 +798,14 @@ export const useCypher = create<CypherState>((set, get) => ({
       if (!ok) return; // user cancelled
     }
     const all = get().tracks;
-    let targets = all.filter((t) => t.armed);
+    // Sampler tracks aren't recordable — they hold per-pad samples loaded
+    // by the user, not a single timeline buffer.
+    const recordable = all.filter((t) => t.kind !== "sampler");
+    let targets = recordable.filter((t) => t.armed);
     // If the user hasn't armed anything, default to all empty tracks so
     // pressing the master record on a fresh project Just Works without
     // overwriting any imported/recorded audio.
-    if (targets.length === 0) targets = all.filter((t) => !t.hasAudio);
+    if (targets.length === 0) targets = recordable.filter((t) => !t.hasAudio);
     // Reflect auto-arming in the UI so the user can see what's recording.
     if (targets.length > 0) {
       const ids = new Set(targets.map((t) => t.id));
@@ -870,10 +941,29 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 }));
 
-function emptyTrack(id: string, name: string): TrackState {
+function emptyPad(): SamplerPadState {
+  return {
+    hasAudio: false,
+    fileName: null,
+    durationSec: 0,
+    audioKey: null,
+    bufferRevision: 0,
+  };
+}
+
+function emptyPads(): SamplerPadState[] {
+  return Array.from({ length: SAMPLER_PAD_COUNT }, emptyPad);
+}
+
+function emptyTrack(
+  id: string,
+  name: string,
+  kind: TrackKind = "audio",
+): TrackState {
   return {
     id,
     name,
+    kind,
     hasAudio: false,
     fileName: null,
     durationSec: 0,
@@ -890,6 +980,7 @@ function emptyTrack(id: string, name: string): TrackState {
     armed: false,
     normalized: false,
     normalizationGain: 1,
+    pads: kind === "sampler" ? emptyPads() : [],
   };
 }
 
@@ -928,6 +1019,14 @@ function buildPersisted(state: PersistInput): PersistedProject {
       armed: t.armed,
       normalized: t.normalized,
       normalizationGain: t.normalizationGain,
+      kind: t.kind,
+      pads: t.kind === "sampler"
+        ? t.pads.map<PersistedSamplerPad>((p) => ({
+            audioKey: p.audioKey,
+            fileName: p.fileName,
+            durationSec: p.durationSec,
+          }))
+        : undefined,
     })),
     createdAt: 0, // filled in by flush — preserves existing createdAt if present.
     updatedAt: Date.now(),
@@ -976,11 +1075,14 @@ let lastHistoryTime = 0;
 let historyApplyInFlight = false;
 
 function captureHistorySnapshot(state: CypherState): HistorySnapshot {
-  // TrackState is all primitives, so a shallow clone per entry is enough
-  // to detach the snapshot from future mutations.
+  // TrackState is mostly primitives plus the pads array, which we deep-clone
+  // so a snapshot can't be mutated by later pad edits.
   return {
     bpm: state.bpm,
-    tracks: state.tracks.map((t) => ({ ...t })),
+    tracks: state.tracks.map((t) => ({
+      ...t,
+      pads: t.pads.map((p) => ({ ...p })),
+    })),
   };
 }
 
@@ -1040,10 +1142,29 @@ async function applyHistorySnapshot(snap: HistorySnapshot) {
   // doesn't matter.
   await Promise.all(
     snap.tracks.map(async (snapT) => {
-      if (!engine.getTrack(snapT.id)) await engine.addTrack(snapT.id, snapT.name);
+      if (!engine.getTrack(snapT.id)) {
+        await engine.addTrack(snapT.id, snapT.name, snapT.kind);
+      }
       const cur = currById.get(snapT.id);
       if (cur?.audioKey !== snapT.audioKey && snapT.audioKey) {
         await restoreTrackAudio(snapT.id, snapT.audioKey, snapT.fileName);
+      }
+      if (snapT.kind === "sampler") {
+        engine.clearAllPads(snapT.id);
+        await Promise.all(
+          snapT.pads.map(async (p, i) => {
+            if (!p.audioKey) return;
+            const blob = await loadAudio(p.audioKey);
+            if (!blob) return;
+            const arr = await blob.arrayBuffer();
+            try {
+              const buf = await engine.context().decodeAudioData(arr.slice(0));
+              engine.setPadBuffer(snapT.id, i, buf);
+            } catch {
+              // Ignore unreadable pad samples — pad UI will reflect missing audio.
+            }
+          }),
+        );
       }
     }),
   );
@@ -1062,7 +1183,14 @@ async function applyHistorySnapshot(snap: HistorySnapshot) {
   const revBase = Date.now();
   useCypher.setState({
     bpm: snap.bpm,
-    tracks: snap.tracks.map((t, i) => ({ ...t, bufferRevision: revBase + i })),
+    tracks: snap.tracks.map((t, i) => ({
+      ...t,
+      bufferRevision: revBase + i,
+      pads: t.pads.map((p, j) => ({
+        ...p,
+        bufferRevision: revBase + i * 1000 + j,
+      })),
+    })),
   });
   applyMixState(useCypher.getState().tracks);
   schedulePersist(useCypher.getState());
@@ -1078,8 +1206,18 @@ async function gcOrphanedAudio() {
     const s = useCypher.getState();
     if (s.currentProjectId !== projectId) return; // project changed mid-flight
     const referenced = new Set<string>();
-    const collect = (snap: { tracks: { audioKey: string | null }[] }) => {
-      for (const t of snap.tracks) if (t.audioKey) referenced.add(t.audioKey);
+    const collect = (snap: {
+      tracks: {
+        audioKey: string | null;
+        pads?: { audioKey: string | null }[];
+      }[];
+    }) => {
+      for (const t of snap.tracks) {
+        if (t.audioKey) referenced.add(t.audioKey);
+        if (t.pads) {
+          for (const p of t.pads) if (p.audioKey) referenced.add(p.audioKey);
+        }
+      }
     };
     collect({ tracks: s.tracks });
     s.undoStack.forEach(collect);
@@ -1189,7 +1327,8 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
   for (const pt of persisted.tracks) {
     const numericId = Number(pt.id.replace(/^t/, "")) || 0;
     if (numericId > trackCounter) trackCounter = numericId;
-    await engine.addTrack(pt.id, pt.name);
+    const kind: TrackKind = pt.kind === "sampler" ? "sampler" : "audio";
+    await engine.addTrack(pt.id, pt.name, kind);
     engine.setVolume(pt.id, pt.volume);
     engine.setPan(pt.id, pt.pan);
     const hasAudio = pt.audioKey
@@ -1199,9 +1338,35 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
       engine.setTrim(pt.id, pt.trimInSec ?? 0, pt.trimOutSec ?? null);
     }
     const bufferRevision = hasAudio ? 1 : 0;
+    let pads: SamplerPadState[] = [];
+    if (kind === "sampler") {
+      const persistedPads = pt.pads ?? [];
+      pads = emptyPads();
+      for (let i = 0; i < pads.length; i++) {
+        const pp = persistedPads[i];
+        if (!pp?.audioKey) continue;
+        const blob = await loadAudio(pp.audioKey);
+        if (!blob) continue;
+        try {
+          const arr = await blob.arrayBuffer();
+          const buf = await engine.context().decodeAudioData(arr.slice(0));
+          engine.setPadBuffer(pt.id, i, buf);
+          pads[i] = {
+            hasAudio: true,
+            fileName: pp.fileName,
+            durationSec: pp.durationSec,
+            audioKey: pp.audioKey,
+            bufferRevision: 1,
+          };
+        } catch {
+          // Leave as empty; user can reload the sample.
+        }
+      }
+    }
     restored.push({
       id: pt.id,
       name: pt.name,
+      kind,
       hasAudio,
       fileName: pt.fileName,
       durationSec: pt.durationSec,
@@ -1218,6 +1383,7 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
       armed: pt.armed ?? false,
       normalized: pt.normalized ?? false,
       normalizationGain: pt.normalizationGain ?? 1,
+      pads,
     });
     if (hasAudio && pt.normalized && pt.normalizationGain && pt.normalizationGain !== 1) {
       engine.setNormalizationGain(pt.id, pt.normalizationGain);

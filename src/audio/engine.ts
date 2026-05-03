@@ -2,9 +2,12 @@ import * as Tone from "tone";
 
 export type TrackId = string;
 
+export type TrackKind = "audio" | "sampler";
+
 export interface Track {
   id: TrackId;
   name: string;
+  kind: TrackKind;
   buffer: AudioBuffer | null;
   player: Tone.Player | null;
   gain: Tone.Gain;
@@ -19,6 +22,9 @@ export interface Track {
   // target peak. 1 = unmodified. Stored so the user can toggle it off and
   // get the original signal back without re-recording or re-importing.
   normalizationGain: number;
+  // Sampler pads. Indexed by pad slot; a missing entry = empty pad. Only
+  // populated when kind === "sampler".
+  pads: Map<number, AudioBuffer>;
 }
 
 interface RecordingSession {
@@ -363,7 +369,7 @@ class AudioEngine {
     return this.nativeCtx;
   }
 
-  async addTrack(id: TrackId, name: string): Promise<Track> {
+  async addTrack(id: TrackId, name: string, kind: TrackKind = "audio"): Promise<Track> {
     await this.start();
     const gain = new Tone.Gain(1);
     const panner = new Tone.Panner(0);
@@ -372,6 +378,7 @@ class AudioEngine {
     const track: Track = {
       id,
       name,
+      kind,
       buffer: null,
       player: null,
       gain,
@@ -383,9 +390,64 @@ class AudioEngine {
       trimInSec: 0,
       trimOutSec: null,
       normalizationGain: 1,
+      pads: new Map(),
     };
     this.tracks.set(id, track);
     return track;
+  }
+
+  setPadBuffer(id: TrackId, padIdx: number, buffer: AudioBuffer | null) {
+    const t = this.tracks.get(id);
+    if (!t) return;
+    if (buffer) t.pads.set(padIdx, buffer);
+    else t.pads.delete(padIdx);
+  }
+
+  getPadBuffer(id: TrackId, padIdx: number): AudioBuffer | null {
+    const t = this.tracks.get(id);
+    if (!t) return null;
+    return t.pads.get(padIdx) ?? null;
+  }
+
+  // Fire a one-shot of the pad's sample through the track's gain/pan chain.
+  // A fresh BufferSource is allocated per trigger so overlapping taps layer
+  // instead of cancelling the previous play. The browser GCs the source once
+  // it ends.
+  triggerPad(id: TrackId, padIdx: number) {
+    const t = this.tracks.get(id);
+    if (!t || !this.nativeCtx) return;
+    const buf = t.pads.get(padIdx);
+    if (!buf) return;
+    if (this.nativeCtx.state === "suspended") {
+      // Best-effort wake; if we're outside a gesture this no-ops and the
+      // user retries by tapping again.
+      void this.nativeCtx.resume();
+    }
+    const src = this.nativeCtx.createBufferSource();
+    src.buffer = buf;
+    // Connect into the Tone.Gain's underlying input so volume/pan/mute apply.
+    const gainInput = (t.gain as unknown as { input: AudioNode }).input;
+    src.connect(gainInput);
+    src.start();
+  }
+
+  async loadFileToPad(
+    id: TrackId,
+    padIdx: number,
+    file: File,
+  ): Promise<AudioBuffer> {
+    const t = this.tracks.get(id);
+    if (!t) throw new Error(`No track ${id}`);
+    const arrayBuf = await file.arrayBuffer();
+    const audioBuf = await this.context().decodeAudioData(arrayBuf.slice(0));
+    t.pads.set(padIdx, audioBuf);
+    return audioBuf;
+  }
+
+  clearAllPads(id: TrackId) {
+    const t = this.tracks.get(id);
+    if (!t) return;
+    t.pads.clear();
   }
 
   removeTrack(id: TrackId) {
@@ -394,6 +456,7 @@ class AudioEngine {
     t.player?.dispose();
     t.gain.dispose();
     t.panner.dispose();
+    t.pads.clear();
     this.tracks.delete(id);
   }
 
@@ -404,6 +467,7 @@ class AudioEngine {
       t.player?.dispose();
       t.gain.dispose();
       t.panner.dispose();
+      t.pads.clear();
     }
     this.tracks.clear();
   }

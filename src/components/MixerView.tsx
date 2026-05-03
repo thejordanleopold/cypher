@@ -3,6 +3,7 @@
 import { useCallback, useRef } from "react";
 import { useCypher, type TrackState } from "@/state/store";
 import { LevelMeter } from "@/components/LevelMeter";
+import { AddTrackButton } from "@/components/AddTrackButton";
 
 const VOL_MIN = 0;
 const VOL_MAX = 1.5;
@@ -10,7 +11,6 @@ const STRIP_HEIGHT = 360; // px — caps mixer strip card height
 
 export function MixerView() {
   const tracks = useCypher((s) => s.tracks);
-  const addTrack = useCypher((s) => s.addTrack);
 
   return (
     <div className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden">
@@ -18,16 +18,7 @@ export function MixerView() {
         {tracks.map((t) => (
           <ChannelStrip key={t.id} track={t} />
         ))}
-        <button
-          onClick={() => addTrack()}
-          aria-label="Add new track"
-          style={{ height: STRIP_HEIGHT }}
-          className="glass shrink-0 w-12 rounded-xl text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] flex items-center justify-center transition-colors"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-        </button>
+        <AddTrackButton variant="strip" stripHeight={STRIP_HEIGHT} />
       </div>
     </div>
   );
