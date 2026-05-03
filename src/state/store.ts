@@ -10,6 +10,7 @@ import {
   loadAudio,
   deleteAudio,
   listAudioKeysForProject,
+  makeAudioKey,
   listProjects,
   deleteProject as dbDeleteProject,
   duplicateProject,
@@ -138,11 +139,11 @@ interface CypherState {
 
   // Undo / redo. Covers parameter changes (volume, pan, mute, solo, trim,
   // normalize, input gain, BPM), track removal, recording, and file import.
-  // Track add and project rename are NOT in history.
+  // Track add and project rename are NOT in history. Audio blobs are kept
+  // alive while referenced by current state or any snapshot; gcOrphanedAudio
+  // sweeps the rest.
   undoStack: HistorySnapshot[];
   redoStack: HistorySnapshot[];
-  canUndo: boolean;
-  canRedo: boolean;
   undo: () => Promise<void>;
   redo: () => Promise<void>;
 
@@ -151,34 +152,8 @@ interface CypherState {
   dismissToast: (id: number) => void;
 }
 
-// History captures the full track state so we can also undo destructive
-// edits (track removal, recording, file import). Audio blobs in IndexedDB
-// are kept alive as long as their key is referenced by current state OR a
-// snapshot in either stack — a GC sweep deletes blobs once nothing
-// references them anymore.
-interface TrackHistorySnapshot {
-  id: string;
-  name: string;
-  hasAudio: boolean;
-  fileName: string | null;
-  durationSec: number;
-  volume: number;
-  pan: number;
-  muted: boolean;
-  soloed: boolean;
-  bufferRevision: number;
-  audioKey: string | null;
-  trimInSec: number;
-  trimOutSec: number | null;
-  inputDeviceId: string;
-  inputGain: number;
-  armed: boolean;
-  normalized: boolean;
-  normalizationGain: number;
-}
-
 interface HistorySnapshot {
-  tracks: TrackHistorySnapshot[];
+  tracks: TrackState[];
   bpm: number;
 }
 
@@ -215,8 +190,6 @@ export const useCypher = create<CypherState>((set, get) => ({
   isCalibrating: false,
   undoStack: [],
   redoStack: [],
-  canUndo: false,
-  canRedo: false,
 
   undo: async () => {
     if (historyApplyInFlight) return;
@@ -224,19 +197,15 @@ export const useCypher = create<CypherState>((set, get) => ({
     try {
       const s = get();
       if (s.undoStack.length === 0) return;
-      const current = captureHistorySnapshot(s);
       const prev = s.undoStack[s.undoStack.length - 1];
-      const nextUndo = s.undoStack.slice(0, -1);
-      const nextRedo = [...s.redoStack, current];
       set({
-        undoStack: nextUndo,
-        redoStack: nextRedo,
-        canUndo: nextUndo.length > 0,
-        canRedo: true,
+        undoStack: s.undoStack.slice(0, -1),
+        redoStack: [...s.redoStack, captureHistorySnapshot(s)],
       });
       await applyHistorySnapshot(prev);
       resetHistoryCoalesce();
-      void gcOrphanedAudio();
+      // No GC: undo just shuffles snapshots between stacks, so the union
+      // of referenced audio keys is unchanged.
     } finally {
       historyApplyInFlight = false;
     }
@@ -248,19 +217,13 @@ export const useCypher = create<CypherState>((set, get) => ({
     try {
       const s = get();
       if (s.redoStack.length === 0) return;
-      const current = captureHistorySnapshot(s);
       const next = s.redoStack[s.redoStack.length - 1];
-      const nextRedo = s.redoStack.slice(0, -1);
-      const nextUndo = [...s.undoStack, current];
       set({
-        undoStack: nextUndo,
-        redoStack: nextRedo,
-        canUndo: true,
-        canRedo: nextRedo.length > 0,
+        undoStack: [...s.undoStack, captureHistorySnapshot(s)],
+        redoStack: s.redoStack.slice(0, -1),
       });
       await applyHistorySnapshot(next);
       resetHistoryCoalesce();
-      void gcOrphanedAudio();
     } finally {
       historyApplyInFlight = false;
     }
@@ -442,7 +405,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   importFile: async (id, file) => {
     pushHistory(get(), `importFile:${id}`);
     const buf = await getEngine().loadFileToTrack(id, file);
-    const audioKey = `audio:${get().currentProjectId}:${id}:${Date.now()}`;
+    const audioKey = makeAudioKey(get().currentProjectId, id);
     await saveAudio(audioKey, audioBufferToWavBlob(buf));
     set((s) => ({
       tracks: s.tracks.map((t) =>
@@ -839,7 +802,7 @@ export const useCypher = create<CypherState>((set, get) => ({
     }
     for (const [trackId, buf] of results) {
       if (!buf) continue;
-      const audioKey = `audio:${get().currentProjectId}:${trackId}:${Date.now()}`;
+      const audioKey = makeAudioKey(get().currentProjectId, trackId);
       await saveAudio(audioKey, audioBufferToWavBlob(buf));
       updates.set(trackId, { audioKey, duration: buf.duration });
     }
@@ -881,7 +844,7 @@ export const useCypher = create<CypherState>((set, get) => ({
     set({ recordingTrackId: null });
     if (id && buf) {
       pushHistory(get(), `recording:${id}`);
-      const audioKey = `audio:${get().currentProjectId}:${id}:${Date.now()}`;
+      const audioKey = makeAudioKey(get().currentProjectId, id);
       await saveAudio(audioKey, audioBufferToWavBlob(buf));
       const latencySec = get().latencyOffsetMs / 1000;
       const trimIn = Math.max(0, Math.min(buf.duration, latencySec));
@@ -1013,28 +976,11 @@ let lastHistoryTime = 0;
 let historyApplyInFlight = false;
 
 function captureHistorySnapshot(state: CypherState): HistorySnapshot {
+  // TrackState is all primitives, so a shallow clone per entry is enough
+  // to detach the snapshot from future mutations.
   return {
     bpm: state.bpm,
-    tracks: state.tracks.map((t) => ({
-      id: t.id,
-      name: t.name,
-      hasAudio: t.hasAudio,
-      fileName: t.fileName,
-      durationSec: t.durationSec,
-      volume: t.volume,
-      pan: t.pan,
-      muted: t.muted,
-      soloed: t.soloed,
-      bufferRevision: t.bufferRevision,
-      audioKey: t.audioKey,
-      trimInSec: t.trimInSec,
-      trimOutSec: t.trimOutSec,
-      inputDeviceId: t.inputDeviceId,
-      inputGain: t.inputGain,
-      armed: t.armed,
-      normalized: t.normalized,
-      normalizationGain: t.normalizationGain,
-    })),
+    tracks: state.tracks.map((t) => ({ ...t })),
   };
 }
 
@@ -1045,30 +991,36 @@ function pushHistory(state: CypherState, action: string) {
     return;
   }
   const snap = captureHistorySnapshot(state);
-  let evicted = false;
-  let hadRedo = false;
+  let needsGc = false;
   useCypher.setState((s) => {
-    hadRedo = s.redoStack.length > 0;
+    needsGc = s.redoStack.length > 0;
     const stack = [...s.undoStack, snap];
     if (stack.length > MAX_HISTORY) {
       stack.shift();
-      evicted = true;
+      needsGc = true;
     }
-    return {
-      undoStack: stack,
-      redoStack: [],
-      canUndo: true,
-      canRedo: false,
-    };
+    return { undoStack: stack, redoStack: [] };
   });
   lastHistoryAction = action;
   lastHistoryTime = now;
-  if (evicted || hadRedo) void gcOrphanedAudio();
+  if (needsGc) void gcOrphanedAudio();
 }
 
 function resetHistoryCoalesce() {
   lastHistoryAction = "";
   lastHistoryTime = 0;
+}
+
+async function restoreTrackAudio(trackId: string, audioKey: string, fileName: string | null) {
+  const blob = await loadAudio(audioKey);
+  if (!blob) return false;
+  const file = new File([blob], fileName ?? "audio.wav", { type: blob.type });
+  try {
+    await getEngine().loadFileToTrack(trackId, file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function applyHistorySnapshot(snap: HistorySnapshot) {
@@ -1079,95 +1031,61 @@ async function applyHistorySnapshot(snap: HistorySnapshot) {
   const snapById = new Map(snap.tracks.map((t) => [t.id, t]));
   const currById = new Map(currentTracks.map((t) => [t.id, t]));
 
-  // Drop engine tracks that aren't in the snapshot.
   for (const cur of currentTracks) {
-    if (!snapById.has(cur.id)) {
-      engine.removeTrack(cur.id);
-    }
+    if (!snapById.has(cur.id)) engine.removeTrack(cur.id);
   }
 
-  // Add or update each track in the snapshot.
-  for (const snapT of snap.tracks) {
-    if (!engine.getTrack(snapT.id)) {
-      await engine.addTrack(snapT.id, snapT.name);
-    }
-    const cur = currById.get(snapT.id);
-    const audioChanged = cur?.audioKey !== snapT.audioKey;
-    if (audioChanged && snapT.audioKey) {
-      const blob = await loadAudio(snapT.audioKey);
-      if (blob) {
-        const file = new File([blob], snapT.fileName ?? "audio.wav", {
-          type: blob.type,
-        });
-        try {
-          await engine.loadFileToTrack(snapT.id, file);
-        } catch {
-          // ignore decode failure — track will read as having no audio
-        }
+  // Add and reload audio for all tracks in parallel — each track is keyed
+  // by id and the final setState rebuilds the whole list, so order
+  // doesn't matter.
+  await Promise.all(
+    snap.tracks.map(async (snapT) => {
+      if (!engine.getTrack(snapT.id)) await engine.addTrack(snapT.id, snapT.name);
+      const cur = currById.get(snapT.id);
+      if (cur?.audioKey !== snapT.audioKey && snapT.audioKey) {
+        await restoreTrackAudio(snapT.id, snapT.audioKey, snapT.fileName);
       }
-    }
+    }),
+  );
+
+  for (const snapT of snap.tracks) {
     engine.setVolume(snapT.id, snapT.volume);
     engine.setPan(snapT.id, snapT.pan);
-    if (snapT.audioKey) {
-      engine.setTrim(snapT.id, snapT.trimInSec, snapT.trimOutSec);
-    }
+    if (snapT.audioKey) engine.setTrim(snapT.id, snapT.trimInSec, snapT.trimOutSec);
     engine.setNormalizationGain(
       snapT.id,
       snapT.normalized ? snapT.normalizationGain : 1,
     );
   }
 
-  // Bump bufferRevision so dependent components (waveform) re-read the
-  // engine's buffer.
-  let revBump = Date.now();
+  // Bump bufferRevision so the waveform re-reads from the engine.
+  const revBase = Date.now();
   useCypher.setState({
     bpm: snap.bpm,
-    tracks: snap.tracks.map((snapT) => ({
-      id: snapT.id,
-      name: snapT.name,
-      hasAudio: snapT.hasAudio,
-      fileName: snapT.fileName,
-      durationSec: snapT.durationSec,
-      volume: snapT.volume,
-      pan: snapT.pan,
-      muted: snapT.muted,
-      soloed: snapT.soloed,
-      bufferRevision: revBump++,
-      audioKey: snapT.audioKey,
-      trimInSec: snapT.trimInSec,
-      trimOutSec: snapT.trimOutSec,
-      inputDeviceId: snapT.inputDeviceId,
-      inputGain: snapT.inputGain,
-      armed: snapT.armed,
-      normalized: snapT.normalized,
-      normalizationGain: snapT.normalizationGain,
-    })),
+    tracks: snap.tracks.map((t, i) => ({ ...t, bufferRevision: revBase + i })),
   });
   applyMixState(useCypher.getState().tracks);
   schedulePersist(useCypher.getState());
 }
 
-// Delete IndexedDB audio blobs for the current project that aren't
-// referenced by current track state OR any history snapshot. Called after
-// undo/redo, after history eviction, and after project load.
 async function gcOrphanedAudio() {
-  const s = useCypher.getState();
-  const referenced = new Set<string>();
-  for (const t of s.tracks) {
-    if (t.audioKey) referenced.add(t.audioKey);
-  }
-  for (const stack of [s.undoStack, s.redoStack]) {
-    for (const snap of stack) {
-      for (const t of snap.tracks) {
-        if (t.audioKey) referenced.add(t.audioKey);
-      }
-    }
-  }
+  const projectId = useCypher.getState().currentProjectId;
   try {
-    const all = await listAudioKeysForProject(s.currentProjectId);
-    for (const key of all) {
-      if (!referenced.has(key)) await deleteAudio(key);
-    }
+    const all = await listAudioKeysForProject(projectId);
+    // Re-read state AFTER the IDB query so any audio key persisted by an
+    // in-flight recording/import (and added to store state during the
+    // await) shows up as referenced and isn't deleted as an orphan.
+    const s = useCypher.getState();
+    if (s.currentProjectId !== projectId) return; // project changed mid-flight
+    const referenced = new Set<string>();
+    const collect = (snap: { tracks: { audioKey: string | null }[] }) => {
+      for (const t of snap.tracks) if (t.audioKey) referenced.add(t.audioKey);
+    };
+    collect({ tracks: s.tracks });
+    s.undoStack.forEach(collect);
+    s.redoStack.forEach(collect);
+    const orphans = all.filter((k) => !referenced.has(k));
+    await Promise.all(orphans.map(deleteAudio));
   } catch {
     // best-effort cleanup
   }
@@ -1274,26 +1192,13 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
     await engine.addTrack(pt.id, pt.name);
     engine.setVolume(pt.id, pt.volume);
     engine.setPan(pt.id, pt.pan);
-    let hasAudio = false;
-    let bufferRevision = 0;
-    if (pt.audioKey) {
-      const blob = await loadAudio(pt.audioKey);
-      if (blob) {
-        const file = new File([blob], pt.fileName ?? "audio.wav", {
-          type: blob.type,
-        });
-        try {
-          await engine.loadFileToTrack(pt.id, file);
-          hasAudio = true;
-          bufferRevision = 1;
-        } catch {
-          // Decoding failed; keep track but mark no audio.
-        }
-      }
-    }
+    const hasAudio = pt.audioKey
+      ? await restoreTrackAudio(pt.id, pt.audioKey, pt.fileName)
+      : false;
     if (hasAudio) {
       engine.setTrim(pt.id, pt.trimInSec ?? 0, pt.trimOutSec ?? null);
     }
+    const bufferRevision = hasAudio ? 1 : 0;
     restored.push({
       id: pt.id,
       name: pt.name,
@@ -1332,8 +1237,6 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
     isLoaded: true,
     undoStack: [],
     redoStack: [],
-    canUndo: false,
-    canRedo: false,
   });
   resetHistoryCoalesce();
   applyMixState(restored);
@@ -1373,8 +1276,6 @@ async function switchToProject(
     isLoaded: true,
     undoStack: [],
     redoStack: [],
-    canUndo: false,
-    canRedo: false,
   });
   resetHistoryCoalesce();
   schedulePersist({
