@@ -453,17 +453,22 @@ export const useCypher = create<CypherState>((set, get) => ({
   loadPadSample: async (trackId, padIdx, file) => {
     const track = get().tracks.find((t) => t.id === trackId);
     if (!track || track.kind !== "sampler") return;
-    // Read raw bytes FIRST, before any other async operations.
-    // iOS Safari revokes File handles after async context switches (e.g.
-    // Tone.start()), causing file.arrayBuffer() to throw the misleading
-    // "Error preparing Blob/File data to be stored in object store" error.
-    const rawBytes = await readFileAsArrayBuffer(file);
-    // Wake the AudioContext before decoding. iOS Safari leaves the context
-    // suspended until a user gesture; `decodeAudioData` works on a suspended
-    // context, but addTrack defers Tone.start() and we want a fully-running
-    // graph the moment the pad is triggered.
-    await getEngine().start();
+
+    let rawBytes: ArrayBuffer;
+    try {
+      rawBytes = await readFileAsArrayBuffer(file);
+    } catch (err) {
+      throw new Error(`[read] ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    try {
+      await getEngine().start();
+    } catch (err) {
+      throw new Error(`[start] ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     pushHistory(get(), `padSample:${trackId}:${padIdx}`);
+
     let buf: AudioBuffer;
     try {
       buf = await getEngine().loadFileToPad(trackId, padIdx, rawBytes);
@@ -474,13 +479,18 @@ export const useCypher = create<CypherState>((set, get) => ({
         new Error(
           name === "EncodingError" || /decode/i.test(msg)
             ? "Couldn't decode that file. Try a WAV, MP3, or M4A."
-            : msg,
+            : `[decode] ${msg}`,
         ),
         { name },
       );
     }
+
     const audioKey = makePadAudioKey(get().currentProjectId, trackId, padIdx);
-    await saveAudio(audioKey, audioBufferToWavBlob(buf));
+    try {
+      await saveAudio(audioKey, audioBufferToWavBlob(buf));
+    } catch (err) {
+      throw new Error(`[save] ${err instanceof Error ? err.message : String(err)}`);
+    }
     set((s) => ({
       tracks: s.tracks.map((t) => {
         if (t.id !== trackId) return t;
