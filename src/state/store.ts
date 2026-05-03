@@ -114,6 +114,10 @@ interface CypherState {
   loadPadSample: (trackId: string, padIdx: number, file: File) => Promise<void>;
   clearPadSample: (trackId: string, padIdx: number) => Promise<void>;
   triggerPad: (trackId: string, padIdx: number) => Promise<void>;
+  /** Which pad slot is currently being recorded into via the mic (null = idle). */
+  recordingPad: { trackId: string; padIdx: number } | null;
+  startPadRecording: (trackId: string, padIdx: number) => Promise<void>;
+  stopPadRecording: () => Promise<void>;
   togglePatternRecording: (trackId: string) => void;
   togglePatternStep: (trackId: string, padIdx: number, step: number) => void;
   clearPattern: (trackId: string) => void;
@@ -201,6 +205,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   metronomeOn: false,
   recordingTrackId: null,
   patternRecording: null,
+  recordingPad: null,
   exportProgress: null,
   inputDevices: [],
   defaultInputDeviceId: "default",
@@ -531,6 +536,50 @@ export const useCypher = create<CypherState>((set, get) => ({
     set((s) => ({
       patternRecording: s.patternRecording === trackId ? null : trackId,
     }));
+  },
+
+  startPadRecording: async (trackId, padIdx) => {
+    void getEngine().start();
+    const t = get().tracks.find((x) => x.id === trackId);
+    const deviceId = t?.inputDeviceId;
+    try {
+      await getEngine().startPadRecording(trackId, padIdx, deviceId);
+      set({ recordingPad: { trackId, padIdx } });
+    } catch (err) {
+      get().pushToast(toastFromMicError(err));
+    }
+  },
+
+  stopPadRecording: async () => {
+    const pr = get().recordingPad;
+    if (!pr) return;
+    let buf: AudioBuffer | null = null;
+    try {
+      buf = await getEngine().stopPadRecording();
+    } catch (err) {
+      get().pushToast(toastFromCaptureError(err));
+    }
+    set({ recordingPad: null });
+    if (!buf || !pr) return;
+    const audioKey = makePadAudioKey(get().currentProjectId, pr.trackId, pr.padIdx);
+    await saveAudio(audioKey, audioBufferToWavBlob(buf));
+    const finalBuf = buf;
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== pr.trackId) return t;
+        const pads = t.pads.slice();
+        pads[pr.padIdx] = {
+          hasAudio: true,
+          fileName: "Recording",
+          durationSec: finalBuf.duration,
+          audioKey,
+          bufferRevision: (pads[pr.padIdx]?.bufferRevision ?? 0) + 1,
+        };
+        return { ...t, pads };
+      }),
+    }));
+    schedulePersist(get());
+    await flushPersist();
   },
 
   togglePatternStep: (trackId, padIdx, step) => {

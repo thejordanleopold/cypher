@@ -150,11 +150,15 @@ function Pad({
   const clearPadSample = useCypher((s) => s.clearPadSample);
   const pushToast = useCypher((s) => s.pushToast);
   const patternRecording = useCypher((s) => s.patternRecording);
+  const startPadRecording = useCypher((s) => s.startPadRecording);
+  const stopPadRecording = useCypher((s) => s.stopPadRecording);
+  const recordingPad = useCypher((s) => s.recordingPad);
   const fileRef = useRef<HTMLInputElement>(null);
   const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
 
   const isCapturing = patternRecording === trackId;
+  const isMicRecording = recordingPad?.trackId === trackId && recordingPad?.padIdx === padIdx;
 
   const handleFile = async (file: File) => {
     try {
@@ -252,6 +256,36 @@ function Pad({
           ×
         </button>
       )}
+      {/* Mic record button — bottom-left */}
+      <button
+        onPointerDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (isMicRecording) {
+            void stopPadRecording();
+          } else {
+            void startPadRecording(trackId, padIdx);
+          }
+        }}
+        aria-label={isMicRecording ? `Stop recording into pad ${padIdx + 1}` : `Record mic into pad ${padIdx + 1}`}
+        aria-pressed={isMicRecording}
+        className={`absolute bottom-0.5 left-0.5 w-4 h-4 rounded flex items-center justify-center ${
+          isMicRecording
+            ? "bg-red-500 animate-pulse text-white"
+            : "text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-black/40"
+        }`}
+      >
+        {isMicRecording ? (
+          <svg width="8" height="8" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="8" fill="currentColor" />
+          </svg>
+        ) : (
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <rect x="9" y="2" width="6" height="12" rx="3" />
+            <path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8" />
+          </svg>
+        )}
+      </button>
       <input
         ref={fileRef}
         type="file"
