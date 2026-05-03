@@ -149,17 +149,12 @@ function Pad({
   const loadPadSample = useCypher((s) => s.loadPadSample);
   const clearPadSample = useCypher((s) => s.clearPadSample);
   const pushToast = useCypher((s) => s.pushToast);
-  const startPadRecording = useCypher((s) => s.startPadRecording);
-  const stopPadRecording = useCypher((s) => s.stopPadRecording);
-  const recordingPad = useCypher((s) => s.recordingPad);
   const patternRecording = useCypher((s) => s.patternRecording);
   const fileRef = useRef<HTMLInputElement>(null);
   const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
 
   const isCapturing = patternRecording === trackId;
-  const isMicRecording =
-    recordingPad?.trackId === trackId && recordingPad?.padIdx === padIdx;
 
   const handleFile = async (file: File) => {
     try {
