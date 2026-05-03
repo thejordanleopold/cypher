@@ -147,17 +147,28 @@ function Pad({
   const loadPadSample = useCypher((s) => s.loadPadSample);
   const clearPadSample = useCypher((s) => s.clearPadSample);
   const fileRef = useRef<HTMLInputElement>(null);
+  const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
 
-  const onTrigger = () => {
+  const onTap = () => {
+    const now = performance.now();
+    const isDoubleTap = now - lastTapRef.current < 300;
+    lastTapRef.current = now;
+    if (isDoubleTap) {
+      // Second tap within the double-tap window opens the file picker so the
+      // user can load (or replace) the pad's sample. The first tap already
+      // triggered the existing sample if there was one — that's fine; the
+      // brief overlap is the cost of keeping single-tap latency near zero.
+      lastTapRef.current = 0;
+      fileRef.current?.click();
+      return;
+    }
     if (!pad.hasAudio) {
       fileRef.current?.click();
       return;
     }
     setActive(true);
     void triggerPad(trackId, padIdx);
-    // Brief flash so the user sees the hit register even when the sample is
-    // very short or muted.
     window.setTimeout(() => setActive(false), 120);
   };
 
@@ -166,11 +177,11 @@ function Pad({
       <button
         onPointerDown={(e) => {
           e.preventDefault();
-          onTrigger();
+          onTap();
         }}
         aria-label={
           pad.hasAudio
-            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"}`
+            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"} (double-tap to replace)`
             : `Pad ${padIdx + 1} — tap to load a sample`
         }
         className={`w-full aspect-square rounded-lg border text-[10px] font-medium flex flex-col items-center justify-center gap-0.5 transition-colors select-none touch-none ${
