@@ -1097,6 +1097,8 @@ class AudioEngine {
 
   // Fire-and-forget polyphonic pad playback. Creates a native AudioBufferSourceNode
   // so multiple pads can play simultaneously without stopping the Tone.Player.
+  // A short fade in/out on the gain envelope hides the discontinuities at slice
+  // boundaries that would otherwise read as audible clicks.
   playPad(
     trackId: TrackId,
     startSec: number,
@@ -1111,14 +1113,23 @@ class AudioEngine {
     const src = ctx.createBufferSource();
     src.buffer = t.buffer;
     const gainNode = ctx.createGain();
-    gainNode.gain.value = t.muted ? 0 : volume * normGain;
+    const target = t.muted ? 0 : volume * normGain;
     const panNode = ctx.createStereoPanner();
     panNode.pan.value = pan;
     src.connect(gainNode);
     gainNode.connect(panNode);
     panNode.connect(this.master.input as AudioNode);
+
     const dur = Math.max(0.01, endSec - startSec);
-    src.start(ctx.currentTime, startSec, dur);
+    const startTime = ctx.currentTime;
+    const fadeIn = Math.min(0.003, dur / 4);
+    const fadeOut = Math.min(0.012, dur / 4);
+    gainNode.gain.setValueAtTime(0, startTime);
+    gainNode.gain.linearRampToValueAtTime(target, startTime + fadeIn);
+    gainNode.gain.setValueAtTime(target, startTime + dur - fadeOut);
+    gainNode.gain.linearRampToValueAtTime(0, startTime + dur);
+
+    src.start(startTime, startSec, dur);
     src.onended = () => {
       try {
         src.disconnect();

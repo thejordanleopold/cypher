@@ -29,7 +29,15 @@ export function TrackRow({ track }: { track: TrackState }) {
   const swipeRef = useRef<{ x: number; y: number; id: number } | null>(null);
 
   function onSwipeStart(e: React.PointerEvent) {
-    if ((e.target as HTMLElement).closest('button, input, [role="slider"], [data-trim-handle]')) return;
+    const el = e.target as HTMLElement;
+    if (el.closest('input, [role="slider"], [data-trim-handle]')) return;
+    // In audio mode, ignore button-originated swipes so taps on header
+    // controls don't sometimes register as a mode switch. In sampler mode,
+    // pads ARE buttons — allow swipes from them so users can swipe back to
+    // audio mode without hunting for the gap between pads (the pad still
+    // triggers on pointerdown; the mode switch only fires past 64px of
+    // horizontal motion, well beyond a tap).
+    if (track.mode === 'audio' && el.closest('button')) return;
     swipeRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
   }
 
