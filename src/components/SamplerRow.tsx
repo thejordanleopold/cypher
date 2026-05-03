@@ -147,17 +147,28 @@ function Pad({
   const loadPadSample = useCypher((s) => s.loadPadSample);
   const clearPadSample = useCypher((s) => s.clearPadSample);
   const fileRef = useRef<HTMLInputElement>(null);
+  const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
 
-  const onTrigger = () => {
+  const onTap = () => {
+    const now = performance.now();
+    const isDoubleTap = now - lastTapRef.current < 300;
+    lastTapRef.current = now;
+    if (isDoubleTap) {
+      // Second tap within the double-tap window opens the file picker so the
+      // user can load (or replace) the pad's sample. The first tap already
+      // triggered the existing sample if there was one — that's fine; the
+      // brief overlap is the cost of keeping single-tap latency near zero.
+      lastTapRef.current = 0;
+      fileRef.current?.click();
+      return;
+    }
     if (!pad.hasAudio) {
       fileRef.current?.click();
       return;
     }
     setActive(true);
     void triggerPad(trackId, padIdx);
-    // Brief flash so the user sees the hit register even when the sample is
-    // very short or muted.
     window.setTimeout(() => setActive(false), 120);
   };
 
@@ -166,11 +177,11 @@ function Pad({
       <button
         onPointerDown={(e) => {
           e.preventDefault();
-          onTrigger();
+          onTap();
         }}
         aria-label={
           pad.hasAudio
-            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"}`
+            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"} (double-tap to replace)`
             : `Pad ${padIdx + 1} — tap to load a sample`
         }
         className={`w-full aspect-square rounded-lg border text-[10px] font-medium flex flex-col items-center justify-center gap-0.5 transition-colors select-none touch-none ${
@@ -188,9 +199,35 @@ function Pad({
           {pad.hasAudio ? padLabel(pad.fileName) : "+"}
         </span>
       </button>
+      <button
+        onPointerDown={(e) => {
+          // Stop the underlying pad's pointerdown from firing — without this
+          // both buttons get a hit and the pad would trigger right before
+          // the file picker opened.
+          e.stopPropagation();
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          fileRef.current?.click();
+        }}
+        aria-label={
+          pad.hasAudio
+            ? `Replace sample on pad ${padIdx + 1}`
+            : `Load sample to pad ${padIdx + 1}`
+        }
+        className="absolute top-0.5 left-0.5 w-4 h-4 rounded text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-black/40 flex items-center justify-center"
+      >
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M12 16V4M6 10l6-6 6 6M4 20h16" />
+        </svg>
+      </button>
       {pad.hasAudio && (
         <button
-          onClick={() => clearPadSample(trackId, padIdx)}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            clearPadSample(trackId, padIdx);
+          }}
           aria-label={`Clear pad ${padIdx + 1}`}
           className="absolute top-0.5 right-0.5 w-4 h-4 rounded text-[var(--text-faint)] hover:text-red-400 hover:bg-black/40 flex items-center justify-center text-[10px] leading-none"
         >
