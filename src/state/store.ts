@@ -31,6 +31,20 @@ function makeId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// iOS Safari's Blob.arrayBuffer() can fail with "Error preparing Blob/File
+// data to be stored in object store" due to internal IDB-backed storage.
+// FileReader.readAsArrayBuffer() is the older, more compatible path.
+function readFileAsArrayBuffer(file: File | Blob): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(reader.result as ArrayBuffer));
+    reader.addEventListener("error", () =>
+      reject(reader.error ?? new Error("Could not read file")),
+    );
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 export interface Toast {
   id: number;
   variant: "info" | "warn" | "error";
@@ -443,7 +457,7 @@ export const useCypher = create<CypherState>((set, get) => ({
     // iOS Safari revokes File handles after async context switches (e.g.
     // Tone.start()), causing file.arrayBuffer() to throw the misleading
     // "Error preparing Blob/File data to be stored in object store" error.
-    const rawBytes = await file.arrayBuffer();
+    const rawBytes = await readFileAsArrayBuffer(file);
     // Wake the AudioContext before decoding. iOS Safari leaves the context
     // suspended until a user gesture; `decodeAudioData` works on a suspended
     // context, but addTrack defers Tone.start() and we want a fully-running
@@ -654,7 +668,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   importFile: async (id, file) => {
     // Read bytes immediately before any async context switches so iOS Safari
     // cannot revoke the File handle.
-    const rawBytes = await file.arrayBuffer();
+    const rawBytes = await readFileAsArrayBuffer(file);
     const fileName = file.name;
     pushHistory(get(), `importFile:${id}`);
     const buf = await getEngine().loadFileToTrack(id, rawBytes);

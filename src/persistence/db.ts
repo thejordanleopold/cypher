@@ -182,12 +182,23 @@ export async function duplicateProject(
 
 // ---- Audio ----
 
+// Blob.arrayBuffer() can fail on iOS Safari with "Error preparing Blob/File
+// data to be stored in object store". FileReader is the older, safer path.
+function blobToArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(reader.result as ArrayBuffer));
+    reader.addEventListener("error", () =>
+      reject(reader.error ?? new Error("Could not read blob")),
+    );
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
 export async function saveAudio(key: string, blob: Blob) {
   const db = await getDb();
-  // iOS Safari throws "Error preparing Blob/File data to be stored in object
-  // store" when given a Blob directly. Storing ArrayBuffer works on all
-  // browsers; we re-wrap it as a Blob on load.
-  const arr = await blob.arrayBuffer();
+  // Store as ArrayBuffer — iOS Safari cannot serialize Blob in IndexedDB.
+  const arr = await blobToArrayBuffer(blob);
   await db.put(AUDIO_STORE, arr, key);
 }
 
