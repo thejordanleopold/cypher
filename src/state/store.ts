@@ -125,7 +125,7 @@ interface CypherState {
   addTrack: (kind?: TrackKind) => Promise<void>;
   removeTrack: (id: string) => Promise<void>;
   importFile: (id: string, file: File) => Promise<void>;
-  loadPadSample: (trackId: string, padIdx: number, file: File) => Promise<void>;
+  loadPadSample: (trackId: string, padIdx: number, bytes: ArrayBuffer, fileName: string) => Promise<void>;
   clearPadSample: (trackId: string, padIdx: number) => Promise<void>;
   triggerPad: (trackId: string, padIdx: number) => Promise<void>;
   /** Which pad slot is currently being recorded into via the mic (null = idle). */
@@ -450,16 +450,13 @@ export const useCypher = create<CypherState>((set, get) => ({
     schedulePersist(get());
   },
 
-  loadPadSample: async (trackId, padIdx, file) => {
+  loadPadSample: async (trackId, padIdx, bytes, fileName) => {
     const track = get().tracks.find((t) => t.id === trackId);
     if (!track || track.kind !== "sampler") return;
 
-    let rawBytes: ArrayBuffer;
-    try {
-      rawBytes = await readFileAsArrayBuffer(file);
-    } catch (err) {
-      throw new Error(`[read] ${err instanceof Error ? err.message : String(err)}`);
-    }
+    // bytes are already read — passed as ArrayBuffer from SamplerRow's onChange
+    // via URL.createObjectURL + fetch, which bypasses the bfcache-sensitive
+    // FileReader / Blob.arrayBuffer() paths that fail in Safari browser mode.
 
     try {
       await getEngine().start();
@@ -471,7 +468,7 @@ export const useCypher = create<CypherState>((set, get) => ({
 
     let buf: AudioBuffer;
     try {
-      buf = await getEngine().loadFileToPad(trackId, padIdx, rawBytes);
+      buf = await getEngine().loadFileToPad(trackId, padIdx, bytes);
     } catch (err) {
       const name = err instanceof Error ? err.name : "Error";
       const msg = err instanceof Error ? err.message : String(err);
@@ -487,7 +484,9 @@ export const useCypher = create<CypherState>((set, get) => ({
 
     const audioKey = makePadAudioKey(get().currentProjectId, trackId, padIdx);
     try {
-      await saveAudio(audioKey, audioBufferToWavBlob(buf));
+      // Store original bytes directly — avoids a lossy WAV re-encode and is
+      // the only safe path since we already have the ArrayBuffer in hand.
+      await saveAudio(audioKey, bytes);
     } catch (err) {
       throw new Error(`[save] ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -497,7 +496,7 @@ export const useCypher = create<CypherState>((set, get) => ({
         const pads = t.pads.slice();
         pads[padIdx] = {
           hasAudio: true,
-          fileName: file.name,
+          fileName,
           durationSec: buf.duration,
           audioKey,
           bufferRevision: (pads[padIdx]?.bufferRevision ?? 0) + 1,

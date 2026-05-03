@@ -195,10 +195,10 @@ function blobToArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
   });
 }
 
-export async function saveAudio(key: string, blob: Blob) {
+export async function saveAudio(key: string, data: Blob | ArrayBuffer) {
   const db = await getDb();
   // Store as ArrayBuffer — iOS Safari cannot serialize Blob in IndexedDB.
-  const arr = await blobToArrayBuffer(blob);
+  const arr = data instanceof ArrayBuffer ? data : await blobToArrayBuffer(data);
   await db.put(AUDIO_STORE, arr, key);
 }
 

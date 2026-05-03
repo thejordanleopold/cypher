@@ -197,9 +197,9 @@ function Pad({
 
   const isCapturing = patternRecording === trackId;
 
-  const handleFile = async (file: File) => {
+  const handleFile = async (bytes: ArrayBuffer, fileName: string) => {
     try {
-      await loadPadSample(trackId, padIdx, file);
+      await loadPadSample(trackId, padIdx, bytes, fileName);
     } catch (err) {
       pushToast({
         variant: "error",
@@ -319,11 +319,29 @@ function Pad({
         type="file"
         accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/ogg,audio/*"
         className="sr-only"
-        onChange={async (e) => {
+        onChange={(e) => {
           const f = e.target.files?.[0];
-          const input = e.target;
-          if (f) await handleFile(f);
-          input.value = "";
+          e.target.value = "";
+          if (!f) return;
+          // URL.createObjectURL is synchronous and creates a durable blob: URL
+          // that survives Safari's bfcache restoration (which invalidates File
+          // handles when the picker backgrounds the tab in browser mode).
+          // fetch() then reads the bytes through a path that doesn't hit the
+          // IDB-backed storage that fails after bfcache.
+          const url = URL.createObjectURL(f);
+          const name = f.name;
+          void fetch(url)
+            .then((r) => r.arrayBuffer())
+            .then((bytes) => handleFile(bytes, name))
+            .catch((err) => {
+              pushToast({
+                variant: "error",
+                title: `Pad ${padIdx + 1}: load failed`,
+                message: err instanceof Error ? err.message : "Could not read file",
+                ttlMs: 8000,
+              });
+            })
+            .finally(() => URL.revokeObjectURL(url));
         }}
       />
     </div>
