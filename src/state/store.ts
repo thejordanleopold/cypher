@@ -90,8 +90,7 @@ interface CypherState {
   positionSec: number;
   metronomeOn: boolean;
   recordingTrackId: string | null;
-  // trackId of the sampler currently in live pattern-record mode (pad taps → grid),
-  // or null when not recording.
+  /** trackId of the sampler in live pattern-record mode (pad taps → grid). */
   patternRecording: string | null;
 
   // Library
@@ -201,7 +200,6 @@ export const useCypher = create<CypherState>((set, get) => ({
   positionSec: 0,
   metronomeOn: false,
   recordingTrackId: null,
-  recordingPad: null,
   patternRecording: null,
   exportProgress: null,
   inputDevices: [],
