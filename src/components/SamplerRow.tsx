@@ -18,6 +18,12 @@ export function SamplerRow({ track }: { track: TrackState }) {
   const removeTrack = useCypher((s) => s.removeTrack);
   const [collapsed, setCollapsed] = useState(false);
   const [selectedPad, setSelectedPad] = useState<number | null>(null);
+  const [patternEditorOpen, setPatternEditorOpen] = useState(false);
+
+  const openEditorForPad = (padIdx: number) => {
+    setSelectedPad(padIdx);
+    setPatternEditorOpen(true);
+  };
 
   return (
     <article className="glass rounded-xl" aria-label={track.name}>
@@ -119,22 +125,26 @@ export function SamplerRow({ track }: { track: TrackState }) {
               pads={track.pads}
               selectedPad={selectedPad}
               onSelectPad={setSelectedPad}
+              onOpenEditorForPad={openEditorForPad}
             />
 
-            {selectedPad !== null ? (
-              <PadStepEditor
-                trackId={track.id}
-                padIdx={selectedPad}
-                steps={track.pattern[selectedPad] ?? Array(SAMPLER_STEP_COUNT).fill(false)}
-                padName={track.pads[selectedPad]?.fileName ?? null}
-                onClose={() => setSelectedPad(null)}
-              />
-            ) : (
-              <PatternOverview
+            <PatternPreview
+              trackId={track.id}
+              pattern={track.pattern}
+              onEdit={() => setPatternEditorOpen(true)}
+            />
+
+            {patternEditorOpen && (
+              <PatternEditor
                 trackId={track.id}
                 pattern={track.pattern}
                 pads={track.pads}
+                selectedPad={selectedPad}
                 onSelectPad={setSelectedPad}
+                onClose={() => {
+                  setPatternEditorOpen(false);
+                  setSelectedPad(null);
+                }}
               />
             )}
           </div>
@@ -151,11 +161,13 @@ function PadGrid({
   pads,
   selectedPad,
   onSelectPad,
+  onOpenEditorForPad,
 }: {
   trackId: string;
   pads: SamplerPadState[];
   selectedPad: number | null;
   onSelectPad: (idx: number | null) => void;
+  onOpenEditorForPad: (idx: number) => void;
 }) {
   return (
     <div className="grid grid-cols-4 gap-1.5">
@@ -167,6 +179,7 @@ function PadGrid({
           pad={pad}
           selected={selectedPad === i}
           onSelect={() => onSelectPad(selectedPad === i ? null : i)}
+          onOpenEditorForPad={() => onOpenEditorForPad(i)}
         />
       ))}
     </div>
@@ -179,12 +192,14 @@ function Pad({
   pad,
   selected,
   onSelect,
+  onOpenEditorForPad,
 }: {
   trackId: string;
   padIdx: number;
   pad: SamplerPadState;
   selected: boolean;
   onSelect: () => void;
+  onOpenEditorForPad: () => void;
 }) {
   const triggerPad = useCypher((s) => s.triggerPad);
   const loadPadSample = useCypher((s) => s.loadPadSample);
@@ -218,8 +233,8 @@ function Pad({
     if (isDoubleTap) {
       lastTapRef.current = 0;
       if (pad.hasAudio) {
-        // Double-tap loaded pad → open step sequencer for this pad
-        onSelect();
+        // Double-tap loaded pad → open pattern editor focused on this pad's row
+        onOpenEditorForPad();
       } else {
         fileRef.current?.click();
       }
@@ -245,7 +260,7 @@ function Pad({
         }}
         aria-label={
           pad.hasAudio
-            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"} — double-tap to edit steps`
+            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"} — double-tap to edit pattern`
             : `Pad ${padIdx + 1} — tap to load a sample`
         }
         className={`w-full rounded-lg border text-[10px] font-medium flex flex-col items-start justify-between transition-colors select-none touch-none overflow-hidden ${
@@ -268,7 +283,6 @@ function Pad({
             {pad.hasAudio ? padLabel(pad.fileName) : "+"}
           </span>
         </div>
-        {/* Waveform area — double-tap hint when loaded */}
         <div className="w-full px-1 pb-1.5 min-h-[28px]">
           {pad.hasAudio ? (
             <PadWaveform
@@ -323,11 +337,8 @@ function Pad({
           const f = e.target.files?.[0];
           e.target.value = "";
           if (!f) return;
-          // URL.createObjectURL is synchronous and creates a durable blob: URL
-          // that survives Safari's bfcache restoration (which invalidates File
-          // handles when the picker backgrounds the tab in browser mode).
-          // fetch() then reads the bytes through a path that doesn't hit the
-          // IDB-backed storage that fails after bfcache.
+          // URL.createObjectURL is synchronous — durable across Safari bfcache
+          // restoration that invalidates File handles in browser mode.
           const url = URL.createObjectURL(f);
           const name = f.name;
           void fetch(url)
@@ -407,19 +418,149 @@ function PadWaveform({
   );
 }
 
-// ---- Per-pad step editor ----
+// ---- Pattern preview (mini canvas strip, like audio waveform) ----
 
-function PadStepEditor({
+function PatternPreview({
   trackId,
-  padIdx,
-  steps,
-  padName,
+  pattern,
+  onEdit,
+}: {
+  trackId: string;
+  pattern: boolean[][];
+  onEdit: () => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const lastTapRef = useRef(0);
+  const togglePatternRecording = useCypher((s) => s.togglePatternRecording);
+  const patternRecording = useCypher((s) => s.patternRecording);
+  const isRecording = patternRecording === trackId;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.offsetWidth || 300;
+    const h = canvas.offsetHeight || 48;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const rowH = h / SAMPLER_PAD_COUNT;
+    const colW = w / SAMPLER_STEP_COUNT;
+    const activeColor = isRecording ? "rgba(239,68,68,0.85)" : "rgba(124,182,255,0.85)";
+
+    for (let r = 0; r < SAMPLER_PAD_COUNT; r++) {
+      for (let c = 0; c < SAMPLER_STEP_COUNT; c++) {
+        const on = pattern[r]?.[c] ?? false;
+        const beatStart = c % 4 === 0;
+        ctx.fillStyle = on
+          ? activeColor
+          : beatStart
+          ? "rgba(255,255,255,0.07)"
+          : "rgba(255,255,255,0.03)";
+        ctx.fillRect(
+          c * colW + 0.5,
+          r * rowH + 0.5,
+          colW - 1,
+          rowH - 1,
+        );
+      }
+    }
+
+    // Subtle beat-boundary vertical lines
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    for (let c = 4; c < SAMPLER_STEP_COUNT; c += 4) {
+      ctx.fillRect(c * colW, 0, 1, h);
+    }
+  }, [pattern, isRecording]);
+
+  const onTap = () => {
+    const now = performance.now();
+    const isDoubleTap = now - lastTapRef.current < 300;
+    lastTapRef.current = now;
+    if (isDoubleTap) {
+      lastTapRef.current = 0;
+      onEdit();
+    }
+  };
+
+  const hasAnyStep = pattern.some((row) => row.some(Boolean));
+
+  return (
+    <div className="relative group">
+      <canvas
+        ref={canvasRef}
+        onPointerDown={(e) => {
+          e.preventDefault();
+          onTap();
+        }}
+        className={`w-full rounded-lg cursor-pointer border transition-colors ${
+          isRecording
+            ? "border-red-500/50 ring-1 ring-red-500/20"
+            : "border-[var(--border-subtle)] hover:border-[var(--accent)]/40"
+        }`}
+        style={{ height: "48px", display: "block" }}
+        aria-label="Pattern preview — double-tap to edit"
+      />
+
+      {/* Hint — visible on hover (desktop) or always when no steps */}
+      {!hasAnyStep && !isRecording && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <span className="text-[9px] text-[var(--text-faint)] opacity-60 tracking-wide">
+            double-tap to edit · tap REC to record
+          </span>
+        </div>
+      )}
+      <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity">
+        {hasAnyStep && (
+          <span className="text-[8px] uppercase tracking-[0.12em] text-[var(--accent)]/70 bg-black/50 px-1.5 py-0.5 rounded">
+            double-tap to edit
+          </span>
+        )}
+      </div>
+
+      {/* REC toggle */}
+      <button
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={() => togglePatternRecording(trackId)}
+        aria-pressed={isRecording}
+        aria-label={isRecording ? "Stop recording" : "Record pad hits into pattern"}
+        className={`absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1 px-1.5 py-1 rounded text-[8px] font-bold uppercase tracking-[0.08em] transition-colors ${
+          isRecording
+            ? "bg-red-600 text-white animate-pulse"
+            : "bg-black/60 hover:bg-black/80 text-[var(--text-faint)] hover:text-[var(--text-primary)]"
+        }`}
+      >
+        <span
+          className={`block w-1.5 h-1.5 rounded-full shrink-0 ${
+            isRecording ? "bg-white" : "bg-red-500"
+          }`}
+        />
+        REC
+      </button>
+    </div>
+  );
+}
+
+// ---- Pattern editor (FL Studio style — all pads × 16 steps) ----
+
+function PatternEditor({
+  trackId,
+  pattern,
+  pads,
+  selectedPad,
+  onSelectPad,
   onClose,
 }: {
   trackId: string;
-  padIdx: number;
-  steps: boolean[];
-  padName: string | null;
+  pattern: boolean[][];
+  pads: SamplerPadState[];
+  selectedPad: number | null;
+  onSelectPad: (idx: number | null) => void;
   onClose: () => void;
 }) {
   const togglePatternStep = useCypher((s) => s.togglePatternStep);
@@ -429,36 +570,49 @@ function PadStepEditor({
   const isRecording = patternRecording === trackId;
 
   return (
-    <div className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/5 p-2 space-y-2">
+    <div
+      className={`rounded-xl border p-2 space-y-1.5 transition-colors ${
+        isRecording
+          ? "border-red-500/40 bg-red-950/20"
+          : "border-[var(--accent)]/30 bg-[var(--accent)]/5"
+      }`}
+    >
       {/* Header */}
-      <div className="flex items-center gap-2">
-        <span className="text-[10px] font-medium text-[var(--text-primary)] flex-1 truncate">
-          Pad {padIdx + 1}{padName ? ` · ${padLabel(padName)}` : ""}
+      <div className="flex items-center gap-1.5">
+        <span
+          className={`text-[10px] font-bold uppercase tracking-[0.12em] flex-1 leading-none ${
+            isRecording ? "text-red-400" : "text-[var(--text-primary)]"
+          }`}
+        >
+          {isRecording ? "● Recording" : "Step Sequencer"}
         </span>
         <button
           onClick={() => togglePatternRecording(trackId)}
           aria-pressed={isRecording}
-          aria-label={isRecording ? "Stop pattern recording" : "Record pad hits into pattern"}
-          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${
+          aria-label={isRecording ? "Stop recording" : "Record pad hits into pattern"}
+          className={`flex items-center gap-1 px-2 py-1 rounded text-[9px] font-bold uppercase tracking-[0.08em] transition-colors ${
             isRecording
               ? "bg-red-600 text-white animate-pulse"
-              : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
+              : "bg-white/[0.05] hover:bg-white/[0.10] border border-[var(--border-subtle)] text-[var(--text-muted)]"
           }`}
         >
-          <span className={`block w-1.5 h-1.5 rounded-full ${isRecording ? "bg-white" : "bg-red-500"}`} />
+          <span
+            className={`block w-1.5 h-1.5 rounded-full shrink-0 ${
+              isRecording ? "bg-white" : "bg-red-500"
+            }`}
+          />
           REC
         </button>
         <button
           onClick={() => clearPattern(trackId)}
-          title="Clear this row"
-          className="text-[9px] uppercase tracking-[0.1em] text-[var(--text-faint)] hover:text-[var(--text-primary)] px-1.5 py-0.5 rounded hover:bg-white/[0.06] border border-transparent hover:border-[var(--border-subtle)] transition-colors"
+          className="text-[9px] uppercase tracking-[0.08em] text-[var(--text-faint)] hover:text-[var(--text-primary)] px-1.5 py-1 rounded hover:bg-white/[0.06] border border-transparent hover:border-[var(--border-subtle)] transition-colors"
         >
           Clear
         </button>
         <button
           onClick={onClose}
-          aria-label="Close step editor"
-          className="w-5 h-5 rounded flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-white/[0.06]"
+          aria-label="Close pattern editor"
+          className="w-6 h-6 rounded flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-white/[0.08] transition-colors"
         >
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden="true">
             <path d="M18 6L6 18M6 6l12 12" />
@@ -466,44 +620,20 @@ function PadStepEditor({
         </button>
       </div>
 
-      {/* 16 steps grouped into 4 beats */}
-      <div className="flex gap-1">
+      {/* Beat number labels */}
+      <div className="flex items-center gap-0.5 pl-[56px]">
         {[0, 1, 2, 3].map((beat) => (
-          <div key={beat} className="flex gap-0.5 flex-1">
+          <div
+            key={beat}
+            className={`flex flex-1 gap-px ${beat > 0 ? "ml-0.5" : ""}`}
+          >
             {[0, 1, 2, 3].map((sub) => {
               const step = beat * 4 + sub;
-              const on = steps[step] ?? false;
               return (
-                <button
+                <span
                   key={step}
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    togglePatternStep(trackId, padIdx, step);
-                  }}
-                  aria-label={`Step ${step + 1} ${on ? "on" : "off"}`}
-                  aria-pressed={on}
-                  className={`flex-1 h-10 rounded-sm transition-colors touch-none select-none ${
-                    on
-                      ? "bg-[var(--accent)] hover:opacity-80"
-                      : sub === 0
-                      ? "bg-white/[0.10] hover:bg-white/[0.18] border border-[var(--border-subtle)]"
-                      : "bg-white/[0.05] hover:bg-white/[0.12] border border-[var(--border-subtle)]/60"
-                  }`}
-                />
-              );
-            })}
-          </div>
-        ))}
-      </div>
-
-      {/* Step number labels */}
-      <div className="flex gap-1 px-px">
-        {[0, 1, 2, 3].map((beat) => (
-          <div key={beat} className="flex gap-0.5 flex-1">
-            {[0, 1, 2, 3].map((sub) => {
-              const step = beat * 4 + sub;
-              return (
-                <span key={step} className="flex-1 text-center text-[7px] text-[var(--text-faint)] tabular-nums">
+                  className="flex-1 text-center text-[7px] text-[var(--text-faint)] tabular-nums leading-none"
+                >
                   {step + 1}
                 </span>
               );
@@ -511,99 +641,82 @@ function PadStepEditor({
           </div>
         ))}
       </div>
-    </div>
-  );
-}
 
-// ---- Pattern overview ----
+      {/* Pad rows */}
+      <div className="space-y-px">
+        {Array.from({ length: SAMPLER_PAD_COUNT }, (_, padIdx) => {
+          const pad = pads[padIdx];
+          const steps = pattern[padIdx] ?? Array(SAMPLER_STEP_COUNT).fill(false);
+          const isSelected = selectedPad === padIdx;
+          const hasAudio = pad?.hasAudio ?? false;
+          const activeStepColor = isRecording
+            ? "bg-red-500 hover:bg-red-400"
+            : "bg-[var(--accent)] hover:opacity-80";
 
-function PatternOverview({
-  trackId,
-  pattern,
-  pads,
-  onSelectPad,
-}: {
-  trackId: string;
-  pattern: boolean[][];
-  pads: SamplerPadState[];
-  onSelectPad: (idx: number) => void;
-}) {
-  const togglePatternStep = useCypher((s) => s.togglePatternStep);
-  const togglePatternRecording = useCypher((s) => s.togglePatternRecording);
-  const clearPattern = useCypher((s) => s.clearPattern);
-  const patternRecording = useCypher((s) => s.patternRecording);
-  const isRecording = patternRecording === trackId;
+          return (
+            <div
+              key={padIdx}
+              className={`flex items-center gap-0.5 rounded transition-colors py-px ${
+                isSelected ? "bg-[var(--accent)]/[0.08] -mx-0.5 px-0.5" : ""
+              }`}
+            >
+              {/* Pad label — tap to highlight row */}
+              <button
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => onSelectPad(isSelected ? null : padIdx)}
+                title={pad?.fileName ?? `Pad ${padIdx + 1}`}
+                className={`w-14 shrink-0 text-right pr-1.5 text-[8px] leading-none truncate rounded-sm py-0.5 transition-colors ${
+                  hasAudio
+                    ? isSelected
+                      ? "text-[var(--accent)] font-semibold"
+                      : "text-[var(--text-primary)] hover:text-[var(--accent)]"
+                    : "text-[var(--text-faint)]"
+                }`}
+              >
+                {hasAudio ? padLabel(pad.fileName) : `P${padIdx + 1}`}
+              </button>
 
-  return (
-    <div>
-      <div className="flex items-center gap-2 mb-1.5">
-        <span className="text-[9px] uppercase tracking-[0.16em] text-[var(--text-faint)] flex-1">
-          Pattern
-        </span>
-        <button
-          onClick={() => togglePatternRecording(trackId)}
-          aria-pressed={isRecording}
-          aria-label={isRecording ? "Stop pattern recording" : "Record pad hits into pattern"}
-          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${
-            isRecording
-              ? "bg-red-600 text-white animate-pulse"
-              : "bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)]"
-          }`}
-        >
-          <span className={`block w-1.5 h-1.5 rounded-full ${isRecording ? "bg-white" : "bg-red-500"}`} />
-          REC
-        </button>
-        <button
-          onClick={() => clearPattern(trackId)}
-          className="text-[9px] uppercase tracking-[0.1em] text-[var(--text-faint)] hover:text-[var(--text-primary)] px-1.5 py-0.5 rounded hover:bg-white/[0.06] border border-transparent hover:border-[var(--border-subtle)] transition-colors"
-        >
-          Clear
-        </button>
-      </div>
-
-      <div className="overflow-x-auto -mx-0.5 px-0.5">
-        <div className="inline-block min-w-full">
-          {Array.from({ length: SAMPLER_PAD_COUNT }, (_, padIdx) => {
-            const hasAudio = pads[padIdx]?.hasAudio;
-            return (
-              <div key={padIdx} className="flex items-center gap-0.5 mb-0.5">
-                {/* Pad label — tap to open step editor */}
-                <button
-                  onClick={() => onSelectPad(padIdx)}
-                  title={`Edit steps for pad ${padIdx + 1}`}
-                  className={`text-[8px] w-5 shrink-0 text-right tabular-nums rounded px-0.5 transition-colors ${
-                    hasAudio
-                      ? "text-[var(--text-primary)] hover:text-[var(--accent)] hover:bg-white/[0.06]"
-                      : "text-[var(--text-faint)]"
-                  }`}
+              {/* 16 steps grouped into 4 beats */}
+              {[0, 1, 2, 3].map((beat) => (
+                <div
+                  key={beat}
+                  className={`flex flex-1 gap-px ${beat > 0 ? "ml-0.5" : ""}`}
                 >
-                  {padIdx + 1}
-                </button>
-                <div className="flex gap-0.5">
-                  {Array.from({ length: SAMPLER_STEP_COUNT }, (_, step) => {
-                    const on = pattern[padIdx]?.[step] ?? false;
-                    const beatStart = step % 4 === 0;
+                  {[0, 1, 2, 3].map((sub) => {
+                    const step = beat * 4 + sub;
+                    const on = steps[step] ?? false;
                     return (
                       <button
                         key={step}
-                        onClick={() => togglePatternStep(trackId, padIdx, step)}
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          togglePatternStep(trackId, padIdx, step);
+                        }}
                         aria-label={`Pad ${padIdx + 1} step ${step + 1} ${on ? "on" : "off"}`}
                         aria-pressed={on}
-                        className={`w-5 h-4 rounded-sm transition-colors shrink-0 ${
+                        className={`flex-1 h-7 rounded-sm transition-colors touch-none select-none ${
                           on
-                            ? "bg-[var(--accent)] hover:opacity-80"
-                            : beatStart
-                            ? "bg-white/[0.09] hover:bg-white/[0.16] border border-[var(--border-subtle)]"
-                            : "bg-white/[0.04] hover:bg-white/[0.10] border border-[var(--border-subtle)]/50"
+                            ? activeStepColor
+                            : sub === 0
+                            ? `bg-white/[0.10] hover:bg-white/[0.18] border ${
+                                isSelected
+                                  ? "border-[var(--accent)]/30"
+                                  : "border-[var(--border-subtle)]"
+                              }`
+                            : `bg-white/[0.05] hover:bg-white/[0.12] border ${
+                                isSelected
+                                  ? "border-[var(--accent)]/20"
+                                  : "border-[var(--border-subtle)]/50"
+                              }`
                         }`}
                       />
                     );
                   })}
                 </div>
-              </div>
-            );
-          })}
-        </div>
+              ))}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
