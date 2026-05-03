@@ -337,22 +337,25 @@ function Pad({
           const f = e.target.files?.[0];
           e.target.value = "";
           if (!f) return;
-          // URL.createObjectURL is synchronous — durable across Safari bfcache
-          // restoration that invalidates File handles in browser mode.
-          const url = URL.createObjectURL(f);
           const name = f.name;
-          void fetch(url)
-            .then((r) => r.arrayBuffer())
-            .then((bytes) => handleFile(bytes, name))
-            .catch((err) => {
-              pushToast({
-                variant: "error",
-                title: `Pad ${padIdx + 1}: load failed`,
-                message: err instanceof Error ? err.message : "Could not read file",
-                ttlMs: 8000,
-              });
-            })
-            .finally(() => URL.revokeObjectURL(url));
+          // FileReader.readAsArrayBuffer reads from the native file path and
+          // does not touch iOS Safari's IDB-backed blob URL registry.
+          // fetch(URL.createObjectURL(f)) fails after bfcache restoration
+          // because the blob: URL's backing store is IDB-based and gets
+          // invalidated when the tab is backgrounded during the file picker.
+          const reader = new FileReader();
+          reader.onload = () => {
+            void handleFile(reader.result as ArrayBuffer, name);
+          };
+          reader.onerror = () => {
+            pushToast({
+              variant: "error",
+              title: `Pad ${padIdx + 1}: load failed`,
+              message: reader.error?.message ?? "Could not read file",
+              ttlMs: 8000,
+            });
+          };
+          reader.readAsArrayBuffer(f);
         }}
       />
     </div>
