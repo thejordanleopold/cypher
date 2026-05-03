@@ -439,6 +439,11 @@ export const useCypher = create<CypherState>((set, get) => ({
   loadPadSample: async (trackId, padIdx, file) => {
     const track = get().tracks.find((t) => t.id === trackId);
     if (!track || track.kind !== "sampler") return;
+    // Read raw bytes FIRST, before any other async operations.
+    // iOS Safari revokes File handles after async context switches (e.g.
+    // Tone.start()), causing file.arrayBuffer() to throw the misleading
+    // "Error preparing Blob/File data to be stored in object store" error.
+    const rawBytes = await file.arrayBuffer();
     // Wake the AudioContext before decoding. iOS Safari leaves the context
     // suspended until a user gesture; `decodeAudioData` works on a suspended
     // context, but addTrack defers Tone.start() and we want a fully-running
@@ -447,7 +452,7 @@ export const useCypher = create<CypherState>((set, get) => ({
     pushHistory(get(), `padSample:${trackId}:${padIdx}`);
     let buf: AudioBuffer;
     try {
-      buf = await getEngine().loadFileToPad(trackId, padIdx, file);
+      buf = await getEngine().loadFileToPad(trackId, padIdx, rawBytes);
     } catch (err) {
       const name = err instanceof Error ? err.name : "Error";
       const msg = err instanceof Error ? err.message : String(err);
@@ -647,8 +652,12 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   importFile: async (id, file) => {
+    // Read bytes immediately before any async context switches so iOS Safari
+    // cannot revoke the File handle.
+    const rawBytes = await file.arrayBuffer();
+    const fileName = file.name;
     pushHistory(get(), `importFile:${id}`);
-    const buf = await getEngine().loadFileToTrack(id, file);
+    const buf = await getEngine().loadFileToTrack(id, rawBytes);
     const audioKey = makeAudioKey(get().currentProjectId, id);
     await saveAudio(audioKey, audioBufferToWavBlob(buf));
     set((s) => ({
@@ -657,7 +666,7 @@ export const useCypher = create<CypherState>((set, get) => ({
           ? {
               ...t,
               hasAudio: true,
-              fileName: file.name,
+              fileName,
               durationSec: buf.duration,
               bufferRevision: t.bufferRevision + 1,
               audioKey,

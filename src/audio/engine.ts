@@ -463,11 +463,13 @@ class AudioEngine {
   async loadFileToPad(
     id: TrackId,
     padIdx: number,
-    file: File,
+    source: File | ArrayBuffer,
   ): Promise<AudioBuffer> {
     const t = this.tracks.get(id);
     if (!t) throw new Error(`No track ${id}`);
-    const arrayBuf = await file.arrayBuffer();
+    // Accept a pre-read ArrayBuffer (caller read bytes before any other async
+    // work to avoid iOS Safari revoking the File handle mid-flight).
+    const arrayBuf = source instanceof ArrayBuffer ? source : await source.arrayBuffer();
     let audioBuf: AudioBuffer;
     try {
       audioBuf = await this.context().decodeAudioData(arrayBuf.slice(0));
@@ -514,10 +516,10 @@ class AudioEngine {
     this.patterns.clear();
   }
 
-  async loadFileToTrack(id: TrackId, file: File): Promise<AudioBuffer> {
+  async loadFileToTrack(id: TrackId, file: File | ArrayBuffer): Promise<AudioBuffer> {
     const t = this.tracks.get(id);
     if (!t) throw new Error(`No track ${id}`);
-    const arrayBuf = await file.arrayBuffer();
+    const arrayBuf = file instanceof ArrayBuffer ? file : await file.arrayBuffer();
     const audioBuf = await this.context().decodeAudioData(arrayBuf.slice(0));
     t.player?.dispose();
     const player = new Tone.Player(audioBuf);
