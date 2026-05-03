@@ -257,12 +257,12 @@ function Pad({
         className="sr-only"
         onChange={async (e) => {
           const f = e.target.files?.[0];
-          // Reset BEFORE awaiting so re-picking the same file fires a fresh
-          // change event (browsers suppress duplicate selections), and so a
-          // failure mid-load doesn't strand the input in a state that
-          // refuses subsequent picks.
-          e.target.value = "";
+          // Capture before any await — on iOS Safari clearing the input before
+          // file.arrayBuffer() completes can close the underlying file handle.
+          const input = e.target;
           if (f) await handleFile(f);
+          // Reset after processing so the user can re-pick the same file.
+          input.value = "";
         }}
       />
     </div>

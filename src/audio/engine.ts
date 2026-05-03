@@ -132,6 +132,32 @@ function applyInputGain(buf: AudioBuffer, gain: number): AudioBuffer {
   return buf;
 }
 
+// Decode a user-supplied audio file. Tries OfflineAudioContext first (a
+// stateless context avoids iOS audio-session sample-rate constraints that can
+// make the live AudioContext's decodeAudioData reject valid files), then falls
+// back to a fresh AudioContext.
+async function decodeAudioFile(arr: ArrayBuffer): Promise<AudioBuffer> {
+  const fallbackRate = 44_100;
+  if (typeof OfflineAudioContext !== "undefined") {
+    try {
+      const oac = new OfflineAudioContext(2, 1, fallbackRate);
+      return await oac.decodeAudioData(arr.slice(0));
+    } catch {
+      // fall through to live context
+    }
+  }
+  const ctx = new AudioContext({ sampleRate: fallbackRate });
+  try {
+    return await ctx.decodeAudioData(arr.slice(0));
+  } finally {
+    try {
+      await ctx.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 async function decodeRecording(
   arr: ArrayBuffer,
   hintRate: number,
@@ -439,7 +465,14 @@ class AudioEngine {
     const t = this.tracks.get(id);
     if (!t) throw new Error(`No track ${id}`);
     const arrayBuf = await file.arrayBuffer();
-    const audioBuf = await this.context().decodeAudioData(arrayBuf.slice(0));
+    let audioBuf: AudioBuffer;
+    try {
+      audioBuf = await this.context().decodeAudioData(arrayBuf.slice(0));
+    } catch {
+      // Main AudioContext decode failed (e.g. iOS sample-rate mismatch);
+      // retry via OfflineAudioContext which is more permissive.
+      audioBuf = await decodeAudioFile(arrayBuf);
+    }
     t.pads.set(padIdx, audioBuf);
     return audioBuf;
   }
