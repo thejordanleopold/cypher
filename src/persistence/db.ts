@@ -168,6 +168,15 @@ export async function deleteAudio(key: string) {
   await db.delete(AUDIO_STORE, key);
 }
 
+export async function listAudioKeysForProject(projectId: string): Promise<string[]> {
+  const db = await getDb();
+  const all = (await db.getAllKeys(AUDIO_STORE)) as IDBValidKey[];
+  const prefix = `audio:${projectId}:`;
+  return all.filter(
+    (k): k is string => typeof k === "string" && k.startsWith(prefix),
+  );
+}
+
 // ---- Meta ----
 
 export async function getCurrentProjectId(): Promise<string | undefined> {
