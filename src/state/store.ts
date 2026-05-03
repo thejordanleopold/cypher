@@ -351,7 +351,7 @@ export const useCypher = create<CypherState>((set, get) => ({
 
   createProject: async (name = "Untitled") => {
     const id = makeId();
-    await switchToProject(id, name, /* initialTracks */ true, set);
+    await switchToProject(id, name, /* initialTracks */ false, set);
     await get().refreshProjects();
   },
 
@@ -397,7 +397,7 @@ export const useCypher = create<CypherState>((set, get) => ({
     if (remaining.length > 0) {
       await loadProjectIntoEngine(remaining[0].id, set);
     } else {
-      await switchToProject(DEFAULT_PROJECT_ID, "Untitled", true, set);
+      await switchToProject(DEFAULT_PROJECT_ID, "Untitled", false, set);
     }
     await get().refreshProjects();
   },
@@ -1316,8 +1316,10 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
 
   const persisted = await loadProject(id);
   if (!persisted) {
-    // No record under this id — create a fresh empty project.
-    await switchToProject(id, "Untitled", true, set);
+    // No record under this id — create a fresh empty project. Start with no
+    // tracks so the user picks Audio vs Sampler from the Add Track menu
+    // instead of getting two surprise audio tracks pre-populated.
+    await switchToProject(id, "Untitled", false, set);
     return;
   }
 
