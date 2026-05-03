@@ -38,12 +38,14 @@ export async function mixdown(tracks: MixTrack[]): Promise<AudioBuffer> {
   const totalSamples = Math.max(1, Math.ceil(lengthSec * sampleRate));
   const ctx = new OfflineAudioContext(2, totalSamples, sampleRate);
 
+  // Match the engine's playback compressor — see engine.ts for the
+  // rationale on the slow release.
   const limiter = ctx.createDynamicsCompressor();
   limiter.threshold.value = -1;
-  limiter.knee.value = 0;
-  limiter.ratio.value = 20;
-  limiter.attack.value = 0.001;
-  limiter.release.value = 0.05;
+  limiter.knee.value = 6;
+  limiter.ratio.value = 12;
+  limiter.attack.value = 0.005;
+  limiter.release.value = 0.25;
   limiter.connect(ctx.destination);
 
   for (const t of playable) {

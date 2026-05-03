@@ -21,7 +21,11 @@ export function Transport() {
     countdownActive,
     countdownBeat,
     cancelCountdown,
+    undo,
+    redo,
   } = useCypher();
+  const canUndo = useCypher((s) => s.undoStack.length > 0);
+  const canRedo = useCypher((s) => s.redoStack.length > 0);
   const armedCount = tracks.filter((t) => t.armed).length;
   const emptyCount = tracks.filter((t) => !t.hasAudio).length;
   const willRecordCount = armedCount > 0 ? armedCount : emptyCount;
@@ -98,6 +102,16 @@ export function Transport() {
           )}
         </button>
 
+        <div className="hidden sm:block h-7 w-px bg-[var(--border-subtle)]/80 mx-1" aria-hidden="true" />
+        <HistoryButton label="Undo" disabled={!canUndo} onClick={undo}>
+          <path d="M9 14L4 9l5-5" />
+          <path d="M4 9h11a5 5 0 0 1 0 10h-4" />
+        </HistoryButton>
+        <HistoryButton label="Redo" disabled={!canRedo} onClick={redo}>
+          <path d="M15 14l5-5-5-5" />
+          <path d="M20 9H9a5 5 0 0 0 0 10h4" />
+        </HistoryButton>
+
         <div className="flex-1" />
         <div className="hidden sm:block h-7 w-px bg-[var(--border-subtle)]/80 mx-1" aria-hidden="true" />
 
@@ -147,5 +161,41 @@ export function Transport() {
         </button>
       </div>
     </div>
+  );
+}
+
+function HistoryButton({
+  label,
+  disabled,
+  onClick,
+  children,
+}: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className="h-9 w-9 rounded-md bg-white/[0.05] hover:bg-white/[0.09] border border-[var(--border-subtle)] text-[var(--text-muted)] flex items-center justify-center active:scale-95 shrink-0 transition-colors disabled:opacity-40 disabled:hover:bg-white/[0.05]"
+    >
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        {children}
+      </svg>
+    </button>
   );
 }

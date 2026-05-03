@@ -168,6 +168,24 @@ export async function deleteAudio(key: string) {
   await db.delete(AUDIO_STORE, key);
 }
 
+export function audioKeyPrefix(projectId: string): string {
+  return `audio:${projectId}:`;
+}
+
+export function makeAudioKey(projectId: string, trackId: string): string {
+  return `${audioKeyPrefix(projectId)}${trackId}:${Date.now()}`;
+}
+
+export async function listAudioKeysForProject(projectId: string): Promise<string[]> {
+  const db = await getDb();
+  const prefix = audioKeyPrefix(projectId);
+  // Use a key range so IndexedDB does the prefix scan natively instead of
+  // pulling every audio key for every project and filtering in JS.
+  const range = IDBKeyRange.bound(prefix, `${prefix}￿`);
+  const keys = (await db.getAllKeys(AUDIO_STORE, range)) as IDBValidKey[];
+  return keys.filter((k): k is string => typeof k === "string");
+}
+
 // ---- Meta ----
 
 export async function getCurrentProjectId(): Promise<string | undefined> {

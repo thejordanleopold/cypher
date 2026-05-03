@@ -211,7 +211,7 @@ function pickRecorderMimeType(): string {
 
 class AudioEngine {
   private master: Tone.Gain | null = null;
-  private limiter: Tone.Limiter | null = null;
+  private limiter: Tone.Compressor | null = null;
   private tracks = new Map<TrackId, Track>();
   private started = false;
   private nativeCtx: AudioContext | null = null;
@@ -262,7 +262,20 @@ class AudioEngine {
       // actually running (post-gesture), otherwise it blocks forever and
       // stalls callers like initProject.
       this.master = new Tone.Gain(1);
-      this.limiter = new Tone.Limiter(-1);
+      // Catch peaks above -1 dBFS so the destination doesn't hard-clip on
+      // hot mixes, but with a slow release so the gain reduction doesn't
+      // modulate audibly. Tone.Limiter ships with release=0.01 s, which on
+      // music whose peaks regularly cross threshold modulates the gain
+      // around 100 Hz and reads as a "robotic"/"metallic" coloration on the
+      // master bus. A 250 ms release pushes that modulation well below the
+      // audible band while still catching transients.
+      this.limiter = new Tone.Compressor({
+        threshold: -1,
+        knee: 6,
+        ratio: 12,
+        attack: 0.005,
+        release: 0.25,
+      });
       this.master.connect(this.limiter);
       this.limiter.toDestination();
       this.started = true;
