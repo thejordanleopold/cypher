@@ -184,12 +184,22 @@ export async function duplicateProject(
 
 export async function saveAudio(key: string, blob: Blob) {
   const db = await getDb();
-  await db.put(AUDIO_STORE, blob, key);
+  // iOS Safari throws "Error preparing Blob/File data to be stored in object
+  // store" when given a Blob directly. Storing ArrayBuffer works on all
+  // browsers; we re-wrap it as a Blob on load.
+  const arr = await blob.arrayBuffer();
+  await db.put(AUDIO_STORE, arr, key);
 }
 
 export async function loadAudio(key: string): Promise<Blob | undefined> {
   const db = await getDb();
-  return db.get(AUDIO_STORE, key);
+  const stored = await db.get(AUDIO_STORE, key);
+  if (!stored) return undefined;
+  // Re-wrap ArrayBuffer (new format) or pass Blob through (legacy entries).
+  if (stored instanceof ArrayBuffer) {
+    return new Blob([stored], { type: "audio/wav" });
+  }
+  return stored as Blob;
 }
 
 export async function deleteAudio(key: string) {
