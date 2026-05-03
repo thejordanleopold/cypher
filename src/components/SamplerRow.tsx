@@ -148,7 +148,6 @@ function Pad({
   const clearPadSample = useCypher((s) => s.clearPadSample);
   const pushToast = useCypher((s) => s.pushToast);
   const fileRef = useRef<HTMLInputElement>(null);
-  const lastTapRef = useRef(0);
   const [active, setActive] = useState(false);
 
   const handleFile = async (file: File) => {
@@ -166,19 +165,10 @@ function Pad({
     }
   };
 
+  // Every pointerdown fires immediately with no debounce or double-tap window
+  // so finger-drumming layers cleanly. Replacement and clear are handled by
+  // the dedicated corner buttons.
   const onTap = () => {
-    const now = performance.now();
-    const isDoubleTap = now - lastTapRef.current < 300;
-    lastTapRef.current = now;
-    if (isDoubleTap) {
-      // Second tap within the double-tap window opens the file picker so the
-      // user can load (or replace) the pad's sample. The first tap already
-      // triggered the existing sample if there was one — that's fine; the
-      // brief overlap is the cost of keeping single-tap latency near zero.
-      lastTapRef.current = 0;
-      fileRef.current?.click();
-      return;
-    }
     if (!pad.hasAudio) {
       fileRef.current?.click();
       return;
@@ -197,7 +187,7 @@ function Pad({
         }}
         aria-label={
           pad.hasAudio
-            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"} (double-tap to replace)`
+            ? `Trigger pad ${padIdx + 1}: ${pad.fileName ?? "sample"}`
             : `Pad ${padIdx + 1} — tap to load a sample`
         }
         className={`w-full aspect-square rounded-lg border text-[10px] font-medium flex flex-col items-center justify-center gap-0.5 transition-colors select-none touch-none ${
