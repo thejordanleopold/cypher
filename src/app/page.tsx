@@ -102,7 +102,7 @@ export default function Home() {
 
   useEffect(() => {
     initProject();
-    const t = setTimeout(() => setSplashDone(true), 42000);
+    const t = setTimeout(() => setSplashDone(true), 2500);
     return () => clearTimeout(t);
   }, [initProject]);
 
@@ -124,16 +124,48 @@ export default function Home() {
   }, [viewMode]);
 
   if (!splashDone) {
+    const letters = "CYPHER".split("");
     return (
-      <main className="flex-1 overflow-hidden bg-black">
-        <video
-          src="/cypher-splash.mp4"
-          autoPlay
-          muted
-          playsInline
-          onEnded={() => setSplashDone(true)}
-          className="w-full h-full object-cover"
-        />
+      <main className="flex-1 flex items-center justify-center text-[var(--text-primary)] overflow-hidden">
+        <h1
+          aria-label="CYPHER"
+          className="font-[family-name:var(--font-bebas)] text-6xl sm:text-7xl tracking-[0.12em] leading-none flex cypher-splash"
+        >
+          {letters.map((ch, i) => (
+            <span
+              key={i}
+              className="cypher-letter inline-block"
+              style={{ animationDelay: `${i * 70}ms` }}
+            >
+              {ch}
+            </span>
+          ))}
+        </h1>
+        <style jsx>{`
+          .cypher-splash {
+            animation: cypher-exit 700ms cubic-bezier(0.4, 0, 0.2, 1) 1800ms forwards;
+          }
+          .cypher-letter {
+            opacity: 0;
+            transform: translateY(12px);
+            filter: blur(8px);
+            animation: cypher-in 900ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+          }
+          @keyframes cypher-in {
+            to {
+              opacity: 1;
+              transform: translateY(0);
+              filter: blur(0);
+            }
+          }
+          @keyframes cypher-exit {
+            to {
+              opacity: 0;
+              transform: scale(1.08);
+              filter: blur(6px);
+            }
+          }
+        `}</style>
       </main>
     );
   }
@@ -156,7 +188,7 @@ export default function Home() {
           CYPHER
         </h1>
         <div className="glass-raised rounded-2xl overflow-hidden">
-          <header className="px-3 sm:px-4 pt-1.5 pb-2 flex items-center gap-2">
+          <header className="px-3 sm:px-4 pt-2 pb-2 flex items-center gap-2">
             <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
               <span aria-hidden="true" className="text-[var(--text-faint)] text-[13px] leading-none">/</span>
               <p className="text-[13px] text-[var(--text-muted)] truncate min-w-0 leading-none">
