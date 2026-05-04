@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useCypher } from "@/state/store";
 import { Transport } from "@/components/Transport";
 import { Timeline } from "@/components/Timeline";
@@ -16,16 +16,29 @@ type ViewMode = "track" | "mixer";
 export default function Home() {
   const tracks = useCypher((s) => s.tracks);
   const projectName = useCypher((s) => s.currentProjectName);
+  const isLoaded = useCypher((s) => s.isLoaded);
   const initProject = useCypher((s) => s.initProject);
+  const createProject = useCypher((s) => s.createProject);
 
   const [splashDone, setSplashDone] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("track");
+  const [showResume, setShowResume] = useState(false);
+  // Guard so the dialog only fires once per page load.
+  const resumeChecked = useRef(false);
 
   useEffect(() => {
     initProject();
     const t = setTimeout(() => setSplashDone(true), 2500);
     return () => clearTimeout(t);
   }, [initProject]);
+
+  // After the splash clears and the project is loaded, show the resume dialog
+  // if there is an existing session with tracks.
+  useEffect(() => {
+    if (!splashDone || !isLoaded || resumeChecked.current) return;
+    resumeChecked.current = true;
+    if (tracks.length > 0) setShowResume(true);
+  }, [splashDone, isLoaded, tracks.length]);
 
   // Persist view choice locally so it survives reloads.
   useEffect(() => {
@@ -85,6 +98,17 @@ export default function Home() {
 
   return (
     <main className="flex-1 flex flex-col text-[var(--text-primary)] min-h-[100dvh]">
+      {showResume && (
+        <ResumeDialog
+          projectName={projectName}
+          trackCount={tracks.length}
+          onResume={() => setShowResume(false)}
+          onNew={async () => {
+            setShowResume(false);
+            await createProject();
+          }}
+        />
+      )}
       <div className="sticky top-0 z-20 px-2 sm:px-3 pt-[max(env(safe-area-inset-top),0.5rem)] pb-2 bg-gradient-to-b from-[var(--bg-base)] via-[var(--bg-base)]/85 to-transparent">
         <div className="glass-raised rounded-2xl overflow-hidden">
           <header className="px-3 sm:px-4 pt-3 pb-2 flex items-center gap-2">
@@ -120,6 +144,56 @@ export default function Home() {
       )}
       <RecordingShield />
     </main>
+  );
+}
+
+function ResumeDialog({
+  projectName,
+  trackCount,
+  onResume,
+  onNew,
+}: {
+  projectName: string;
+  trackCount: number;
+  onResume: () => void;
+  onNew: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-5">
+      {/* Backdrop */}
+      <div
+        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+        onClick={onResume}
+      />
+      {/* Card */}
+      <div className="relative glass-raised rounded-2xl px-6 py-6 w-full max-w-xs flex flex-col items-center gap-4 shadow-2xl animate-[fade-up_220ms_cubic-bezier(0.22,1,0.36,1)_both]">
+        <h1 className="font-[family-name:var(--font-bebas)] text-4xl tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
+          CYPHER
+        </h1>
+        <div className="text-center space-y-1">
+          <p className="text-[var(--text-primary)] text-sm font-semibold">
+            Welcome back
+          </p>
+          <p className="text-[var(--text-faint)] text-xs truncate max-w-full">
+            {projectName} · {trackCount} {trackCount === 1 ? "track" : "tracks"}
+          </p>
+        </div>
+        <div className="flex flex-col gap-2 w-full">
+          <button
+            onClick={onResume}
+            className="w-full h-10 rounded-xl bg-[var(--accent)] text-[#031024] text-sm font-bold tracking-wide active:scale-95 transition-transform"
+          >
+            Resume Session
+          </button>
+          <button
+            onClick={onNew}
+            className="w-full h-10 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-primary)] text-sm font-medium active:scale-95 transition-colors"
+          >
+            Start New
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
