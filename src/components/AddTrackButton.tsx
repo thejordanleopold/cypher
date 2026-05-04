@@ -25,16 +25,11 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
   const btnRef = useRef<HTMLButtonElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
 
-  // Measure trigger position so the portal-rendered popover lines up.
   useLayoutEffect(() => {
     if (!open || !btnRef.current) return;
     const update = () => {
       const r = btnRef.current!.getBoundingClientRect();
-      setPos({
-        top: r.bottom + 6,
-        left: variant === "strip" ? r.right + 8 : r.left + r.width / 2,
-        width: r.width,
-      });
+      setPos({ top: r.bottom + 6, left: r.right + 8, width: r.width });
     };
     update();
     window.addEventListener("resize", update);
@@ -43,7 +38,7 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
       window.removeEventListener("resize", update);
       window.removeEventListener("scroll", update, true);
     };
-  }, [open, variant]);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -71,22 +66,38 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
     void addTrack(kind);
   };
 
+  // Wide: two explicit side-by-side buttons, no popover needed.
+  if (variant === "wide") {
+    const isEmpty = tracks.length === 0;
+    return (
+      <div className="flex gap-1.5">
+        <button
+          onClick={() => void addTrack("audio")}
+          className="glass flex-1 rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+          aria-label="Add audio track"
+        >
+          <PlusIcon />
+          {isEmpty ? "Add your first track" : "Add Track"}
+        </button>
+        <button
+          onClick={() => void addTrack("sampler")}
+          className="glass flex-1 rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
+          aria-label="Add sampler track"
+        >
+          <PadGridIcon />
+          Add Sampler
+        </button>
+      </div>
+    );
+  }
+
+  // Strip: compact + button with popover (used in non-track-list contexts).
   const popover = open && pos ? (
     <div
       ref={popRef}
       role="menu"
       aria-label="Choose track type"
-      style={
-        variant === "strip"
-          ? { position: "fixed", top: pos.top, left: pos.left, zIndex: 9999 }
-          : {
-              position: "fixed",
-              top: pos.top,
-              left: pos.left,
-              transform: "translateX(-50%)",
-              zIndex: 9999,
-            }
-      }
+      style={{ position: "fixed", top: pos.top, left: pos.left, zIndex: 9999 }}
       className="w-56 glass-raised rounded-xl p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
     >
       <MenuOption
@@ -103,25 +114,6 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
       />
     </div>
   ) : null;
-
-  if (variant === "wide") {
-    return (
-      <>
-        <button
-          ref={btnRef}
-          onClick={() => setOpen((v) => !v)}
-          className="glass block w-full rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
-          aria-label="Add new track"
-          aria-haspopup="menu"
-          aria-expanded={open}
-        >
-          <PlusIcon />
-          {tracks.length === 0 ? "Add your first track" : "Add track"}
-        </button>
-        {typeof document !== "undefined" && createPortal(popover, document.body)}
-      </>
-    );
-  }
 
   return (
     <>
