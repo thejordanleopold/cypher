@@ -26,6 +26,7 @@ export function SamplerRow({
   const armSamplerRecord = useCypher((s) => s.armSamplerRecord);
   const clearSamplerPattern = useCypher((s) => s.clearSamplerPattern);
   const isPlaying = useCypher((s) => s.isPlaying);
+  const cardRef = useRef<HTMLElement>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [activeBank, setActiveBank] = useState(0);
 
@@ -34,12 +35,67 @@ export function SamplerRow({
   const totalLoaded = track.pads.filter((p) => p.hasAudio).length;
 
   return (
-    <article data-track-id={track.id} className="glass rounded-xl" aria-label={track.name}>
+    <article
+      ref={cardRef as React.RefObject<HTMLElement>}
+      data-track-id={track.id}
+      onPointerDown={(e) => {
+        if ((e.target as Element).closest("button, input, [role='slider']")) return;
+        const startX = e.clientX;
+        const startY = e.clientY;
+        let locked: "none" | "h" | "v" = "none";
+        const card = cardRef.current!;
+
+        const onMove = (mv: PointerEvent) => {
+          const dx = mv.clientX - startX;
+          const dy = mv.clientY - startY;
+          if (locked === "none") {
+            if (dx > 10 && dx > Math.abs(dy)) locked = "h";
+            else if (Math.abs(dy) > 10 || dx < -10) locked = "v";
+            return;
+          }
+          if (locked === "h") card.style.transform = `translateX(${Math.max(0, dx)}px)`;
+        };
+
+        const snapBack = () => {
+          card.style.transition = "transform 200ms ease-out";
+          card.style.transform = "translateX(0)";
+          setTimeout(() => { card.style.transition = ""; }, 200);
+        };
+
+        const onUp = (mv: PointerEvent) => {
+          cleanup();
+          if (locked !== "h") return;
+          const dx = mv.clientX - startX;
+          if (dx > 100) {
+            card.style.transition = "transform 180ms ease-out";
+            card.style.transform = `translateX(${window.innerWidth}px)`;
+            setTimeout(() => removeTrack(track.id), 180);
+          } else {
+            snapBack();
+          }
+        };
+
+        const onCancel = () => { cleanup(); snapBack(); };
+
+        const cleanup = () => {
+          document.removeEventListener("pointermove", onMove);
+          document.removeEventListener("pointerup", onUp);
+          document.removeEventListener("pointercancel", onCancel);
+        };
+
+        document.addEventListener("pointermove", onMove);
+        document.addEventListener("pointerup", onUp);
+        document.addEventListener("pointercancel", onCancel);
+      }}
+      className="glass rounded-xl"
+      aria-label={track.name}
+    >
       {/* Header — click to collapse, hold to drag */}
       <header
         className="flex items-center gap-1 px-2.5 pt-1.5 pb-1 cursor-pointer touch-none [&_button]:cursor-pointer"
         onPointerDown={(e) => {
           if ((e.target as Element).closest("button")) return;
+          const startX = e.clientX;
           const startY = e.clientY;
           let currentX = e.clientX;
           let currentY = e.clientY;
@@ -56,7 +112,7 @@ export function SamplerRow({
           const onMove = (mv: PointerEvent) => {
             currentX = mv.clientX;
             currentY = mv.clientY;
-            if (!scrollCancelled && Math.abs(mv.clientY - startY) > 8) {
+            if (!scrollCancelled && (Math.abs(mv.clientY - startY) > 8 || Math.abs(mv.clientX - startX) > 8)) {
               scrollCancelled = true;
               clearTimeout(timer);
               cleanup();
@@ -80,16 +136,6 @@ export function SamplerRow({
           document.addEventListener("pointercancel", onUp);
         }}
       >
-        {/* Remove — left */}
-        <button
-          onClick={() => removeTrack(track.id)}
-          className="-ml-1 h-7 w-7 rounded-md text-[var(--text-faint)] hover:text-red-400 active:scale-95 flex items-center justify-center shrink-0 transition-colors"
-          aria-label={`Remove ${track.name}`}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
-        </button>
         {/* Collapse indicator — visual only */}
         <div className="h-5 w-4 flex items-center justify-center shrink-0 pointer-events-none text-[var(--text-faint)]" aria-hidden="true">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform duration-150 ${collapsed ? "" : "rotate-90"}`}>

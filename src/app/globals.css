@@ -46,6 +46,8 @@ html, body {
   font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, sans-serif;
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
+  /* Prevent pinch-zoom and horizontal browser swipe navigation. */
+  touch-action: pan-y;
 }
 
 /* Disable accidental text selection everywhere except editable fields. */
