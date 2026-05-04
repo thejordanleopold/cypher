@@ -7,7 +7,13 @@ import { LiveWaveform } from "@/components/LiveWaveform";
 import { InputPicker } from "@/components/InputPicker";
 import { LevelMeter } from "@/components/LevelMeter";
 
-export function TrackRow({ track }: { track: TrackState }) {
+export function TrackRow({
+  track,
+  onDragStart,
+}: {
+  track: TrackState;
+  onDragStart?: (trackId: string, pointerX: number, pointerY: number) => void;
+}) {
   const {
     importFile,
     setVolume,
@@ -27,6 +33,7 @@ export function TrackRow({ track }: { track: TrackState }) {
 
   return (
     <article
+      data-track-id={track.id}
       className={`glass rounded-xl transition-colors ${
         isRecordingNow
           ? "!border-red-500/60 ring-1 ring-red-500/40"
@@ -36,29 +43,67 @@ export function TrackRow({ track }: { track: TrackState }) {
       }`}
       aria-label={track.name}
     >
-      {/* Header — always visible */}
-      <header className="flex items-center gap-1 px-2.5 pt-1.5 pb-1">
+      {/* Header — click to collapse, hold to drag */}
+      <header
+        className="flex items-center gap-1 px-2.5 pt-1.5 pb-1 cursor-pointer touch-none [&_button]:cursor-pointer"
+        onPointerDown={(e) => {
+          if ((e.target as Element).closest("button")) return;
+          const startY = e.clientY;
+          let currentX = e.clientX;
+          let currentY = e.clientY;
+          let didDrag = false;
+          let scrollCancelled = false;
+
+          const timer = setTimeout(() => {
+            if (scrollCancelled) return;
+            didDrag = true;
+            cleanup();
+            onDragStart?.(track.id, currentX, currentY);
+          }, 260);
+
+          const onMove = (mv: PointerEvent) => {
+            currentX = mv.clientX;
+            currentY = mv.clientY;
+            if (!scrollCancelled && Math.abs(mv.clientY - startY) > 8) {
+              scrollCancelled = true;
+              clearTimeout(timer);
+              cleanup();
+            }
+          };
+
+          const onUp = () => {
+            cleanup();
+            if (!didDrag && !scrollCancelled) setCollapsed((v) => !v);
+          };
+
+          const cleanup = () => {
+            clearTimeout(timer);
+            document.removeEventListener("pointermove", onMove);
+            document.removeEventListener("pointerup", onUp);
+            document.removeEventListener("pointercancel", onUp);
+          };
+
+          document.addEventListener("pointermove", onMove);
+          document.addEventListener("pointerup", onUp);
+          document.addEventListener("pointercancel", onUp);
+        }}
+      >
+        {/* Remove — left */}
         <button
-          onClick={() => setCollapsed((v) => !v)}
-          className="h-7 w-7 -ml-1 rounded-md text-[var(--text-faint)] hover:text-[var(--text-primary)] active:scale-95 flex items-center justify-center shrink-0 transition-colors"
-          aria-label={collapsed ? `Expand ${track.name}` : `Collapse ${track.name}`}
-          aria-expanded={!collapsed}
+          onClick={() => removeTrack(track.id)}
+          className="-ml-1 h-7 w-7 rounded-md text-[var(--text-faint)] hover:text-red-400 active:scale-95 flex items-center justify-center shrink-0 transition-colors"
+          aria-label={`Remove ${track.name}`}
         >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-            className={`transition-transform duration-150 ${collapsed ? "" : "rotate-90"}`}
-          >
-            <path d="M9 18l6-6-6-6" />
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <path d="M18 6L6 18M6 6l12 12" />
           </svg>
         </button>
+        {/* Collapse indicator — visual only */}
+        <div className="h-5 w-4 flex items-center justify-center shrink-0 pointer-events-none text-[var(--text-faint)]" aria-hidden="true">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform duration-150 ${collapsed ? "" : "rotate-90"}`}>
+            <path d="M9 18l6-6-6-6" />
+          </svg>
+        </div>
         <div className="min-w-0 flex-1 flex items-baseline gap-2">
           <div className="font-[family-name:var(--font-bebas)] tracking-[0.08em] text-sm text-[var(--text-primary)] truncate leading-none shrink-0">
             {track.name}
@@ -108,15 +153,10 @@ export function TrackRow({ track }: { track: TrackState }) {
         >
           N
         </ToggleButton>
-        <button
-          onClick={() => removeTrack(track.id)}
-          className="h-7 w-7 rounded-md text-[var(--text-faint)] hover:text-red-400 active:scale-95 flex items-center justify-center shrink-0 transition-colors"
-          aria-label={`Remove ${track.name}`}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-            <path d="M18 6L6 18M6 6l12 12" />
-          </svg>
-        </button>
+        {/* Grip — right, visual affordance for hold-to-drag */}
+        <div className="-mr-1 h-7 w-5 flex items-center justify-center shrink-0 pointer-events-none text-[var(--text-faint)]" aria-hidden="true">
+          <GripIcon />
+        </div>
       </header>
 
       {/* Collapsible body */}
@@ -214,6 +254,19 @@ export function TrackRow({ track }: { track: TrackState }) {
         )}
       </div>
     </article>
+  );
+}
+
+function GripIcon() {
+  return (
+    <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden="true">
+      <circle cx="3" cy="2.5" r="1.2" />
+      <circle cx="7" cy="2.5" r="1.2" />
+      <circle cx="3" cy="7"   r="1.2" />
+      <circle cx="7" cy="7"   r="1.2" />
+      <circle cx="3" cy="11.5" r="1.2" />
+      <circle cx="7" cy="11.5" r="1.2" />
+    </svg>
   );
 }
 

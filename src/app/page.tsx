@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useCypher } from "@/state/store";
 import { Transport } from "@/components/Transport";
 import { Timeline } from "@/components/Timeline";
@@ -20,13 +20,85 @@ export default function Home() {
   const isLoaded = useCypher((s) => s.isLoaded);
   const initProject = useCypher((s) => s.initProject);
   const createProject = useCypher((s) => s.createProject);
+  const reorderTracks = useCypher((s) => s.reorderTracks);
 
   const [splashDone, setSplashDone] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("track");
   const [showResume, setShowResume] = useState(false);
   const [showSongEditor, setShowSongEditor] = useState(false);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [draggingTrack, setDraggingTrack] = useState<(typeof tracks)[number] | null>(null);
+  const [insertBefore, setInsertBefore] = useState<number | null>(null);
   // Guard so the dialog only fires once per page load.
   const resumeChecked = useRef(false);
+  const insertBeforeRef = useRef<number | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const ghostRef = useRef<HTMLDivElement>(null);
+  const ghostOffsetY = useRef(0);
+  const ghostRectRef = useRef<{ left: number; top: number; width: number } | null>(null);
+
+  function handleDragStart(trackId: string, pointerX: number, pointerY: number) {
+    const fromIdx = tracks.findIndex((t) => t.id === trackId);
+    if (fromIdx === -1) return;
+
+    const cardEl = containerRef.current?.querySelector<HTMLElement>(
+      `[data-track-id="${trackId}"]`,
+    );
+    const rect = cardEl?.getBoundingClientRect();
+    if (rect) {
+      ghostRectRef.current = { left: rect.left, top: rect.top, width: rect.width };
+      ghostOffsetY.current = pointerY - rect.top;
+    }
+
+    setDraggingId(trackId);
+    setDraggingTrack(tracks[fromIdx]);
+    insertBeforeRef.current = null;
+
+    const onMove = (ev: PointerEvent) => {
+      // Direct DOM update — bypasses React for butter-smooth 60fps ghost movement.
+      if (ghostRef.current && ghostRectRef.current) {
+        const dy = ev.clientY - ghostOffsetY.current - ghostRectRef.current.top;
+        ghostRef.current.style.transform = `translateY(${dy}px) scale(1.025)`;
+      }
+
+      const container = containerRef.current;
+      if (!container) return;
+      const cards = Array.from(
+        container.querySelectorAll<HTMLElement>("[data-track-id]"),
+      );
+      let newInsertBefore = cards.length;
+      for (let i = 0; i < cards.length; i++) {
+        const r = cards[i].getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) {
+          newInsertBefore = i;
+          break;
+        }
+      }
+      if (newInsertBefore !== insertBeforeRef.current) {
+        insertBeforeRef.current = newInsertBefore;
+        setInsertBefore(newInsertBefore);
+      }
+    };
+
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+      const ib = insertBeforeRef.current;
+      if (ib !== null && ib !== fromIdx && ib !== fromIdx + 1) {
+        reorderTracks(fromIdx, ib > fromIdx ? ib - 1 : ib);
+      }
+      setDraggingId(null);
+      setDraggingTrack(null);
+      setInsertBefore(null);
+      insertBeforeRef.current = null;
+      ghostRectRef.current = null;
+    };
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
+  }
 
   useEffect(() => {
     initProject();
@@ -54,7 +126,7 @@ export default function Home() {
   if (!splashDone) {
     const letters = "CYPHER".split("");
     return (
-      <main className="flex-1 flex items-center justify-center text-[var(--text-primary)] min-h-[100dvh] overflow-hidden">
+      <main className="flex-1 flex items-center justify-center text-[var(--text-primary)] overflow-hidden">
         <h1
           aria-label="CYPHER"
           className="font-[family-name:var(--font-bebas)] text-6xl sm:text-7xl tracking-[0.12em] leading-none flex cypher-splash"
@@ -99,7 +171,7 @@ export default function Home() {
   }
 
   return (
-    <main className="flex-1 flex flex-col text-[var(--text-primary)] min-h-[100dvh]">
+    <main className="flex-1 flex flex-col text-[var(--text-primary)] overflow-hidden">
       {showResume && (
         <ResumeDialog
           projectName={projectName}
@@ -113,7 +185,7 @@ export default function Home() {
       )}
       <div className="sticky top-0 z-20 px-2 sm:px-3 pt-[max(env(safe-area-inset-top),0.5rem)] pb-2 bg-gradient-to-b from-[var(--bg-base)] via-[var(--bg-base)]/85 to-transparent">
         <div className="glass-raised rounded-2xl overflow-hidden">
-          <header className="px-3 sm:px-4 pt-3 pb-2 flex items-center gap-2">
+          <header className="px-3 sm:px-4 pt-5 pb-2 flex items-center gap-2">
             <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
               <h1 className="font-[family-name:var(--font-bebas)] text-3xl sm:text-[2rem] tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
                 CYPHER
@@ -131,13 +203,43 @@ export default function Home() {
         </div>
       </div>
       {viewMode === "track" ? (
-        <div className="flex-1 overflow-y-auto px-3 pt-2 space-y-1.5 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
-          {tracks.map((t) =>
-            t.kind === "sampler" ? (
-              <SamplerRow key={t.id} track={t} />
-            ) : (
-              <TrackRow key={t.id} track={t} />
-            ),
+        <div
+          ref={containerRef}
+          className="flex-1 overflow-y-auto px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] flex flex-col gap-1.5"
+        >
+          {tracks.map((t, i) => (
+            <Fragment key={t.id}>
+              {/* Insertion indicator — always rendered when dragging, fades in/out */}
+              {draggingId && (
+                <div
+                  className={`h-0.5 rounded-full mx-2 shrink-0 transition-all duration-150 ${
+                    insertBefore === i
+                      ? "bg-[var(--accent)] opacity-100 scale-x-100"
+                      : "opacity-0 scale-x-75"
+                  }`}
+                />
+              )}
+              <div
+                className={`shrink-0 transition-opacity duration-150 ${
+                  draggingId === t.id ? "opacity-0 pointer-events-none" : ""
+                }`}
+              >
+                {t.kind === "sampler" ? (
+                  <SamplerRow track={t} onDragStart={handleDragStart} />
+                ) : (
+                  <TrackRow track={t} onDragStart={handleDragStart} />
+                )}
+              </div>
+            </Fragment>
+          ))}
+          {draggingId && (
+            <div
+              className={`h-0.5 rounded-full mx-2 shrink-0 transition-all duration-150 ${
+                insertBefore === tracks.length
+                  ? "bg-[var(--accent)] opacity-100 scale-x-100"
+                  : "opacity-0 scale-x-75"
+              }`}
+            />
           )}
           <AddTrackButton variant="wide" />
         </div>
@@ -147,6 +249,50 @@ export default function Home() {
       <RecordingShield />
       {showSongEditor && (
         <SongEditor onClose={() => setShowSongEditor(false)} />
+      )}
+
+      {/* Drag ghost — fixed overlay, updated via direct DOM for 60fps smoothness */}
+      {draggingTrack && ghostRectRef.current && (
+        <div
+          ref={ghostRef}
+          className="fixed pointer-events-none z-[300]"
+          style={{
+            left: ghostRectRef.current.left,
+            top: ghostRectRef.current.top,
+            width: ghostRectRef.current.width,
+            transform: "scale(1.025)",
+            transformOrigin: "center top",
+            willChange: "transform",
+          }}
+        >
+          <article className="glass-raised rounded-xl border border-[var(--border-strong)] shadow-[0_28px_64px_-12px_rgba(0,0,0,0.8),0_0_0_1px_rgba(96,165,250,0.18)]">
+            <div className="flex items-center gap-2 px-3 py-2.5">
+              <svg
+                width="10"
+                height="14"
+                viewBox="0 0 10 14"
+                fill="rgba(96,165,250,0.55)"
+                aria-hidden="true"
+                className="shrink-0"
+              >
+                <circle cx="3" cy="2.5" r="1.2" />
+                <circle cx="7" cy="2.5" r="1.2" />
+                <circle cx="3" cy="7" r="1.2" />
+                <circle cx="7" cy="7" r="1.2" />
+                <circle cx="3" cy="11.5" r="1.2" />
+                <circle cx="7" cy="11.5" r="1.2" />
+              </svg>
+              <span className="font-[family-name:var(--font-bebas)] tracking-[0.08em] text-sm text-[var(--text-primary)] truncate">
+                {draggingTrack.name}
+              </span>
+              <span className="text-[10px] text-[var(--text-faint)] truncate">
+                {draggingTrack.kind === "sampler"
+                  ? "sampler"
+                  : (draggingTrack as { fileName?: string }).fileName ?? "audio"}
+              </span>
+            </div>
+          </article>
+        </div>
       )}
     </main>
   );

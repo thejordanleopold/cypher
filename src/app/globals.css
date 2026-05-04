@@ -36,6 +36,16 @@ html, body {
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
 }
+
+/* Disable accidental text selection everywhere except editable fields. */
+* {
+  user-select: none;
+  -webkit-user-select: none;
+}
+input, textarea, [contenteditable] {
+  user-select: text;
+  -webkit-user-select: text;
+}
 body {
   /* Layer the gradient stack directly on body so it tiles for any page
      height. background-attachment: fixed keeps the radial glows pinned to

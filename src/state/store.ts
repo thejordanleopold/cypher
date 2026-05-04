@@ -116,6 +116,7 @@ interface CypherState {
   initProject: () => Promise<void>;
   addTrack: (kind?: TrackKind) => Promise<void>;
   removeTrack: (id: string) => Promise<void>;
+  reorderTracks: (fromIdx: number, toIdx: number) => void;
   importFile: (id: string, file: File) => Promise<void>;
   loadPadSample: (trackId: string, padIdx: number, file: File) => Promise<void>;
   clearPadSample: (trackId: string, padIdx: number) => Promise<void>;
@@ -518,6 +519,17 @@ export const useCypher = create<CypherState>((set, get) => ({
     // Don't delete the audio blob here — a snapshot in undoStack still
     // references it. gcOrphanedAudio() cleans up once nothing does.
     set((s) => ({ tracks: s.tracks.filter((x) => x.id !== id) }));
+    schedulePersist(get());
+  },
+
+  reorderTracks: (fromIdx, toIdx) => {
+    pushHistory(get(), "reorderTracks");
+    set((s) => {
+      const arr = [...s.tracks];
+      const [item] = arr.splice(fromIdx, 1);
+      arr.splice(toIdx, 0, item);
+      return { tracks: arr };
+    });
     schedulePersist(get());
   },
 
