@@ -184,9 +184,12 @@ export default function Home() {
         />
       )}
       <div className="sticky top-0 z-20 px-2 sm:px-3 pt-[max(env(safe-area-inset-top),0.5rem)] pb-2 bg-gradient-to-b from-[var(--bg-base)] via-[var(--bg-base)]/85 to-transparent">
-        <h1 className="font-[family-name:var(--font-bebas)] text-[2.25rem] sm:text-[2.4rem] tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent px-1 pt-3 pb-2">
-          CYPHER
-        </h1>
+        <div className="flex items-center justify-between px-1 pt-3 pb-2">
+          <h1 className="font-[family-name:var(--font-bebas)] text-[2.25rem] sm:text-[2.4rem] tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
+            CYPHER
+          </h1>
+          <MainMenu />
+        </div>
         <div className="glass-raised rounded-2xl overflow-hidden">
           <header className="px-3 sm:px-4 pt-2 pb-2 flex items-center gap-2">
             <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
@@ -196,7 +199,6 @@ export default function Home() {
               </p>
             </div>
             <ViewToggle mode={viewMode} onChange={setViewMode} />
-            <MainMenu />
           </header>
           <Transport />
           <Timeline onOpenSongEditor={() => setShowSongEditor(true)} />
