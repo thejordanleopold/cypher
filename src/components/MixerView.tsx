@@ -14,7 +14,7 @@ export function MixerView() {
 
   return (
     <div className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden">
-      <div className="flex items-start gap-1.5 px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] min-w-min">
+      <div className="flex items-start justify-end gap-1.5 px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] min-w-min">
         {tracks.map((t) => (
           <ChannelStrip key={t.id} track={t} />
         ))}
