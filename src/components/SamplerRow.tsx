@@ -111,8 +111,8 @@ export function SamplerRow({ track }: { track: TrackState }) {
               />
             ))}
           </div>
-          {/* Tiny bank switcher */}
-          <div className="flex gap-0.5 shrink-0">
+          {/* Tiny bank switcher — 2×2 grid */}
+          <div className="grid grid-cols-2 gap-0.5 shrink-0">
             {(BANK_LABELS as readonly string[]).map((label, i) => {
               const isActive = i === activeBank;
               const hasContent = track.pads
