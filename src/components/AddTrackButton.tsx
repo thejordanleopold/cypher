@@ -19,7 +19,6 @@ interface PopoverPos {
 
 export function AddTrackButton({ variant, stripHeight }: Props) {
   const addTrack = useCypher((s) => s.addTrack);
-  const tracks = useCypher((s) => s.tracks);
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<PopoverPos | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -68,7 +67,6 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
 
   // Wide: two explicit side-by-side buttons, no popover needed.
   if (variant === "wide") {
-    const isEmpty = tracks.length === 0;
     return (
       <div className="flex gap-1.5">
         <button
@@ -76,8 +74,8 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
           className="glass flex-1 rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] px-4 py-2.5 text-sm font-medium active:scale-[0.99] transition-colors flex items-center justify-center gap-2"
           aria-label="Add audio track"
         >
-          <PlusIcon />
-          {isEmpty ? "Add your first track" : "Add Track"}
+          <MicIcon />
+          Add Audio Track
         </button>
         <button
           onClick={() => void addTrack("sampler")}
@@ -178,6 +176,17 @@ function PlusIcon({ size = 14 }: { size?: number }) {
       aria-hidden="true"
     >
       <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
+function MicIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9" y="2" width="6" height="11" rx="3" />
+      <path d="M5 10a7 7 0 0 0 14 0" />
+      <line x1="12" y1="19" x2="12" y2="22" />
+      <line x1="9" y1="22" x2="15" y2="22" />
     </svg>
   );
 }
