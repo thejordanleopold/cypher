@@ -33,10 +33,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Build (static export, basePath=/cypher)
-        env:
-          GH_PAGES: "1"
-          NEXT_PUBLIC_BASE_PATH: "/cypher"
+      - name: Build (static export)
         run: pnpm build
 
       # Disable Jekyll so files/folders starting with _ (e.g. _next) aren't ignored.
