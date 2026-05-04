@@ -45,7 +45,9 @@ const DEFAULT_PROJECT_ID = "default";
 
 export type TrackKind = "audio" | "sampler";
 
-export const SAMPLER_PAD_COUNT = 8;
+export const SAMPLER_BANK_COUNT = 4;
+export const SAMPLER_BANK_SIZE = 8;
+export const SAMPLER_PAD_COUNT = SAMPLER_BANK_COUNT * SAMPLER_BANK_SIZE; // 32 total
 
 export interface SamplerPadState {
   hasAudio: boolean;
@@ -53,6 +55,11 @@ export interface SamplerPadState {
   durationSec: number;
   audioKey: string | null;
   bufferRevision: number;
+}
+
+export interface SamplerEvent {
+  padIdx: number;
+  timeSec: number;
 }
 
 export interface TrackState {
@@ -76,6 +83,9 @@ export interface TrackState {
   normalized: boolean;
   normalizationGain: number;
   pads: SamplerPadState[];
+  // Sampler pattern recording — session-only (not persisted to IndexedDB).
+  samplerRecArmed: boolean;
+  samplerPattern: SamplerEvent[];
 }
 
 export const DEFAULT_INPUT_GAIN = 1;
@@ -138,6 +148,8 @@ interface CypherState {
   toggleArm: (id: string) => void;
   toggleNormalize: (id: string) => void;
   isMultiRecording: boolean;
+  armSamplerRecord: (id: string) => void;
+  clearSamplerPattern: (id: string) => void;
 
   countInBeats: number; // 0 = disabled, otherwise N beats of click before record
   setCountInBeats: (n: number) => void;
@@ -485,6 +497,19 @@ export const useCypher = create<CypherState>((set, get) => ({
     // anything else — iOS Safari treats post-await work as out-of-gesture.
     await getEngine().start();
     getEngine().triggerPad(trackId, padIdx);
+    // Record the hit if this sampler is armed and transport is rolling.
+    const s = get();
+    const track = s.tracks.find((t) => t.id === trackId);
+    if (track?.samplerRecArmed && s.isPlaying) {
+      const timeSec = getEngine().seconds();
+      set((s2) => ({
+        tracks: s2.tracks.map((t) =>
+          t.id === trackId
+            ? { ...t, samplerPattern: [...t.samplerPattern, { padIdx, timeSec }] }
+            : t,
+        ),
+      }));
+    }
   },
 
   removeTrack: async (id) => {
@@ -648,6 +673,19 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   play: async () => {
+    // Schedule sampler patterns before starting the transport so the Part
+    // is ready to fire. Skip if already playing to avoid destroying in-flight Parts.
+    if (!get().isPlaying) {
+      for (const t of get().tracks) {
+        if (t.kind !== "sampler") continue;
+        if (t.samplerRecArmed) {
+          // Recording mode: clear any old Part so playback doesn't interfere.
+          getEngine().clearSamplerPart(t.id);
+        } else if (t.samplerPattern.length > 0) {
+          getEngine().setSamplerPattern(t.id, t.samplerPattern);
+        }
+      }
+    }
     await getEngine().play();
     set({ isPlaying: true });
   },
@@ -812,6 +850,25 @@ export const useCypher = create<CypherState>((set, get) => ({
     }));
   },
 
+  armSamplerRecord: (id) => {
+    set((s) => ({
+      tracks: s.tracks.map((t) =>
+        t.id === id && t.kind === "sampler"
+          ? { ...t, samplerRecArmed: !t.samplerRecArmed }
+          : t,
+      ),
+    }));
+  },
+
+  clearSamplerPattern: (id) => {
+    getEngine().clearSamplerPart(id);
+    set((s) => ({
+      tracks: s.tracks.map((t) =>
+        t.id === id ? { ...t, samplerPattern: [] } : t,
+      ),
+    }));
+  },
+
   startArmedRecording: async () => {
     // Kick the AudioContext awake inside the user gesture; once we await
     // anything (enumerateDevices, getUserMedia) iOS Safari treats it as
@@ -842,6 +899,16 @@ export const useCypher = create<CypherState>((set, get) => ({
       }));
     }
     if (targets.length > 0) {
+      // Schedule sampler patterns for non-recording sampler tracks before
+      // the transport starts so they play back in sync during the take.
+      for (const t of get().tracks) {
+        if (t.kind !== "sampler") continue;
+        if (t.samplerRecArmed) {
+          getEngine().clearSamplerPart(t.id);
+        } else if (t.samplerPattern.length > 0) {
+          getEngine().setSamplerPattern(t.id, t.samplerPattern);
+        }
+      }
       try {
         await getEngine().startMultiRecording(
           targets.map((t) => ({
@@ -1007,6 +1074,8 @@ function emptyTrack(
     normalized: false,
     normalizationGain: 1,
     pads: kind === "sampler" ? emptyPads() : [],
+    samplerRecArmed: false,
+    samplerPattern: [],
   };
 }
 
@@ -1412,6 +1481,8 @@ async function loadProjectIntoEngine(id: string, set: Setter) {
       normalized: pt.normalized ?? false,
       normalizationGain: pt.normalizationGain ?? 1,
       pads,
+      samplerRecArmed: false,
+      samplerPattern: [],
     });
     if (hasAudio && pt.normalized && pt.normalizationGain && pt.normalizationGain !== 1) {
       engine.setNormalizationGain(pt.id, pt.normalizationGain);

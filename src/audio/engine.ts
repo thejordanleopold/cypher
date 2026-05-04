@@ -25,6 +25,9 @@ export interface Track {
   // Sampler pads. Indexed by pad slot; a missing entry = empty pad. Only
   // populated when kind === "sampler".
   pads: Map<number, AudioBuffer>;
+  // Transport-scheduled Part for sampler pattern playback. Null when no
+  // pattern has been recorded or the track is in record-armed mode.
+  samplerPart: Tone.Part | null;
 }
 
 interface RecordingSession {
@@ -182,19 +185,15 @@ function setAudioSessionType(type: AudioSessionType) {
   if (typeof navigator === "undefined") return;
   const nav = navigator as NavigatorWithAudioSession;
   if (!nav.audioSession) return;
-  // On iOS, every transition between "playback" and "play-and-record"
-  // forces the OS to reassign the output route (Playback → loud speaker;
-  // PlayAndRecord → receiver/earpiece). That manifests as audible
-  // re-routing the moment recording starts, then again when it stops.
-  // Pin the session to "play-and-record" if the API is available so the
-  // route stays stable across the entire app lifecycle. Quality of
-  // playback in PlayAndRecord on iOS 17+ is on par with Playback for
-  // music — the historical voice-profile downgrade only happens with
-  // the old "auto"/voice category.
-  const target: AudioSessionType =
-    type === "playback" ? "play-and-record" : type;
+  // Use "playback" during normal operation and only switch to "play-and-record"
+  // when a recording session is actually opening. The output bridge (<audio>
+  // element fed from a MediaStreamAudioDestinationNode) keeps audio on the
+  // loud speaker even while the session is in play-and-record mode, so the
+  // earpiece-routing concern from the old approach is already handled.
+  // Permanently pinning to "play-and-record" was causing iOS to show the
+  // orange mic indicator in the Dynamic Island even when not recording.
   try {
-    nav.audioSession.type = target;
+    nav.audioSession.type = type;
   } catch {
     // ignore — older browsers may treat the setter as read-only
   }
@@ -391,6 +390,7 @@ class AudioEngine {
       trimOutSec: null,
       normalizationGain: 1,
       pads: new Map(),
+      samplerPart: null,
     };
     this.tracks.set(id, track);
     return track;
@@ -412,8 +412,9 @@ class AudioEngine {
   // Fire a one-shot of the pad's sample through the track's gain/pan chain.
   // A fresh BufferSource is allocated per trigger so overlapping taps layer
   // instead of cancelling the previous play. The browser GCs the source once
-  // it ends.
-  triggerPad(id: TrackId, padIdx: number) {
+  // it ends. When `audioTime` is provided (from a scheduled Tone.Part), the
+  // source is started at that precise AudioContext time for accurate timing.
+  triggerPad(id: TrackId, padIdx: number, audioTime?: number) {
     const t = this.tracks.get(id);
     if (!t || !this.nativeCtx) return;
     const buf = t.pads.get(padIdx);
@@ -428,7 +429,42 @@ class AudioEngine {
     // Connect into the Tone.Gain's underlying input so volume/pan/mute apply.
     const gainInput = (t.gain as unknown as { input: AudioNode }).input;
     src.connect(gainInput);
-    src.start();
+    if (audioTime !== undefined) {
+      src.start(audioTime);
+    } else {
+      src.start();
+    }
+  }
+
+  // Build a Tone.Part from recorded events and schedule it to fire at the
+  // appropriate transport positions. Called from the store before transport
+  // starts so the Part is ready to fire on play. The Part calls triggerPad
+  // directly (not through the store) so the playback hits are not re-recorded.
+  setSamplerPattern(
+    id: TrackId,
+    events: Array<{ padIdx: number; timeSec: number }>,
+  ) {
+    const t = this.tracks.get(id);
+    if (!t) return;
+    t.samplerPart?.dispose();
+    t.samplerPart = null;
+    if (events.length === 0) return;
+    const part = new Tone.Part(
+      (time: number, val: { padIdx: number }) => {
+        this.triggerPad(id, val.padIdx, time);
+      },
+      events.map((e) => ({ time: e.timeSec, padIdx: e.padIdx })),
+    );
+    part.loop = false;
+    part.start(0);
+    t.samplerPart = part;
+  }
+
+  clearSamplerPart(id: TrackId) {
+    const t = this.tracks.get(id);
+    if (!t) return;
+    t.samplerPart?.dispose();
+    t.samplerPart = null;
   }
 
   async loadFileToPad(
@@ -454,6 +490,7 @@ class AudioEngine {
     const t = this.tracks.get(id);
     if (!t) return;
     t.player?.dispose();
+    t.samplerPart?.dispose();
     t.gain.dispose();
     t.panner.dispose();
     t.pads.clear();
@@ -465,6 +502,7 @@ class AudioEngine {
     Tone.getTransport().stop();
     for (const t of this.tracks.values()) {
       t.player?.dispose();
+      t.samplerPart?.dispose();
       t.gain.dispose();
       t.panner.dispose();
       t.pads.clear();

@@ -4,9 +4,12 @@ import { useRef, useState } from "react";
 import {
   useCypher,
   SAMPLER_PAD_COUNT,
+  SAMPLER_BANK_SIZE,
   type SamplerPadState,
   type TrackState,
 } from "@/state/store";
+
+const BANK_LABELS = ["A", "B", "C", "D"] as const;
 
 export function SamplerRow({ track }: { track: TrackState }) {
   const setVolume = useCypher((s) => s.setVolume);
@@ -14,7 +17,15 @@ export function SamplerRow({ track }: { track: TrackState }) {
   const toggleMute = useCypher((s) => s.toggleMute);
   const toggleSolo = useCypher((s) => s.toggleSolo);
   const removeTrack = useCypher((s) => s.removeTrack);
+  const armSamplerRecord = useCypher((s) => s.armSamplerRecord);
+  const clearSamplerPattern = useCypher((s) => s.clearSamplerPattern);
+  const isPlaying = useCypher((s) => s.isPlaying);
   const [collapsed, setCollapsed] = useState(false);
+  const [activeBank, setActiveBank] = useState(0);
+
+  const bankOffset = activeBank * SAMPLER_BANK_SIZE;
+  const bankPads = track.pads.slice(bankOffset, bankOffset + SAMPLER_BANK_SIZE);
+  const totalLoaded = track.pads.filter((p) => p.hasAudio).length;
 
   return (
     <article className="glass rounded-xl" aria-label={track.name}>
@@ -45,7 +56,7 @@ export function SamplerRow({ track }: { track: TrackState }) {
             {track.name}
           </div>
           <div className="text-[10px] text-[var(--text-faint)] truncate leading-none">
-            sampler · {track.pads.filter((p) => p.hasAudio).length}/{SAMPLER_PAD_COUNT} loaded
+            sampler · {totalLoaded}/{SAMPLER_PAD_COUNT} loaded
           </div>
         </div>
         <ToggleButton
@@ -63,6 +74,18 @@ export function SamplerRow({ track }: { track: TrackState }) {
           onClick={() => toggleSolo(track.id)}
         >
           S
+        </ToggleButton>
+        <ToggleButton
+          active={track.samplerRecArmed}
+          activeClass="bg-red-600 text-white"
+          ariaLabel={
+            track.samplerRecArmed
+              ? "Disable pattern recording"
+              : "Enable pattern recording — pad hits will be recorded while transport plays"
+          }
+          onClick={() => armSamplerRecord(track.id)}
+        >
+          ●
         </ToggleButton>
         <button
           onClick={() => removeTrack(track.id)}
@@ -110,7 +133,75 @@ export function SamplerRow({ track }: { track: TrackState }) {
                 }
               />
             </div>
-            <PadGrid trackId={track.id} pads={track.pads} />
+            {(track.samplerRecArmed || track.samplerPattern.length > 0) && (
+              <div className="flex items-center gap-2 text-[9px] leading-none">
+                {track.samplerRecArmed && (
+                  <span
+                    className={`flex items-center gap-1 font-bold tracking-wider uppercase ${
+                      isPlaying ? "text-red-400" : "text-[var(--text-muted)]"
+                    }`}
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full bg-red-500 ${
+                        isPlaying ? "animate-pulse" : "opacity-50"
+                      }`}
+                    />
+                    {isPlaying ? "Recording" : "Rec armed"}
+                  </span>
+                )}
+                {track.samplerPattern.length > 0 && (
+                  <>
+                    {track.samplerRecArmed && (
+                      <span className="text-[var(--border-strong)]">·</span>
+                    )}
+                    <span className="text-[var(--text-faint)]">
+                      {track.samplerPattern.length}{" "}
+                      {track.samplerPattern.length === 1 ? "event" : "events"}
+                    </span>
+                    <button
+                      onClick={() => clearSamplerPattern(track.id)}
+                      className="text-[var(--text-faint)] hover:text-red-400 transition-colors uppercase tracking-wider"
+                    >
+                      Clear
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+            <div className="flex gap-1.5 items-stretch">
+              <PadGrid trackId={track.id} pads={bankPads} bankOffset={bankOffset} />
+              <div className="flex flex-col gap-1 w-7 shrink-0">
+                {(BANK_LABELS as readonly string[]).map((label, i) => {
+                  const start = i * SAMPLER_BANK_SIZE;
+                  const hasContent = track.pads
+                    .slice(start, start + SAMPLER_BANK_SIZE)
+                    .some((p) => p.hasAudio);
+                  const isActive = i === activeBank;
+                  return (
+                    <button
+                      key={label}
+                      onClick={() => setActiveBank(i)}
+                      aria-label={`Bank ${label}`}
+                      aria-pressed={isActive}
+                      className={`flex-1 rounded-md text-[10px] font-bold tracking-wide flex flex-col items-center justify-center gap-0.5 transition-colors ${
+                        isActive
+                          ? "bg-[var(--accent)] text-[#031024]"
+                          : "bg-white/[0.05] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-white/[0.09] hover:text-[var(--text-primary)]"
+                      }`}
+                    >
+                      {label}
+                      {hasContent && (
+                        <span
+                          className={`w-1 h-1 rounded-full ${
+                            isActive ? "bg-[#031024]/50" : "bg-[var(--accent)]"
+                          }`}
+                        />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -121,14 +212,16 @@ export function SamplerRow({ track }: { track: TrackState }) {
 function PadGrid({
   trackId,
   pads,
+  bankOffset,
 }: {
   trackId: string;
   pads: SamplerPadState[];
+  bankOffset: number;
 }) {
   return (
-    <div className="grid grid-cols-4 gap-1.5">
+    <div className="flex-1 grid grid-cols-4 gap-1.5">
       {pads.map((pad, i) => (
-        <Pad key={i} trackId={trackId} padIdx={i} pad={pad} />
+        <Pad key={bankOffset + i} trackId={trackId} padIdx={bankOffset + i} pad={pad} />
       ))}
     </div>
   );
@@ -199,7 +292,7 @@ function Pad({
         }`}
       >
         <span className="text-[9px] uppercase tracking-[0.16em] opacity-70">
-          {padIdx + 1}
+          {(padIdx % SAMPLER_BANK_SIZE) + 1}
         </span>
         <span className="px-1 truncate max-w-full text-[10px] leading-tight">
           {pad.hasAudio ? padLabel(pad.fileName) : "+"}
