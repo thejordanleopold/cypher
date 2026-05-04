@@ -4,11 +4,14 @@ import { useEffect, useRef, useState } from "react";
 import { useCypher } from "@/state/store";
 import { getEngine } from "@/audio/engine";
 
-export function Timeline() {
+const DOUBLE_TAP_MS = 300;
+
+export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }) {
   const tracks = useCypher((s) => s.tracks);
   const isPlaying = useCypher((s) => s.isPlaying);
   const seek = useCypher((s) => s.seek);
   const pause = useCypher((s) => s.pause);
+  const lastTapRef = useRef(0);
 
   const duration = Math.max(
     0,
@@ -56,6 +59,17 @@ export function Timeline() {
 
   function onPointerDown(e: React.PointerEvent) {
     if (duration === 0) return;
+
+    // Double-tap opens the song editor.
+    const now = Date.now();
+    const delta = now - lastTapRef.current;
+    if (delta > 0 && delta < DOUBLE_TAP_MS) {
+      lastTapRef.current = 0;
+      onOpenSongEditor?.();
+      return;
+    }
+    lastTapRef.current = now;
+
     railRef.current?.setPointerCapture(e.pointerId);
     setScrubbing(true);
     const s = pointToSeconds(e.clientX);
@@ -112,6 +126,7 @@ export function Timeline() {
               seek(duration);
             }
           }}
+          title={hasAudio ? "Double-tap to open song editor" : undefined}
           className={`flex-1 h-7 relative rounded-md bg-white/[0.04] border border-[var(--border-subtle)] overflow-hidden select-none ${
             hasAudio ? "cursor-pointer" : "cursor-default opacity-60"
           }`}

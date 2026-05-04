@@ -151,3 +151,12 @@ input[type="number"] {
     transform: translateY(0) scale(1);
   }
 }
+
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}

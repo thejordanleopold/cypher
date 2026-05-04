@@ -141,10 +141,11 @@ export async function duplicateProject(
   for (const t of source.tracks) {
     let newAudioKey: string | null = null;
     if (t.audioKey) {
-      const blob = (await db.get(AUDIO_STORE, t.audioKey)) as Blob | undefined;
-      if (blob) {
+      const stored = (await db.get(AUDIO_STORE, t.audioKey)) as ArrayBuffer | Blob | undefined;
+      if (stored) {
+        const buf = stored instanceof ArrayBuffer ? stored : await stored.arrayBuffer();
         newAudioKey = `audio:${newId}:${t.id}:${now}`;
-        await db.put(AUDIO_STORE, blob, newAudioKey);
+        await db.put(AUDIO_STORE, buf, newAudioKey);
       }
     }
     let newPads: PersistedSamplerPad[] | undefined;
@@ -154,10 +155,11 @@ export async function duplicateProject(
         const p = t.pads[i];
         let padKey: string | null = null;
         if (p.audioKey) {
-          const blob = (await db.get(AUDIO_STORE, p.audioKey)) as Blob | undefined;
-          if (blob) {
+          const stored = (await db.get(AUDIO_STORE, p.audioKey)) as ArrayBuffer | Blob | undefined;
+          if (stored) {
+            const buf = stored instanceof ArrayBuffer ? stored : await stored.arrayBuffer();
             padKey = `audio:${newId}:${t.id}:pad${i}:${now}`;
-            await db.put(AUDIO_STORE, blob, padKey);
+            await db.put(AUDIO_STORE, buf, padKey);
           }
         }
         newPads.push({ ...p, audioKey: padKey });
@@ -180,14 +182,21 @@ export async function duplicateProject(
 
 // ---- Audio ----
 
-export async function saveAudio(key: string, blob: Blob) {
+export async function saveAudio(key: string, data: Blob | ArrayBuffer) {
   const db = await getDb();
-  await db.put(AUDIO_STORE, blob, key);
+  // Always store ArrayBuffer — Blob is not reliably cloneable by the structured
+  // clone algorithm in Safari/WebKit, causing DataCloneError on IDB writes.
+  const buf = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+  await db.put(AUDIO_STORE, buf, key);
 }
 
 export async function loadAudio(key: string): Promise<Blob | undefined> {
   const db = await getDb();
-  return db.get(AUDIO_STORE, key);
+  const stored = await db.get(AUDIO_STORE, key);
+  if (!stored) return undefined;
+  // New format: ArrayBuffer. Legacy format: Blob (from before this fix).
+  if (stored instanceof ArrayBuffer) return new Blob([stored]);
+  return stored as Blob;
 }
 
 export async function deleteAudio(key: string) {

@@ -10,6 +10,7 @@ import { MainMenu } from "@/components/MainMenu";
 import { RecordingShield } from "@/components/RecordingShield";
 import { MixerView } from "@/components/MixerView";
 import { AddTrackButton } from "@/components/AddTrackButton";
+import { SongEditor } from "@/components/SongEditor";
 
 type ViewMode = "track" | "mixer";
 
@@ -23,6 +24,7 @@ export default function Home() {
   const [splashDone, setSplashDone] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("track");
   const [showResume, setShowResume] = useState(false);
+  const [showSongEditor, setShowSongEditor] = useState(false);
   // Guard so the dialog only fires once per page load.
   const resumeChecked = useRef(false);
 
@@ -125,7 +127,7 @@ export default function Home() {
             <MainMenu />
           </header>
           <Transport />
-          <Timeline />
+          <Timeline onOpenSongEditor={() => setShowSongEditor(true)} />
         </div>
       </div>
       {viewMode === "track" ? (
@@ -143,6 +145,9 @@ export default function Home() {
         <MixerView />
       )}
       <RecordingShield />
+      {showSongEditor && (
+        <SongEditor onClose={() => setShowSongEditor(false)} />
+      )}
     </main>
   );
 }
