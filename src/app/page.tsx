@@ -188,7 +188,7 @@ export default function Home() {
           CYPHER
         </h1>
         <div className="glass-raised rounded-2xl overflow-hidden">
-          <header className="px-3 sm:px-4 pt-3 pb-2 flex items-center gap-2">
+          <header className="px-3 sm:px-4 pt-1.5 pb-2 flex items-center gap-2">
             <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
               <span aria-hidden="true" className="text-[var(--text-faint)] text-[11px] leading-none">/</span>
               <p className="text-[11px] text-[var(--text-muted)] truncate min-w-0 leading-none">
