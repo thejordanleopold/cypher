@@ -104,6 +104,7 @@ interface CypherState {
   currentProjectName: string;
   projects: ProjectSummary[];
   isLoaded: boolean;
+  isDemoMode: boolean;
   refreshProjects: () => Promise<void>;
   createProject: (name?: string) => Promise<void>;
   startDemo: () => Promise<void>;
@@ -214,6 +215,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   currentProjectName: "Untitled",
   projects: [],
   isLoaded: false,
+  isDemoMode: false,
   lastSavedAt: null,
   toasts: [],
   countInBeats: 0,
@@ -366,6 +368,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   createProject: async (name = "Untitled") => {
     const id = makeId();
     await switchToProject(id, name, /* initialTracks */ false, set);
+    set({ isDemoMode: false });
     await get().refreshProjects();
   },
 
@@ -373,6 +376,7 @@ export const useCypher = create<CypherState>((set, get) => ({
     void getEngine().start();
     const id = makeId();
     await switchToProject(id, "Demo", false, set);
+    set({ isDemoMode: true });
     await get().refreshProjects();
 
     const audioId = nextId();
@@ -413,6 +417,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   openProject: async (id) => {
     if (id === get().currentProjectId) return;
     await loadProjectIntoEngine(id, set);
+    set({ isDemoMode: false });
     await get().refreshProjects();
   },
 

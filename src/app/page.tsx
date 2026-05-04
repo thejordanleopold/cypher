@@ -21,6 +21,7 @@ export default function Home() {
   const initProject = useCypher((s) => s.initProject);
   const createProject = useCypher((s) => s.createProject);
   const startDemo = useCypher((s) => s.startDemo);
+  const isDemoMode = useCypher((s) => s.isDemoMode);
   const reorderTracks = useCypher((s) => s.reorderTracks);
 
   const [splashDone, setSplashDone] = useState(false);
@@ -195,12 +196,16 @@ export default function Home() {
               type="button"
               disabled={demoLoading}
               onClick={async () => {
-                setDemoLoading(true);
-                try { await startDemo(); } finally { setDemoLoading(false); }
+                if (isDemoMode) {
+                  await createProject();
+                } else {
+                  setDemoLoading(true);
+                  try { await startDemo(); } finally { setDemoLoading(false); }
+                }
               }}
               className="h-9 px-3 rounded-md glass border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[10px] uppercase tracking-[0.16em] font-semibold active:scale-95 transition-colors disabled:opacity-50 disabled:pointer-events-none"
             >
-              {demoLoading ? "Loading…" : "Start Demo"}
+              {demoLoading ? "Loading…" : isDemoMode ? "Exit Demo" : "Start Demo"}
             </button>
             <MainMenu />
           </div>
