@@ -20,12 +20,14 @@ export default function Home() {
   const isLoaded = useCypher((s) => s.isLoaded);
   const initProject = useCypher((s) => s.initProject);
   const createProject = useCypher((s) => s.createProject);
+  const startDemo = useCypher((s) => s.startDemo);
   const reorderTracks = useCypher((s) => s.reorderTracks);
 
   const [splashDone, setSplashDone] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("track");
   const [showResume, setShowResume] = useState(false);
   const [showSongEditor, setShowSongEditor] = useState(false);
+  const [demoLoading, setDemoLoading] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [draggingTrack, setDraggingTrack] = useState<(typeof tracks)[number] | null>(null);
   const [insertBefore, setInsertBefore] = useState<number | null>(null);
@@ -188,7 +190,20 @@ export default function Home() {
           <h1 className="font-[family-name:var(--font-bebas)] text-[2.25rem] sm:text-[2.4rem] tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
             CYPHER
           </h1>
-          <MainMenu />
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={demoLoading}
+              onClick={async () => {
+                setDemoLoading(true);
+                try { await startDemo(); } finally { setDemoLoading(false); }
+              }}
+              className="h-9 px-3 rounded-md glass border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[10px] uppercase tracking-[0.16em] font-semibold active:scale-95 transition-colors disabled:opacity-50 disabled:pointer-events-none"
+            >
+              {demoLoading ? "Loading…" : "Start Demo"}
+            </button>
+            <MainMenu />
+          </div>
         </div>
         <div className="glass-raised rounded-2xl overflow-hidden">
           <header className="px-3 sm:px-4 pt-2 pb-2 flex items-center gap-2">

@@ -106,6 +106,7 @@ interface CypherState {
   isLoaded: boolean;
   refreshProjects: () => Promise<void>;
   createProject: (name?: string) => Promise<void>;
+  startDemo: () => Promise<void>;
   openProject: (id: string) => Promise<void>;
   renameProject: (name: string) => Promise<void>;
   saveProjectAs: (name: string) => Promise<void>;
@@ -366,6 +367,47 @@ export const useCypher = create<CypherState>((set, get) => ({
     const id = makeId();
     await switchToProject(id, name, /* initialTracks */ false, set);
     await get().refreshProjects();
+  },
+
+  startDemo: async () => {
+    void getEngine().start();
+    const id = makeId();
+    await switchToProject(id, "Demo", false, set);
+    await get().refreshProjects();
+
+    const audioId = nextId();
+    await getEngine().addTrack(audioId, "Track 1", "audio");
+    const audioT = emptyTrack(audioId, "Track 1", "audio");
+    audioT.inputDeviceId = get().defaultInputDeviceId;
+    set((s) => ({ tracks: [...s.tracks, audioT] }));
+
+    const samplerId = nextId();
+    await getEngine().addTrack(samplerId, "Drum Kit", "sampler");
+    const samplerT = emptyTrack(samplerId, "Drum Kit", "sampler");
+    set((s) => ({ tracks: [...s.tracks, samplerT] }));
+
+    schedulePersist(get());
+
+    const DEMO_PADS: Array<{ url: string; name: string }> = [
+      { url: "/demo/neptunes-80.wav",   name: "[CC] Neptunes (80).wav" },
+      { url: "/demo/bang-bang-808.wav", name: "Bang Bang 808.wav" },
+      { url: "/demo/desire-clap.wav",   name: "Desire Clap.wav" },
+      { url: "/demo/tr808hh1.wav",      name: "TR808HH1.WAV" },
+      { url: "/demo/clap-yikes.wav",    name: "Clap (Yikes).wav" },
+      { url: "/demo/kanye-vox.wav",     name: "Kanye Vox.wav" },
+    ];
+
+    for (let i = 0; i < DEMO_PADS.length; i++) {
+      const { url, name } = DEMO_PADS[i];
+      try {
+        const resp = await fetch(url);
+        const blob = await resp.blob();
+        const file = new File([blob], name, { type: "audio/wav" });
+        await get().loadPadSample(samplerId, i, file);
+      } catch {
+        // skip failed pad, continue loading the rest
+      }
+    }
   },
 
   openProject: async (id) => {
