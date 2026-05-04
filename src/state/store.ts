@@ -379,16 +379,16 @@ export const useCypher = create<CypherState>((set, get) => ({
     set({ isDemoMode: true });
     await get().refreshProjects();
 
+    const samplerId = nextId();
+    await getEngine().addTrack(samplerId, "Drum Kit", "sampler");
+    const samplerT = emptyTrack(samplerId, "Drum Kit", "sampler");
+    set((s) => ({ tracks: [...s.tracks, samplerT] }));
+
     const audioId = nextId();
     await getEngine().addTrack(audioId, "Track 1", "audio");
     const audioT = emptyTrack(audioId, "Track 1", "audio");
     audioT.inputDeviceId = get().defaultInputDeviceId;
     set((s) => ({ tracks: [...s.tracks, audioT] }));
-
-    const samplerId = nextId();
-    await getEngine().addTrack(samplerId, "Drum Kit", "sampler");
-    const samplerT = emptyTrack(samplerId, "Drum Kit", "sampler");
-    set((s) => ({ tracks: [...s.tracks, samplerT] }));
 
     schedulePersist(get());
 
