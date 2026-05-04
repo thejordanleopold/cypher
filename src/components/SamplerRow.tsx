@@ -98,51 +98,45 @@ export function SamplerRow({ track }: { track: TrackState }) {
         </button>
       </header>
 
-      {/* Compact pad grid — visible only when collapsed */}
+      {/* Compact pad strip — single horizontal row when collapsed */}
       {collapsed && (
-        <div className="px-2.5 pb-2 pt-1">
-          <div className="flex gap-1.5 items-stretch">
-            <div className="flex-1 grid grid-cols-4 gap-1">
-              {bankPads.map((pad, i) => (
-                <CompactPad
-                  key={bankOffset + i}
-                  trackId={track.id}
-                  padIdx={bankOffset + i}
-                  pad={pad}
-                />
-              ))}
-            </div>
-            <div className="flex flex-col gap-1 w-6 shrink-0">
-              {(BANK_LABELS as readonly string[]).map((label, i) => {
-                const start = i * SAMPLER_BANK_SIZE;
-                const hasContent = track.pads
-                  .slice(start, start + SAMPLER_BANK_SIZE)
-                  .some((p) => p.hasAudio);
-                const isActive = i === activeBank;
-                return (
-                  <button
-                    key={label}
-                    onClick={() => setActiveBank(i)}
-                    aria-label={`Bank ${label}`}
-                    aria-pressed={isActive}
-                    className={`flex-1 rounded text-[9px] font-bold tracking-wide flex flex-col items-center justify-center gap-0.5 transition-colors ${
-                      isActive
-                        ? "bg-[var(--accent)] text-[#031024]"
-                        : "bg-white/[0.05] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-white/[0.09] hover:text-[var(--text-primary)]"
-                    }`}
-                  >
-                    {label}
-                    {hasContent && (
-                      <span
-                        className={`w-1 h-1 rounded-full ${
-                          isActive ? "bg-[#031024]/50" : "bg-[var(--accent)]"
-                        }`}
-                      />
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+        <div className="px-2.5 pb-2 pt-1 flex items-center gap-1.5">
+          <div className="flex-1 grid grid-cols-8 gap-1">
+            {bankPads.map((pad, i) => (
+              <CompactPad
+                key={bankOffset + i}
+                trackId={track.id}
+                padIdx={bankOffset + i}
+                pad={pad}
+              />
+            ))}
+          </div>
+          {/* Tiny bank switcher */}
+          <div className="flex gap-0.5 shrink-0">
+            {(BANK_LABELS as readonly string[]).map((label, i) => {
+              const isActive = i === activeBank;
+              const hasContent = track.pads
+                .slice(i * SAMPLER_BANK_SIZE, i * SAMPLER_BANK_SIZE + SAMPLER_BANK_SIZE)
+                .some((p) => p.hasAudio);
+              return (
+                <button
+                  key={label}
+                  onClick={() => setActiveBank(i)}
+                  aria-label={`Bank ${label}`}
+                  aria-pressed={isActive}
+                  className={`w-5 h-5 rounded text-[8px] font-bold flex items-center justify-center transition-colors relative ${
+                    isActive
+                      ? "bg-[var(--accent)] text-[#031024]"
+                      : "bg-white/[0.05] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-white/[0.09]"
+                  }`}
+                >
+                  {label}
+                  {hasContent && !isActive && (
+                    <span className="absolute top-0 right-0 w-1 h-1 rounded-full bg-[var(--accent)] translate-x-0.5 -translate-y-0.5" />
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
