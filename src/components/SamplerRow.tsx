@@ -98,6 +98,55 @@ export function SamplerRow({ track }: { track: TrackState }) {
         </button>
       </header>
 
+      {/* Compact pad grid — visible only when collapsed */}
+      {collapsed && (
+        <div className="px-2.5 pb-2 pt-1">
+          <div className="flex gap-1.5 items-stretch">
+            <div className="flex-1 grid grid-cols-4 gap-1">
+              {bankPads.map((pad, i) => (
+                <CompactPad
+                  key={bankOffset + i}
+                  trackId={track.id}
+                  padIdx={bankOffset + i}
+                  pad={pad}
+                />
+              ))}
+            </div>
+            <div className="flex flex-col gap-1 w-6 shrink-0">
+              {(BANK_LABELS as readonly string[]).map((label, i) => {
+                const start = i * SAMPLER_BANK_SIZE;
+                const hasContent = track.pads
+                  .slice(start, start + SAMPLER_BANK_SIZE)
+                  .some((p) => p.hasAudio);
+                const isActive = i === activeBank;
+                return (
+                  <button
+                    key={label}
+                    onClick={() => setActiveBank(i)}
+                    aria-label={`Bank ${label}`}
+                    aria-pressed={isActive}
+                    className={`flex-1 rounded text-[9px] font-bold tracking-wide flex flex-col items-center justify-center gap-0.5 transition-colors ${
+                      isActive
+                        ? "bg-[var(--accent)] text-[#031024]"
+                        : "bg-white/[0.05] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-white/[0.09] hover:text-[var(--text-primary)]"
+                    }`}
+                  >
+                    {label}
+                    {hasContent && (
+                      <span
+                        className={`w-1 h-1 rounded-full ${
+                          isActive ? "bg-[#031024]/50" : "bg-[var(--accent)]"
+                        }`}
+                      />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div
         className={`grid transition-[grid-template-rows] duration-200 ease-out ${
           collapsed ? "grid-rows-[0fr]" : "grid-rows-[1fr]"
@@ -349,6 +398,52 @@ function Pad({
         }}
       />
     </div>
+  );
+}
+
+function CompactPad({
+  trackId,
+  padIdx,
+  pad,
+}: {
+  trackId: string;
+  padIdx: number;
+  pad: SamplerPadState;
+}) {
+  const triggerPad = useCypher((s) => s.triggerPad);
+  const [active, setActive] = useState(false);
+
+  const onTap = () => {
+    if (!pad.hasAudio) return;
+    setActive(true);
+    void triggerPad(trackId, padIdx);
+    window.setTimeout(() => setActive(false), 120);
+  };
+
+  return (
+    <button
+      onPointerDown={(e) => {
+        e.preventDefault();
+        onTap();
+      }}
+      aria-label={
+        pad.hasAudio
+          ? `Trigger pad ${(padIdx % SAMPLER_BANK_SIZE) + 1}: ${pad.fileName ?? "sample"}`
+          : `Pad ${(padIdx % SAMPLER_BANK_SIZE) + 1} — empty`
+      }
+      className={`aspect-square rounded border text-[8px] flex flex-col items-center justify-center gap-px transition-colors select-none touch-none ${
+        active
+          ? "bg-[var(--accent)] text-[#031024] border-[var(--accent)]"
+          : pad.hasAudio
+          ? "bg-white/[0.08] hover:bg-white/[0.12] border-[var(--border-subtle)] text-[var(--text-muted)]"
+          : "bg-white/[0.02] border-dashed border-[var(--border-subtle)] opacity-30"
+      }`}
+    >
+      <span className="opacity-60 leading-none">{(padIdx % SAMPLER_BANK_SIZE) + 1}</span>
+      {pad.hasAudio && (
+        <span className="w-1 h-1 rounded-full bg-current opacity-50" />
+      )}
+    </button>
   );
 }
 
