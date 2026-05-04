@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import WaveSurfer from "wavesurfer.js";
 import { getEngine } from "@/audio/engine";
-import { audioBufferToWavBlob } from "@/audio/wav";
 import { useCypher } from "@/state/store";
 
 interface WaveformProps {
@@ -20,6 +18,55 @@ const MIN_TRIM_GAP_SEC = 0.05;
 const SNAP_TO_END_SEC = 0.01;
 const DOUBLE_TAP_MS = 320;
 
+// Draw min/max peaks per pixel column directly from the AudioBuffer for
+// maximum fidelity. Averages all channels so stereo and mono both look right.
+function drawWaveformToCanvas(canvas: HTMLCanvasElement, buffer: AudioBuffer) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth;
+  const cssH = canvas.clientHeight;
+  if (cssW === 0 || cssH === 0) return;
+
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const numChannels = buffer.numberOfChannels;
+  const numSamples = buffer.length;
+  // Pre-read so we avoid repeated getChannelData calls in the inner loop.
+  const channels: Float32Array[] = [];
+  for (let c = 0; c < numChannels; c++) channels.push(buffer.getChannelData(c));
+
+  const numCols = Math.floor(cssW);
+  const samplesPerCol = numSamples / numCols;
+  const mid = cssH / 2;
+
+  ctx.fillStyle = "#4e7fc4";
+
+  for (let col = 0; col < numCols; col++) {
+    const start = Math.floor(col * samplesPerCol);
+    const end = Math.min(numSamples, Math.floor((col + 1) * samplesPerCol));
+    let min = 0;
+    let max = 0;
+    for (let j = start; j < end; j++) {
+      // Average across channels for a true mono representation.
+      let s = 0;
+      for (let c = 0; c < numChannels; c++) s += channels[c][j];
+      s /= numChannels;
+      if (s < min) min = s;
+      if (s > max) max = s;
+    }
+    // Clamp to [-1, 1].
+    min = Math.max(-1, Math.min(1, min));
+    max = Math.max(-1, Math.min(1, max));
+    const barH = Math.max(1, (max - min) * mid);
+    ctx.fillRect(col, mid - max * mid, 1, barH);
+  }
+}
+
 export function Waveform({
   trackId,
   hasAudio,
@@ -28,9 +75,8 @@ export function Waveform({
   trimOutSec,
   durationSec,
 }: WaveformProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
-  const waveContainerRef = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<WaveSurfer | null>(null);
   const lastTapRef = useRef(0);
   const setTrim = useCypher((s) => s.setTrim);
   const [activeSide, setActiveSide] = useState<"left" | "right" | null>(null);
@@ -44,37 +90,24 @@ export function Waveform({
     trimInSec > 0.001 ||
     (trimOutSec !== null && trimOutSec < safeDuration - SNAP_TO_END_SEC);
 
+  // Redraw whenever the buffer changes or the canvas is resized.
   useEffect(() => {
-    if (!waveContainerRef.current) return;
-    const ws = WaveSurfer.create({
-      container: waveContainerRef.current,
-      height: 36,
-      waveColor: "#324264",
-      progressColor: "#60a5fa",
-      cursorColor: "transparent",
-      barWidth: 2,
-      barGap: 1,
-      barRadius: 1,
-      interact: false,
-      normalize: true,
-    });
-    wsRef.current = ws;
-    return () => {
-      ws.destroy();
-      wsRef.current = null;
-    };
-  }, [trackId]);
+    const canvas = canvasRef.current;
+    if (!canvas || !hasAudio) return;
 
-  useEffect(() => {
-    const ws = wsRef.current;
-    if (!ws || !hasAudio) return;
-    const buf = getEngine().getTrack(trackId)?.buffer;
-    if (!buf) return;
-    ws.loadBlob(audioBufferToWavBlob(buf)).catch(() => {});
+    const draw = () => {
+      const buf = getEngine().getTrack(trackId)?.buffer;
+      if (buf) drawWaveformToCanvas(canvas, buf);
+    };
+
+    draw();
+
+    const ro = new ResizeObserver(draw);
+    ro.observe(canvas);
+    return () => ro.disconnect();
   }, [trackId, hasAudio, bufferRevision]);
 
   function onTrackPointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    // Handle taps manage their own pointer events — ignore them here.
     const target = e.target as HTMLElement;
     if (target.closest("[data-trim-handle]")) return;
     const now = Date.now();
@@ -90,7 +123,6 @@ export function Waveform({
   function startDrag(side: "left" | "right") {
     return (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
-      // Don't let the tap bubble into the parent's double-tap detection.
       e.stopPropagation();
       e.currentTarget.setPointerCapture(e.pointerId);
       setActiveSide(side);
@@ -106,8 +138,6 @@ export function Waveform({
         } else {
           const minOut = trimInSec + MIN_TRIM_GAP_SEC;
           const newOut = Math.max(sec, minOut);
-          // Snap back to "open" trim when dragged to the very end so the
-          // saved value matches the buffer length even if the user grew it.
           const snapped = newOut >= safeDuration - SNAP_TO_END_SEC ? null : newOut;
           setTrim(trackId, trimInSec, snapped);
         }
@@ -115,9 +145,7 @@ export function Waveform({
       const onUp = (ev: PointerEvent) => {
         try {
           (ev.target as Element)?.releasePointerCapture?.(ev.pointerId);
-        } catch {
-          // ignore — pointer capture may already be lost
-        }
+        } catch { /* ignore */ }
         document.removeEventListener("pointermove", onMove);
         document.removeEventListener("pointerup", onUp);
         document.removeEventListener("pointercancel", onUp);
@@ -131,7 +159,7 @@ export function Waveform({
 
   return (
     <div className="relative select-none pt-3.5">
-      {/* Time labels — visible while a handle is being dragged */}
+      {/* Time labels during handle drag */}
       <div
         className={`pointer-events-none absolute inset-x-0 top-0 h-3 transition-opacity duration-150 ${
           activeSide ? "opacity-100" : "opacity-0"
@@ -149,26 +177,23 @@ export function Waveform({
         }`}
         title={trimMode ? "Double tap to exit trim" : "Double tap to trim"}
       >
-        {/* Wave + dim overlays — clipped to the rounded track */}
+        {/* Canvas + dim overlays */}
         <div className="absolute inset-0 rounded-md overflow-hidden bg-neutral-900/50">
-          <div ref={waveContainerRef} className="absolute inset-0" />
+          <canvas
+            ref={canvasRef}
+            className="absolute inset-0 w-full h-full"
+          />
+          {/* Dim region before trim-in */}
           <div
             className={`absolute inset-y-0 left-0 pointer-events-none transition-[background-color,width] ${
-              trimMode
-                ? "bg-black/55"
-                : isTrimmed
-                ? "bg-black/30"
-                : "bg-transparent"
+              trimMode ? "bg-black/55" : isTrimmed ? "bg-black/30" : "bg-transparent"
             }`}
             style={{ width: `${inPct}%` }}
           />
+          {/* Dim region after trim-out */}
           <div
             className={`absolute inset-y-0 right-0 pointer-events-none transition-[background-color,width] ${
-              trimMode
-                ? "bg-black/55"
-                : isTrimmed
-                ? "bg-black/30"
-                : "bg-transparent"
+              trimMode ? "bg-black/55" : isTrimmed ? "bg-black/30" : "bg-transparent"
             }`}
             style={{ width: `${100 - outPct}%` }}
           />
@@ -234,7 +259,6 @@ function Handle({
   onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => void;
 }) {
   const roundedClass = side === "left" ? "rounded-l-md" : "rounded-r-md";
-  // Center the handle over the trim boundary so the grab target straddles it.
   const left = `calc(${pct}% - ${HANDLE_WIDTH_PX / 2}px)`;
   return (
     <div

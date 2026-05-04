@@ -678,11 +678,13 @@ export const useCypher = create<CypherState>((set, get) => ({
     if (!get().isPlaying) {
       for (const t of get().tracks) {
         if (t.kind !== "sampler") continue;
-        if (t.samplerRecArmed) {
-          // Recording mode: clear any old Part so playback doesn't interfere.
-          getEngine().clearSamplerPart(t.id);
-        } else if (t.samplerPattern.length > 0) {
+        if (t.samplerPattern.length > 0) {
+          // Always schedule existing patterns — armed tracks overdub on top
+          // (Part-triggered hits go through engine directly, not re-recorded).
           getEngine().setSamplerPattern(t.id, t.samplerPattern);
+        } else if (t.samplerRecArmed) {
+          // Armed with no recorded events yet — ensure no stale Part lingers.
+          getEngine().clearSamplerPart(t.id);
         }
       }
     }
@@ -899,14 +901,15 @@ export const useCypher = create<CypherState>((set, get) => ({
       }));
     }
     if (targets.length > 0) {
-      // Schedule sampler patterns for non-recording sampler tracks before
-      // the transport starts so they play back in sync during the take.
+      // Schedule sampler patterns before the transport starts so they play
+      // back in sync during the take. Armed samplers with existing patterns
+      // overdub — new hits append while the old pattern plays back.
       for (const t of get().tracks) {
         if (t.kind !== "sampler") continue;
-        if (t.samplerRecArmed) {
-          getEngine().clearSamplerPart(t.id);
-        } else if (t.samplerPattern.length > 0) {
+        if (t.samplerPattern.length > 0) {
           getEngine().setSamplerPattern(t.id, t.samplerPattern);
+        } else if (t.samplerRecArmed) {
+          getEngine().clearSamplerPart(t.id);
         }
       }
       try {
