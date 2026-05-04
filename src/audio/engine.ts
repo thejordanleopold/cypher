@@ -28,6 +28,9 @@ export interface Track {
   // Transport-scheduled Part for sampler pattern playback. Null when no
   // pattern has been recorded or the track is in record-armed mode.
   samplerPart: Tone.Part | null;
+  // Live AudioBufferSourceNodes from pad triggers. Tracked so stop() can
+  // cut them all immediately rather than letting them ring out.
+  activePadSources: Set<AudioBufferSourceNode>;
 }
 
 interface RecordingSession {
@@ -391,6 +394,7 @@ class AudioEngine {
       normalizationGain: 1,
       pads: new Map(),
       samplerPart: null,
+      activePadSources: new Set(),
     };
     this.tracks.set(id, track);
     return track;
@@ -429,6 +433,8 @@ class AudioEngine {
     // Connect into the Tone.Gain's underlying input so volume/pan/mute apply.
     const gainInput = (t.gain as unknown as { input: AudioNode }).input;
     src.connect(gainInput);
+    t.activePadSources.add(src);
+    src.onended = () => t.activePadSources.delete(src);
     if (audioTime !== undefined) {
       src.start(audioTime);
     } else {
@@ -491,6 +497,10 @@ class AudioEngine {
     if (!t) return;
     t.player?.dispose();
     t.samplerPart?.dispose();
+    for (const src of t.activePadSources) {
+      try { src.stop(); } catch { /* already ended */ }
+    }
+    t.activePadSources.clear();
     t.gain.dispose();
     t.panner.dispose();
     t.pads.clear();
@@ -503,6 +513,10 @@ class AudioEngine {
     for (const t of this.tracks.values()) {
       t.player?.dispose();
       t.samplerPart?.dispose();
+      for (const src of t.activePadSources) {
+        try { src.stop(); } catch { /* already ended */ }
+      }
+      t.activePadSources.clear();
       t.gain.dispose();
       t.panner.dispose();
       t.pads.clear();
@@ -626,7 +640,13 @@ class AudioEngine {
   stop() {
     const transport = Tone.getTransport();
     transport.stop();
-    for (const t of this.tracks.values()) t.player?.stop();
+    for (const t of this.tracks.values()) {
+      t.player?.stop();
+      for (const src of t.activePadSources) {
+        try { src.stop(); } catch { /* already ended */ }
+      }
+      t.activePadSources.clear();
+    }
   }
 
   seconds() {
