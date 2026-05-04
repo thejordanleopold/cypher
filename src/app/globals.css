@@ -26,15 +26,20 @@
 }
 
 html {
-  /* Gradient lives on html so it covers the full viewport including iOS
-     overscroll/rubber-band areas and safe-area zones that body never paints. */
+  background-color: var(--bg-base);
+}
+/* Fixed pseudo-element covers the full viewport at all times — including the
+   iOS Safari URL bar zone where background-attachment:fixed breaks down. */
+html::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
   background-color: var(--bg-base);
   background-image:
     radial-gradient(60% 50% at 15% 10%, rgba(37, 99, 235, 0.18), transparent 60%),
     radial-gradient(55% 45% at 90% 95%, rgba(14, 116, 208, 0.14), transparent 65%),
     linear-gradient(180deg, #050a18 0%, #060c1c 50%, #04081a 100%);
-  background-attachment: fixed, fixed, fixed;
-  background-size: 100% 100%, 100% 100%, 100% 100%;
 }
 html, body {
   color: var(--text-primary);
