@@ -13,7 +13,7 @@ export function MixerView() {
   const tracks = useCypher((s) => s.tracks);
 
   return (
-    <div className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden" style={{ touchAction: "pan-x" }}>
+    <div className="flex-1 min-h-0 overflow-auto overscroll-contain">
       <div className="flex items-start justify-end gap-1.5 px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] min-w-min">
         {tracks.map((t) => (
           <ChannelStrip key={t.id} track={t} />
@@ -32,12 +32,16 @@ function ChannelStrip({ track }: { track: TrackState }) {
   const toggleArm = useCypher((s) => s.toggleArm);
   const toggleNormalize = useCypher((s) => s.toggleNormalize);
   const isMultiRecording = useCypher((s) => s.isMultiRecording);
+  const isStartingRecording = useCypher((s) => s.isStartingRecording);
+  const isFinalizingRecording = useCypher((s) => s.isFinalizingRecording);
+  const recordingControlsDisabled =
+    isMultiRecording || isStartingRecording || isFinalizingRecording;
   const isRecordingNow = isMultiRecording && track.armed;
 
   return (
     <div
       style={{ height: STRIP_HEIGHT }}
-      className={`glass shrink-0 w-[92px] rounded-xl flex flex-col gap-1.5 px-2 pt-2 pb-2.5 transition-colors ${
+      className={`mixer-channel-strip glass shrink-0 w-[92px] rounded-xl flex flex-col gap-1.5 px-2 pt-2 pb-2.5 transition-colors ${
         isRecordingNow
           ? "!border-red-500/60 ring-1 ring-red-500/40"
           : track.armed
@@ -76,7 +80,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
       </div>
 
       {/* M / S / R / N */}
-      <div className="grid grid-cols-4 gap-0.5">
+      <div className="mixer-toggle-grid grid grid-cols-4 gap-0.5">
         <ChannelToggle
           active={track.muted}
           onClick={() => toggleMute(track.id)}
@@ -96,7 +100,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
         <ChannelToggle
           active={track.armed}
           onClick={() => toggleArm(track.id)}
-          disabled={isMultiRecording}
+          disabled={recordingControlsDisabled}
           ariaLabel="Arm for recording"
           activeClass="bg-red-600 text-white"
         >
@@ -241,7 +245,7 @@ function VerticalFader({
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
       onKeyDown={onKeyDown}
-      className="relative w-7 h-full select-none touch-none cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] rounded"
+      className="mixer-fader relative w-7 h-full select-none touch-none cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] rounded"
     >
       {/* Track */}
       <div className="absolute left-1/2 top-1 bottom-1 -translate-x-1/2 w-1 rounded-full bg-white/[0.08] border border-[var(--border-subtle)]" />

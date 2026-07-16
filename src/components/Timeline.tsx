@@ -3,28 +3,37 @@
 import { useEffect, useRef, useState } from "react";
 import { useCypher } from "@/state/store";
 import { getEngine } from "@/audio/engine";
+import {
+  clampProjectTime,
+  hasSamplerCaptureSource,
+  projectDuration,
+  trackProjectDuration,
+} from "@/audio/project-time";
 
 const DOUBLE_TAP_MS = 300;
 
 export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }) {
   const tracks = useCypher((s) => s.tracks);
   const isPlaying = useCypher((s) => s.isPlaying);
+  const isRecording = useCypher(
+    (s) => s.isMultiRecording || s.recordingTrackId !== null,
+  );
+  const storedPosition = useCypher((s) => s.positionSec);
   const seek = useCypher((s) => s.seek);
-  const pause = useCypher((s) => s.pause);
+  const stop = useCypher((s) => s.stop);
   const lastTapRef = useRef(0);
 
-  const duration = Math.max(
-    0,
-    ...tracks.map((t) => {
-      if (!t.hasAudio) return 0;
-      const end = t.trimOutSec ?? t.durationSec;
-      return Math.max(0, end - t.trimInSec);
-    }),
-  );
+  const duration = projectDuration(tracks);
+  const samplerCaptureReady = hasSamplerCaptureSource(tracks);
 
-  const [position, setPosition] = useState(0);
-  const [scrubbing, setScrubbing] = useState(false);
+  const [livePosition, setLivePosition] = useState<number | null>(null);
+  const [scrubPosition, setScrubPosition] = useState<number | null>(null);
   const railRef = useRef<HTMLDivElement>(null);
+  const scrubbing = scrubPosition !== null;
+  const position = clampProjectTime(
+    scrubPosition ?? (isPlaying ? livePosition ?? storedPosition : storedPosition),
+    duration,
+  );
 
   // Live position via rAF while playing — bypasses store for tightness.
   useEffect(() => {
@@ -32,23 +41,28 @@ export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }
     let raf = 0;
     const tick = () => {
       const t = getEngine().seconds();
-      setPosition(t);
-      if (duration > 0 && t >= duration) {
+      setLivePosition(t);
+      if (
+        !isRecording &&
+        !samplerCaptureReady &&
+        (duration <= 0 || t >= duration)
+      ) {
         // Auto-stop at the end of the longest track.
-        pause();
+        stop();
         return;
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [isPlaying, scrubbing, duration, pause]);
-
-  // When stopped/seeked from elsewhere, mirror engine position.
-  useEffect(() => {
-    if (isPlaying || scrubbing) return;
-    setPosition(getEngine().seconds());
-  }, [isPlaying, scrubbing, tracks]);
+  }, [
+    isPlaying,
+    isRecording,
+    scrubbing,
+    duration,
+    samplerCaptureReady,
+    stop,
+  ]);
 
   function pointToSeconds(clientX: number): number {
     const r = railRef.current?.getBoundingClientRect();
@@ -71,21 +85,33 @@ export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }
     lastTapRef.current = now;
 
     railRef.current?.setPointerCapture(e.pointerId);
-    setScrubbing(true);
     const s = pointToSeconds(e.clientX);
-    setPosition(s);
-    seek(s);
+    setScrubPosition(s);
+    setLivePosition(s);
+    void seek(s);
   }
   function onPointerMove(e: React.PointerEvent) {
     if (!scrubbing) return;
     const s = pointToSeconds(e.clientX);
-    setPosition(s);
+    setScrubPosition(s);
   }
   function onPointerUp(e: React.PointerEvent) {
     if (!scrubbing) return;
-    railRef.current?.releasePointerCapture(e.pointerId);
-    setScrubbing(false);
-    seek(position);
+    try {
+      railRef.current?.releasePointerCapture(e.pointerId);
+    } catch {
+      // The browser may already have released capture on pointer cancellation.
+    }
+    const nextPosition = pointToSeconds(e.clientX);
+    setScrubPosition(null);
+    setLivePosition(nextPosition);
+    void seek(nextPosition);
+  }
+
+  function seekFromKeyboard(nextPosition: number) {
+    const clamped = clampProjectTime(nextPosition, duration);
+    setLivePosition(clamped);
+    void seek(clamped);
   }
 
   const hasAudio = duration > 0;
@@ -114,16 +140,16 @@ export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }
             const step = e.shiftKey ? 5 : 1;
             if (e.key === "ArrowLeft") {
               e.preventDefault();
-              seek(Math.max(0, position - step));
+              seekFromKeyboard(position - step);
             } else if (e.key === "ArrowRight") {
               e.preventDefault();
-              seek(Math.min(duration, position + step));
+              seekFromKeyboard(position + step);
             } else if (e.key === "Home") {
               e.preventDefault();
-              seek(0);
+              seekFromKeyboard(0);
             } else if (e.key === "End") {
               e.preventDefault();
-              seek(duration);
+              seekFromKeyboard(duration);
             }
           }}
           title={hasAudio ? "Double-tap to open song editor" : undefined}
@@ -137,17 +163,8 @@ export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }
               tracks.slice(0, 4).map((t) => (
                 <TrackLane
                   key={t.id}
-                  filled={t.hasAudio}
-                  startRatio={
-                    duration > 0 ? t.trimInSec / duration : 0
-                  }
-                  endRatio={
-                    duration > 0
-                      ? Math.min(
-                          1,
-                          (t.trimOutSec ?? t.durationSec) / duration,
-                        )
-                      : 0
+                  durationRatio={
+                    duration > 0 ? trackProjectDuration(t) / duration : 0
                   }
                 />
               ))
@@ -170,21 +187,40 @@ export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }
         <span className="text-[11px] tabular-nums text-[var(--text-faint)] w-10">
           {formatTime(duration)}
         </span>
+        <button
+          type="button"
+          onClick={onOpenSongEditor}
+          disabled={!hasAudio || !onOpenSongEditor}
+          aria-label="Open song editor"
+          title="Open song editor"
+          className="h-7 w-7 shrink-0 rounded-md border border-[var(--border-subtle)] bg-white/[0.04] text-[var(--text-muted)] flex items-center justify-center hover:text-[var(--text-primary)] disabled:opacity-40 disabled:cursor-default"
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" />
+          </svg>
+        </button>
       </div>
     </div>
   );
 }
 
 function TrackLane({
-  filled,
-  startRatio,
-  endRatio,
+  durationRatio,
 }: {
-  filled: boolean;
-  startRatio: number;
-  endRatio: number;
+  durationRatio: number;
 }) {
-  if (!filled || endRatio <= startRatio) {
+  if (durationRatio <= 0) {
     return <div className="flex-1" />;
   }
   return (
@@ -192,8 +228,8 @@ function TrackLane({
       <div
         className="absolute top-0.5 bottom-0.5 bg-[var(--accent)]/25 rounded-sm"
         style={{
-          left: `${startRatio * 100}%`,
-          width: `${(endRatio - startRatio) * 100}%`,
+          left: 0,
+          width: `${Math.min(1, durationRatio) * 100}%`,
         }}
       />
     </div>

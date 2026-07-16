@@ -10,7 +10,6 @@ export function Toaster() {
     <div
       role="region"
       aria-label="Notifications"
-      aria-live="polite"
       className="fixed left-3 right-3 bottom-3 z-50 flex flex-col gap-2 pointer-events-none sm:left-auto sm:right-4 sm:bottom-4 sm:max-w-sm"
     >
       {toasts.map((t) => {
@@ -23,7 +22,7 @@ export function Toaster() {
         return (
           <div
             key={t.id}
-            role="alert"
+            role={t.variant === "info" ? "status" : "alert"}
             className={`pointer-events-auto rounded-lg border ${accent} backdrop-blur shadow-lg p-3 flex items-start gap-3`}
           >
             <div className="flex-1 min-w-0">

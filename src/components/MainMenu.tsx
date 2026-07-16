@@ -1,9 +1,16 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useCypher } from "@/state/store";
 import { estimateStorage, type StorageEstimate } from "@/persistence/db";
+import { useShallow } from "zustand/react/shallow";
 
 interface PopupRect {
   top: number;
@@ -14,6 +21,81 @@ interface PopupRect {
 
 const POPUP_WIDTH = 320;
 const VIEWPORT_PADDING = 12;
+const RECOVERY_CONFLICT_PREFIX = "cypher:conflicted-project-snapshot:";
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function getFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+  ).filter(
+    (element) =>
+      element.getAttribute("aria-hidden") !== "true" &&
+      element.getClientRects().length > 0,
+  );
+}
+
+interface LocalRecoveryBackup {
+  key: string;
+  projectName: string;
+  conflictedAt: number | null;
+}
+
+function readLocalRecoveryBackups(): LocalRecoveryBackup[] {
+  if (typeof localStorage === "undefined") return [];
+  const backups: LocalRecoveryBackup[] = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(RECOVERY_CONFLICT_PREFIX)) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw) as {
+          project?: { name?: unknown };
+          conflictedAt?: unknown;
+        };
+        backups.push({
+          key,
+          projectName:
+            typeof parsed.project?.name === "string"
+              ? parsed.project.name
+              : "Unknown project",
+          conflictedAt:
+            typeof parsed.conflictedAt === "number"
+              ? parsed.conflictedAt
+              : null,
+        });
+      } catch {
+        backups.push({ key, projectName: "Unreadable backup", conflictedAt: null });
+      }
+    }
+  } catch {
+    return [];
+  }
+  return backups.sort(
+    (a, b) => (b.conflictedAt ?? 0) - (a.conflictedAt ?? 0),
+  );
+}
+
+function downloadRecoveryBackup(key: string, projectName: string) {
+  const raw = localStorage.getItem(key);
+  if (!raw) return;
+  const url = URL.createObjectURL(
+    new Blob([raw], { type: "application/json" }),
+  );
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${projectName.replace(/[^\w-]+/g, "_") || "cypher"}-recovery.json`;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 export function MainMenu() {
   const {
@@ -26,6 +108,9 @@ export function MainMenu() {
     openProject,
     renameProject,
     saveProjectAs,
+    compactCurrentProject,
+    restoreRecoveryBackup,
+    deleteRecoveryBackup,
     deleteCurrentProject,
     saveNow,
     exportMix,
@@ -44,16 +129,71 @@ export function MainMenu() {
     defaultInputDeviceId,
     refreshInputDevices,
     setDefaultInputDevice,
-  } = useCypher();
+  } = useCypher(
+    useShallow((state) => ({
+      projects: state.projects,
+      currentProjectId: state.currentProjectId,
+      currentProjectName: state.currentProjectName,
+      lastSavedAt: state.lastSavedAt,
+      refreshProjects: state.refreshProjects,
+      createProject: state.createProject,
+      openProject: state.openProject,
+      renameProject: state.renameProject,
+      saveProjectAs: state.saveProjectAs,
+      compactCurrentProject: state.compactCurrentProject,
+      restoreRecoveryBackup: state.restoreRecoveryBackup,
+      deleteRecoveryBackup: state.deleteRecoveryBackup,
+      deleteCurrentProject: state.deleteCurrentProject,
+      saveNow: state.saveNow,
+      exportMix: state.exportMix,
+      exportStems: state.exportStems,
+      exportProgress: state.exportProgress,
+      latencyOffsetMs: state.latencyOffsetMs,
+      setLatencyOffsetMs: state.setLatencyOffsetMs,
+      calibrateLatency: state.calibrateLatency,
+      isCalibrating: state.isCalibrating,
+      outputDevices: state.outputDevices,
+      currentOutputDeviceId: state.currentOutputDeviceId,
+      outputSelectable: state.outputSelectable,
+      refreshOutputDevices: state.refreshOutputDevices,
+      setOutputDevice: state.setOutputDevice,
+      inputDevices: state.inputDevices,
+      defaultInputDeviceId: state.defaultInputDeviceId,
+      refreshInputDevices: state.refreshInputDevices,
+      setDefaultInputDevice: state.setDefaultInputDevice,
+    })),
+  );
   const [open, setOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(currentProjectName);
   const [storage, setStorage] = useState<StorageEstimate | null>(null);
+  const [recoveryBackups, setRecoveryBackups] = useState<LocalRecoveryBackup[]>(
+    [],
+  );
+  const [restoringBackupKey, setRestoringBackupKey] = useState<string | null>(
+    null,
+  );
   const [, forceTick] = useState(0);
   const [rect, setRect] = useState<PopupRect | null>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const focusedForOpenRef = useRef(false);
+  const initialFocusFrameRef = useRef<number | null>(null);
   const exporting = exportProgress !== null;
+
+  const restoreTriggerFocus = useCallback(() => {
+    if (initialFocusFrameRef.current !== null) {
+      cancelAnimationFrame(initialFocusFrameRef.current);
+      initialFocusFrameRef.current = null;
+    }
+    buttonRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  const closeAndRestoreFocus = useCallback(() => {
+    focusedForOpenRef.current = false;
+    setOpen(false);
+    restoreTriggerFocus();
+  }, [restoreTriggerFocus]);
 
   useEffect(() => {
     if (!open) return;
@@ -62,8 +202,6 @@ export function MainMenu() {
     refreshInputDevices();
     estimateStorage().then(setStorage).catch(() => setStorage(null));
   }, [open, refreshProjects, refreshOutputDevices, refreshInputDevices]);
-
-  useEffect(() => setDraftName(currentProjectName), [currentProjectName]);
 
   // Keep "saved Xm ago" relative timestamp fresh.
   useEffect(() => {
@@ -99,18 +237,74 @@ export function MainMenu() {
     };
   }, [open]);
 
-  // Close on outside click + Escape. The popover lives in a portal at
-  // document.body, so the listener has to check the portal node too.
+  useEffect(() => {
+    if (!open) {
+      focusedForOpenRef.current = false;
+      return;
+    }
+    if (!rect || focusedForOpenRef.current) return;
+
+    initialFocusFrameRef.current = requestAnimationFrame(() => {
+      initialFocusFrameRef.current = null;
+      const popover = popoverRef.current;
+      if (!popover) return;
+      focusedForOpenRef.current = true;
+      (getFocusableElements(popover)[0] ?? popover).focus({
+        preventScroll: true,
+      });
+    });
+
+    return () => {
+      if (initialFocusFrameRef.current !== null) {
+        cancelAnimationFrame(initialFocusFrameRef.current);
+        initialFocusFrameRef.current = null;
+      }
+    };
+  }, [open, rect]);
+
+  // Close on outside click + Escape, and keep keyboard focus inside the
+  // portaled dialog while it is open.
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
       const target = e.target as Node;
       if (buttonRef.current?.contains(target)) return;
       if (popoverRef.current?.contains(target)) return;
-      setOpen(false);
+      // Focus the trigger before the pointer's default focus behavior runs;
+      // a focusable outside target can still receive focus normally.
+      closeAndRestoreFocus();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeAndRestoreFocus();
+        return;
+      }
+      if (e.key !== "Tab") return;
+
+      const popover = popoverRef.current;
+      if (!popover) return;
+      const focusable = getFocusableElements(popover);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        popover.focus({ preventScroll: true });
+        return;
+      }
+
+      const active = document.activeElement;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!popover.contains(active)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus({ preventScroll: true });
+      } else if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus({ preventScroll: true });
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus({ preventScroll: true });
+      }
     };
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onKey);
@@ -118,14 +312,20 @@ export function MainMenu() {
       document.removeEventListener("mousedown", onDoc);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open]);
+  }, [closeAndRestoreFocus, open]);
 
   return (
     <>
       <button
         ref={buttonRef}
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="menu"
+        onClick={() => {
+          if (open) closeAndRestoreFocus();
+          else {
+            setRecoveryBackups(readLocalRecoveryBackups());
+            setOpen(true);
+          }
+        }}
+        aria-haspopup="dialog"
         aria-expanded={open}
         aria-label="Library and export menu"
         className="h-9 w-9 rounded-md bg-neutral-800 text-neutral-100 flex items-center justify-center active:scale-95 hover:bg-neutral-700 shrink-0"
@@ -133,11 +333,37 @@ export function MainMenu() {
         <HamburgerIcon />
       </button>
 
+      {exporting &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            role="status"
+            aria-live="polite"
+            className="fixed z-[70] left-1/2 -translate-x-1/2 bottom-[max(env(safe-area-inset-bottom),1rem)] min-w-52 rounded-xl border border-[var(--border-strong)] bg-neutral-900/95 px-4 py-3 shadow-2xl backdrop-blur"
+          >
+            <div className="flex items-center justify-between gap-4 text-xs text-neutral-100">
+              <span>Exporting audio…</span>
+              <span className="tabular-nums text-[var(--accent)]">
+                {Math.round((exportProgress ?? 0) * 100)}%
+              </span>
+            </div>
+            <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full bg-[var(--accent)] transition-[width] duration-150"
+                style={{ width: `${Math.round((exportProgress ?? 0) * 100)}%` }}
+              />
+            </div>
+          </div>,
+          document.body,
+        )}
+
       {open && rect && typeof document !== "undefined" &&
         createPortal(
           <div
             ref={popoverRef}
-            role="menu"
+            role="dialog"
+            aria-label="Project, audio, and export settings"
+            tabIndex={-1}
             style={{
               position: "fixed",
               top: rect.top,
@@ -163,6 +389,7 @@ export function MainMenu() {
               >
                 <input
                   autoFocus
+                  aria-label="Project name"
                   value={draftName}
                   onChange={(e) => setDraftName(e.target.value)}
                   className="flex-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1.5 text-sm"
@@ -194,7 +421,7 @@ export function MainMenu() {
             <MenuItem onClick={() => saveNow()}>Save now</MenuItem>
             <MenuItem
               onClick={async () => {
-                setOpen(false);
+                closeAndRestoreFocus();
                 await createProject("Untitled");
               }}
             >
@@ -207,22 +434,43 @@ export function MainMenu() {
                   `${currentProjectName} copy`,
                 );
                 if (!name) return;
-                setOpen(false);
+                closeAndRestoreFocus();
                 await saveProjectAs(name.trim() || "Untitled");
               }}
             >
               Save as new project…
             </MenuItem>
             <MenuItem
-              destructive
               onClick={async () => {
                 if (
                   !window.confirm(
-                    `Delete "${currentProjectName}"? This cannot be undone.`,
+                    "Compact this project now? Cypher will keep the current mix, preserve recovery versions, remove unused takes, and clear undo history.",
                   )
-                )
+                ) {
                   return;
-                setOpen(false);
+                }
+                closeAndRestoreFocus();
+                await compactCurrentProject().catch(() => {});
+              }}
+            >
+              Compact project storage…
+            </MenuItem>
+            <MenuItem
+              destructive
+              onClick={async () => {
+                const cannotCoordinateTabs =
+                  typeof navigator.locks?.request !== "function";
+                if (
+                  !window.confirm(
+                    `Delete "${currentProjectName}"? This cannot be undone.${
+                      cannotCoordinateTabs
+                        ? " Close other Cypher tabs first because this browser cannot coordinate them."
+                        : ""
+                    }`,
+                  )
+                  )
+                  return;
+                closeAndRestoreFocus();
                 await deleteCurrentProject();
               }}
             >
@@ -235,6 +483,74 @@ export function MainMenu() {
             <span>{describeSave(lastSavedAt)}</span>
             {storage && <StorageBar s={storage} />}
           </div>
+
+          {recoveryBackups.length > 0 && (
+            <div className="border-t border-amber-700/50 py-1">
+              <Section label="Recovery backups" />
+              <p className="px-3 pb-2 text-[10px] leading-snug text-amber-200/80">
+                These pending versions could not be copied automatically. Retry
+                after freeing storage, or download the metadata for review.
+              </p>
+              {recoveryBackups.map((backup) => (
+                <div
+                  key={backup.key}
+                  className="border-t border-neutral-800 px-3 py-2"
+                >
+                  <div className="truncate text-xs text-neutral-100">
+                    {backup.projectName}
+                  </div>
+                  {backup.conflictedAt && (
+                    <div className="mt-0.5 text-[10px] text-neutral-500">
+                      Preserved {formatRelative(backup.conflictedAt)}
+                    </div>
+                  )}
+                  <div className="mt-2 grid grid-cols-3 gap-1.5">
+                    <button
+                      type="button"
+                      disabled={restoringBackupKey !== null}
+                      onClick={async () => {
+                        setRestoringBackupKey(backup.key);
+                        const restored = await restoreRecoveryBackup(backup.key);
+                        setRestoringBackupKey(null);
+                        if (restored) {
+                          setRecoveryBackups((items) =>
+                            items.filter((item) => item.key !== backup.key),
+                          );
+                        }
+                      }}
+                      className="h-9 rounded-md bg-amber-500/15 text-xs font-medium text-amber-200 hover:bg-amber-500/25 disabled:opacity-50"
+                    >
+                      {restoringBackupKey === backup.key ? "Restoring…" : "Restore"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        downloadRecoveryBackup(backup.key, backup.projectName)
+                      }
+                      className="h-9 rounded-md bg-neutral-800 text-xs text-neutral-100 hover:bg-neutral-700"
+                    >
+                      Download
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!window.confirm("Delete this recovery backup?")) return;
+                        const deleted = await deleteRecoveryBackup(backup.key);
+                        if (deleted) {
+                          setRecoveryBackups((items) =>
+                            items.filter((item) => item.key !== backup.key),
+                          );
+                        }
+                      }}
+                      className="h-9 rounded-md bg-neutral-800 text-xs text-red-300 hover:bg-neutral-700"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           {/* Recent projects */}
           <div className="border-t border-neutral-800 max-h-56 overflow-y-auto">
@@ -249,9 +565,8 @@ export function MainMenu() {
               return (
                 <button
                   key={p.id}
-                  role="menuitem"
                   onClick={async () => {
-                    setOpen(false);
+                    closeAndRestoreFocus();
                     if (!isCurrent) await openProject(p.id);
                   }}
                   className={`block w-full text-left px-3 py-2 text-sm hover:bg-neutral-800 ${
@@ -344,7 +659,7 @@ export function MainMenu() {
             />
             <button
               onClick={async () => {
-                setOpen(false);
+                closeAndRestoreFocus();
                 await calibrateLatency("default");
               }}
               disabled={isCalibrating}
@@ -369,7 +684,7 @@ export function MainMenu() {
             <MenuItem
               disabled={exporting}
               onClick={async () => {
-                setOpen(false);
+                closeAndRestoreFocus();
                 await exportMix("wav");
               }}
             >
@@ -378,7 +693,7 @@ export function MainMenu() {
             <MenuItem
               disabled={exporting}
               onClick={async () => {
-                setOpen(false);
+                closeAndRestoreFocus();
                 await exportMix("mp3");
               }}
             >
@@ -387,7 +702,7 @@ export function MainMenu() {
             <MenuItem
               disabled={exporting}
               onClick={async () => {
-                setOpen(false);
+                closeAndRestoreFocus();
                 await exportStems("wav");
               }}
             >
@@ -396,7 +711,7 @@ export function MainMenu() {
             <MenuItem
               disabled={exporting}
               onClick={async () => {
-                setOpen(false);
+                closeAndRestoreFocus();
                 await exportStems("mp3");
               }}
             >
@@ -423,7 +738,6 @@ function MenuItem({
 }) {
   return (
     <button
-      role="menuitem"
       disabled={disabled}
       onClick={onClick}
       className={`block w-full text-left px-3 py-2 text-sm hover:bg-neutral-800 disabled:opacity-50 disabled:hover:bg-transparent ${

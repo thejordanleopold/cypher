@@ -14,13 +14,63 @@ interface WaveformProps {
 }
 
 const HANDLE_WIDTH_PX = 12;
+const HANDLE_TARGET_PX = 44;
 const MIN_TRIM_GAP_SEC = 0.05;
 const SNAP_TO_END_SEC = 0.01;
 const DOUBLE_TAP_MS = 320;
+const MAX_PEAK_BINS = 4096;
 
-// Draw min/max peaks per pixel column directly from the AudioBuffer for
-// maximum fidelity. Averages all channels so stereo and mono both look right.
-function drawWaveformToCanvas(canvas: HTMLCanvasElement, buffer: AudioBuffer) {
+interface WaveformPeaks {
+  min: Float32Array;
+  max: Float32Array;
+}
+
+// AudioBuffers are replaced, rather than mutated, whenever track audio
+// changes. A WeakMap therefore lets every Waveform instance reuse one compact
+// peak summary without retaining buffers after the engine releases them.
+const peakCache = new WeakMap<AudioBuffer, WaveformPeaks>();
+
+function getWaveformPeaks(buffer: AudioBuffer): WaveformPeaks {
+  const cached = peakCache.get(buffer);
+  if (cached) return cached;
+
+  const binCount = Math.max(1, Math.min(MAX_PEAK_BINS, buffer.length));
+  const min = new Float32Array(binCount);
+  const max = new Float32Array(binCount);
+  const channels = Array.from(
+    { length: buffer.numberOfChannels },
+    (_, channel) => buffer.getChannelData(channel),
+  );
+
+  for (let bin = 0; bin < binCount; bin++) {
+    const start = Math.floor((bin * buffer.length) / binCount);
+    const end = Math.max(
+      start + 1,
+      Math.floor(((bin + 1) * buffer.length) / binCount),
+    );
+    let binMin = 0;
+    let binMax = 0;
+    for (let sample = start; sample < end; sample++) {
+      let mono = 0;
+      for (let channel = 0; channel < channels.length; channel++) {
+        mono += channels[channel][sample];
+      }
+      mono /= channels.length;
+      if (mono < binMin) binMin = mono;
+      if (mono > binMax) binMax = mono;
+    }
+    min[bin] = Math.max(-1, Math.min(1, binMin));
+    max[bin] = Math.max(-1, Math.min(1, binMax));
+  }
+
+  const peaks = { min, max };
+  peakCache.set(buffer, peaks);
+  return peaks;
+}
+
+// Paint the cached peak summary at the current canvas width. Resizing now
+// costs O(canvas width + peak bins), not O(raw audio samples).
+function drawWaveformToCanvas(canvas: HTMLCanvasElement, peaks: WaveformPeaks) {
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth;
   const cssH = canvas.clientHeight;
@@ -31,37 +81,30 @@ function drawWaveformToCanvas(canvas: HTMLCanvasElement, buffer: AudioBuffer) {
 
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  ctx.scale(dpr, dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssW, cssH);
 
-  const numChannels = buffer.numberOfChannels;
-  const numSamples = buffer.length;
-  // Pre-read so we avoid repeated getChannelData calls in the inner loop.
-  const channels: Float32Array[] = [];
-  for (let c = 0; c < numChannels; c++) channels.push(buffer.getChannelData(c));
-
-  const numCols = Math.floor(cssW);
-  const samplesPerCol = numSamples / numCols;
+  const numCols = Math.max(1, Math.floor(cssW));
+  const binCount = peaks.min.length;
   const mid = cssH / 2;
 
   ctx.fillStyle = "#4e7fc4";
 
   for (let col = 0; col < numCols; col++) {
-    const start = Math.floor(col * samplesPerCol);
-    const end = Math.min(numSamples, Math.floor((col + 1) * samplesPerCol));
-    let min = 0;
-    let max = 0;
-    for (let j = start; j < end; j++) {
-      // Average across channels for a true mono representation.
-      let s = 0;
-      for (let c = 0; c < numChannels; c++) s += channels[c][j];
-      s /= numChannels;
-      if (s < min) min = s;
-      if (s > max) max = s;
+    const start = Math.min(
+      binCount - 1,
+      Math.floor((col * binCount) / numCols),
+    );
+    const end = Math.max(
+      start + 1,
+      Math.floor(((col + 1) * binCount) / numCols),
+    );
+    let min = peaks.min[start];
+    let max = peaks.max[start];
+    for (let bin = start + 1; bin < Math.min(binCount, end); bin++) {
+      if (peaks.min[bin] < min) min = peaks.min[bin];
+      if (peaks.max[bin] > max) max = peaks.max[bin];
     }
-    // Clamp to [-1, 1].
-    min = Math.max(-1, Math.min(1, min));
-    max = Math.max(-1, Math.min(1, max));
     const barH = Math.max(1, (max - min) * mid);
     ctx.fillRect(col, mid - max * mid, 1, barH);
   }
@@ -90,21 +133,36 @@ export function Waveform({
     trimInSec > 0.001 ||
     (trimOutSec !== null && trimOutSec < safeDuration - SNAP_TO_END_SEC);
 
-  // Redraw whenever the buffer changes or the canvas is resized.
+  // Recompute peaks only for a new AudioBuffer. ResizeObserver redraws from
+  // the compact cached summary and coalesces resize bursts to one frame.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !hasAudio) return;
+    const buffer = getEngine().getTrack(trackId)?.buffer;
+    if (!buffer) return;
+
+    let peaks: WaveformPeaks | null = null;
+    let raf = 0;
 
     const draw = () => {
-      const buf = getEngine().getTrack(trackId)?.buffer;
-      if (buf) drawWaveformToCanvas(canvas, buf);
+      raf = 0;
+      if (canvas.clientWidth === 0 || canvas.clientHeight === 0) return;
+      peaks ??= getWaveformPeaks(buffer);
+      drawWaveformToCanvas(canvas, peaks);
+    };
+    const scheduleDraw = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(draw);
     };
 
-    draw();
+    scheduleDraw();
 
-    const ro = new ResizeObserver(draw);
+    const ro = new ResizeObserver(scheduleDraw);
     ro.observe(canvas);
-    return () => ro.disconnect();
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
   }, [trackId, hasAudio, bufferRevision]);
 
   function onTrackPointerDown(e: React.PointerEvent<HTMLDivElement>) {
@@ -155,6 +213,41 @@ export function Waveform({
       document.addEventListener("pointerup", onUp);
       document.addEventListener("pointercancel", onUp);
     };
+  }
+
+  function adjustTrimWithKeyboard(
+    side: "left" | "right",
+    event: React.KeyboardEvent<HTMLDivElement>,
+  ) {
+    const step = event.shiftKey ? 0.5 : 0.05;
+    const current = side === "left" ? trimInSec : effectiveOut;
+    const min = side === "left" ? 0 : trimInSec + MIN_TRIM_GAP_SEC;
+    const max =
+      side === "left" ? effectiveOut - MIN_TRIM_GAP_SEC : safeDuration;
+    let next: number | null = null;
+
+    if (event.key === "ArrowLeft" || event.key === "ArrowDown") {
+      next = current - step;
+    } else if (event.key === "ArrowRight" || event.key === "ArrowUp") {
+      next = current + step;
+    } else if (event.key === "Home") {
+      next = min;
+    } else if (event.key === "End") {
+      next = max;
+    }
+    if (next === null) return;
+
+    event.preventDefault();
+    const clamped = Math.max(min, Math.min(max, next));
+    if (side === "left") {
+      setTrim(trackId, clamped, trimOutSec);
+    } else {
+      setTrim(
+        trackId,
+        trimInSec,
+        clamped >= safeDuration - SNAP_TO_END_SEC ? null : clamped,
+      );
+    }
   }
 
   return (
@@ -212,16 +305,20 @@ export function Waveform({
               pct={inPct}
               active={activeSide === "left"}
               ariaValue={trimInSec}
-              ariaMax={safeDuration}
+              ariaMin={0}
+              ariaMax={Math.max(0, effectiveOut - MIN_TRIM_GAP_SEC)}
               onPointerDown={startDrag("left")}
+              onKeyDown={(event) => adjustTrimWithKeyboard("left", event)}
             />
             <Handle
               side="right"
               pct={outPct}
               active={activeSide === "right"}
               ariaValue={effectiveOut}
+              ariaMin={Math.min(safeDuration, trimInSec + MIN_TRIM_GAP_SEC)}
               ariaMax={safeDuration}
               onPointerDown={startDrag("right")}
+              onKeyDown={(event) => adjustTrimWithKeyboard("right", event)}
             />
           </>
         ) : (
@@ -239,6 +336,18 @@ export function Waveform({
           )
         )}
       </div>
+      <button
+        type="button"
+        aria-pressed={trimMode}
+        onClick={() => setTrimMode((enabled) => !enabled)}
+        className={`mt-1 min-h-7 px-2 rounded-md border text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors ${
+          trimMode
+            ? "border-amber-400/70 bg-amber-400/15 text-amber-300"
+            : "border-[var(--border-subtle)] bg-white/[0.04] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+        }`}
+      >
+        {trimMode ? "Done trimming" : "Trim audio"}
+      </button>
     </div>
   );
 }
@@ -248,36 +357,47 @@ function Handle({
   pct,
   active,
   ariaValue,
+  ariaMin,
   ariaMax,
   onPointerDown,
+  onKeyDown,
 }: {
   side: "left" | "right";
   pct: number;
   active: boolean;
   ariaValue: number;
+  ariaMin: number;
   ariaMax: number;
   onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void;
 }) {
   const roundedClass = side === "left" ? "rounded-l-md" : "rounded-r-md";
-  const left = `calc(${pct}% - ${HANDLE_WIDTH_PX / 2}px)`;
+  const left = `calc(${pct}% - ${HANDLE_TARGET_PX / 2}px)`;
   return (
     <div
       role="slider"
       tabIndex={0}
       data-trim-handle="true"
       aria-label={side === "left" ? "Trim start" : "Trim end"}
-      aria-valuemin={0}
+      aria-valuemin={ariaMin}
       aria-valuemax={ariaMax}
       aria-valuenow={ariaValue}
+      aria-valuetext={`${ariaValue.toFixed(2)} seconds`}
       onPointerDown={onPointerDown}
-      style={{ left, width: HANDLE_WIDTH_PX }}
-      className={`absolute -top-0.5 -bottom-0.5 ${roundedClass} bg-amber-400 cursor-ew-resize touch-none flex items-center justify-center transition-shadow ${
+      onKeyDown={onKeyDown}
+      style={{ left, width: HANDLE_TARGET_PX }}
+      className="absolute -top-0.5 -bottom-0.5 cursor-ew-resize touch-none flex items-center justify-center"
+    >
+      <div
+        className={`h-full flex items-center justify-center bg-amber-400 transition-shadow ${roundedClass} ${
         active
           ? "shadow-[0_0_0_4px_rgba(251,191,36,0.28)]"
           : "shadow-[0_2px_6px_rgba(0,0,0,0.4)]"
       }`}
-    >
-      <div className="h-4 w-[2px] bg-black/55 rounded-full" />
+        style={{ width: HANDLE_WIDTH_PX }}
+      >
+        <div className="h-4 w-[2px] bg-black/55 rounded-full" />
+      </div>
     </div>
   );
 }

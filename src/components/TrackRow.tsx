@@ -1,91 +1,50 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { memo, useRef, useState } from "react";
 import { useCypher, MAX_INPUT_GAIN, type TrackState } from "@/state/store";
 import { Waveform } from "@/components/Waveform";
 import { LiveWaveform } from "@/components/LiveWaveform";
 import { InputPicker } from "@/components/InputPicker";
 import { LevelMeter } from "@/components/LevelMeter";
+import { ReorderGrip } from "@/components/ReorderGrip";
 
-export function TrackRow({
+export const TrackRow = memo(function TrackRow({
   track,
   onDragStart,
+  onMove,
 }: {
   track: TrackState;
   onDragStart?: (trackId: string, pointerX: number, pointerY: number) => void;
+  onMove?: (trackId: string, direction: -1 | 1) => void;
 }) {
-  const {
-    importFile,
-    setVolume,
-    setPan,
-    setInputGain,
-    toggleMute,
-    toggleSolo,
-    toggleArm,
-    toggleNormalize,
-    removeTrack,
-    isMultiRecording,
-  } = useCypher();
+  const importFile = useCypher((state) => state.importFile);
+  const setVolume = useCypher((state) => state.setVolume);
+  const setPan = useCypher((state) => state.setPan);
+  const setInputGain = useCypher((state) => state.setInputGain);
+  const toggleMute = useCypher((state) => state.toggleMute);
+  const toggleSolo = useCypher((state) => state.toggleSolo);
+  const toggleArm = useCypher((state) => state.toggleArm);
+  const toggleNormalize = useCypher((state) => state.toggleNormalize);
+  const removeTrack = useCypher((state) => state.removeTrack);
+  const isMultiRecording = useCypher((state) => state.isMultiRecording);
+  const isStartingRecording = useCypher((state) => state.isStartingRecording);
+  const isFinalizingRecording = useCypher(
+    (state) => state.isFinalizingRecording,
+  );
   const fileRef = useRef<HTMLInputElement>(null);
-  const cardRef = useRef<HTMLElement>(null);
   const [collapsed, setCollapsed] = useState(false);
-  const armDisabled = isMultiRecording;
+  const recordingControlsDisabled =
+    isMultiRecording || isStartingRecording || isFinalizingRecording;
   const isRecordingNow = isMultiRecording && track.armed;
+  const confirmRemove = () => {
+    if (!window.confirm(`Delete "${track.name}"? You can undo this action.`)) return;
+    void removeTrack(track.id);
+  };
 
   return (
     <article
-      ref={cardRef as React.RefObject<HTMLElement>}
       data-track-id={track.id}
-      onPointerDown={(e) => {
-        if ((e.target as Element).closest("button, input, [role='slider']")) return;
-        const startX = e.clientX;
-        const startY = e.clientY;
-        let locked: "none" | "h" | "v" = "none";
-        const card = cardRef.current!;
-
-        const onMove = (mv: PointerEvent) => {
-          const dx = mv.clientX - startX;
-          const dy = mv.clientY - startY;
-          if (locked === "none") {
-            if (dx > 10 && dx > Math.abs(dy)) locked = "h";
-            else if (Math.abs(dy) > 10 || dx < -10) locked = "v";
-            return;
-          }
-          if (locked === "h") card.style.transform = `translateX(${Math.max(0, dx)}px)`;
-        };
-
-        const snapBack = () => {
-          card.style.transition = "transform 200ms ease-out";
-          card.style.transform = "translateX(0)";
-          setTimeout(() => { card.style.transition = ""; }, 200);
-        };
-
-        const onUp = (mv: PointerEvent) => {
-          cleanup();
-          if (locked !== "h") return;
-          const dx = mv.clientX - startX;
-          if (dx > 100) {
-            card.style.transition = "transform 180ms ease-out";
-            card.style.transform = `translateX(${window.innerWidth}px)`;
-            setTimeout(() => removeTrack(track.id), 180);
-          } else {
-            snapBack();
-          }
-        };
-
-        const onCancel = () => { cleanup(); snapBack(); };
-
-        const cleanup = () => {
-          document.removeEventListener("pointermove", onMove);
-          document.removeEventListener("pointerup", onUp);
-          document.removeEventListener("pointercancel", onCancel);
-        };
-
-        document.addEventListener("pointermove", onMove);
-        document.addEventListener("pointerup", onUp);
-        document.addEventListener("pointercancel", onCancel);
-      }}
-      className={`glass rounded-xl transition-colors ${
+      className={`glass rounded-xl touch-pan-y transition-colors ${
         isRecordingNow
           ? "!border-red-500/60 ring-1 ring-red-500/40"
           : track.armed
@@ -94,59 +53,20 @@ export function TrackRow({
       }`}
       aria-label={track.name}
     >
-      {/* Header — click to collapse, hold to drag */}
-      <header
-        className="flex items-center gap-1 px-2.5 pt-1.5 pb-1 cursor-pointer touch-none [&_button]:cursor-pointer"
-        onPointerDown={(e) => {
-          if ((e.target as Element).closest("button")) return;
-          const startX = e.clientX;
-          const startY = e.clientY;
-          let currentX = e.clientX;
-          let currentY = e.clientY;
-          let didDrag = false;
-          let scrollCancelled = false;
-
-          const timer = setTimeout(() => {
-            if (scrollCancelled) return;
-            didDrag = true;
-            cleanup();
-            onDragStart?.(track.id, currentX, currentY);
-          }, 260);
-
-          const onMove = (mv: PointerEvent) => {
-            currentX = mv.clientX;
-            currentY = mv.clientY;
-            if (!scrollCancelled && (Math.abs(mv.clientY - startY) > 8 || Math.abs(mv.clientX - startX) > 8)) {
-              scrollCancelled = true;
-              clearTimeout(timer);
-              cleanup();
-            }
-          };
-
-          const onUp = () => {
-            cleanup();
-            if (!didDrag && !scrollCancelled) setCollapsed((v) => !v);
-          };
-
-          const cleanup = () => {
-            clearTimeout(timer);
-            document.removeEventListener("pointermove", onMove);
-            document.removeEventListener("pointerup", onUp);
-            document.removeEventListener("pointercancel", onUp);
-          };
-
-          document.addEventListener("pointermove", onMove);
-          document.addEventListener("pointerup", onUp);
-          document.addEventListener("pointercancel", onUp);
-        }}
-      >
-        {/* Collapse indicator — visual only */}
-        <div className="h-5 w-4 flex items-center justify-center shrink-0 pointer-events-none text-[var(--text-faint)]" aria-hidden="true">
+      <header className="flex flex-wrap items-center gap-1 px-2.5 pt-1.5 pb-1">
+        <button
+          type="button"
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${track.name}`}
+          aria-expanded={!collapsed}
+          aria-controls={`track-body-${track.id}`}
+          onClick={() => setCollapsed((value) => !value)}
+          className="h-7 w-5 flex items-center justify-center shrink-0 text-[var(--text-faint)] hover:text-[var(--text-primary)] rounded-md"
+        >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform duration-150 ${collapsed ? "" : "rotate-90"}`}>
             <path d="M9 18l6-6-6-6" />
           </svg>
-        </div>
-        <div className="min-w-0 flex-1 flex items-baseline gap-2">
+        </button>
+        <div className="min-w-[7rem] flex-1 flex items-baseline gap-2">
           <div className="font-[family-name:var(--font-bebas)] tracking-[0.08em] text-sm text-[var(--text-primary)] truncate leading-none shrink-0">
             {track.name}
           </div>
@@ -156,53 +76,81 @@ export function TrackRow({
               : "no audio"}
           </div>
         </div>
-        {isRecordingNow && <LevelMeter trackId={track.id} />}
-        <ToggleButton
-          active={track.muted}
-          activeClass="bg-amber-500 text-black"
-          ariaLabel="Mute"
-          onClick={() => toggleMute(track.id)}
-        >
-          M
-        </ToggleButton>
-        <ToggleButton
-          active={track.soloed}
-          activeClass="bg-cyan-400 text-black"
-          ariaLabel="Solo"
-          onClick={() => toggleSolo(track.id)}
-        >
-          S
-        </ToggleButton>
-        <ToggleButton
-          active={track.armed}
-          activeClass="bg-red-600 text-white"
-          ariaLabel="Arm for recording"
-          disabled={armDisabled}
-          onClick={() => toggleArm(track.id)}
-        >
-          R
-        </ToggleButton>
-        <ToggleButton
-          active={track.normalized}
-          activeClass="bg-[var(--accent)] text-[#031024]"
-          ariaLabel={
-            track.normalized
-              ? "Remove normalization"
-              : "Normalize peak to -1 dBFS"
-          }
-          disabled={!track.hasAudio}
-          onClick={() => toggleNormalize(track.id)}
-        >
-          N
-        </ToggleButton>
-        {/* Grip — right, visual affordance for hold-to-drag */}
-        <div className="-mr-1 h-7 w-5 flex items-center justify-center shrink-0 pointer-events-none text-[var(--text-faint)]" aria-hidden="true">
-          <GripIcon />
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+          {isRecordingNow && <LevelMeter trackId={track.id} />}
+          <ToggleButton
+            active={track.muted}
+            activeClass="bg-amber-500 text-black"
+            ariaLabel="Mute"
+            onClick={() => toggleMute(track.id)}
+          >
+            M
+          </ToggleButton>
+          <ToggleButton
+            active={track.soloed}
+            activeClass="bg-cyan-400 text-black"
+            ariaLabel="Solo"
+            onClick={() => toggleSolo(track.id)}
+          >
+            S
+          </ToggleButton>
+          <ToggleButton
+            active={track.armed}
+            activeClass="bg-red-600 text-white"
+            ariaLabel="Arm for recording"
+            disabled={recordingControlsDisabled}
+            onClick={() => toggleArm(track.id)}
+          >
+            R
+          </ToggleButton>
+          <ToggleButton
+            active={track.normalized}
+            activeClass="bg-[var(--accent)] text-[#031024]"
+            ariaLabel={
+              track.normalized
+                ? "Remove normalization"
+                : "Normalize peak to -1 dBFS"
+            }
+            disabled={!track.hasAudio}
+            onClick={() => toggleNormalize(track.id)}
+          >
+            N
+          </ToggleButton>
+          <button
+            type="button"
+            onClick={confirmRemove}
+            aria-label={`Delete ${track.name}`}
+            title={`Delete ${track.name}`}
+            className="h-7 w-7 rounded-md bg-white/[0.05] hover:bg-red-500/15 border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-red-300 flex items-center justify-center active:scale-95 transition-colors shrink-0"
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 10v6M14 10v6" />
+            </svg>
+          </button>
+          <ReorderGrip
+            trackId={track.id}
+            trackName={track.name}
+            onDragStart={onDragStart}
+            onMove={onMove}
+          />
         </div>
       </header>
 
       {/* Collapsible body */}
       <div
+        id={`track-body-${track.id}`}
+        inert={collapsed}
+        aria-hidden={collapsed ? "true" : undefined}
         className={`grid transition-[grid-template-rows] duration-200 ease-out ${
           collapsed ? "grid-rows-[0fr]" : "grid-rows-[1fr]"
         }`}
@@ -214,12 +162,13 @@ export function TrackRow({
                 <InputPicker
                   trackId={track.id}
                   selectedDeviceId={track.inputDeviceId}
-                  disabled={isMultiRecording}
+                  disabled={recordingControlsDisabled}
                 />
               </div>
               <button
+                disabled={recordingControlsDisabled}
                 onClick={() => fileRef.current?.click()}
-                className="h-7 px-2.5 rounded-md bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-primary)] text-[11px] font-medium active:scale-95 shrink-0 transition-colors"
+                className="h-7 px-2.5 rounded-md bg-white/[0.06] hover:bg-white/[0.1] border border-[var(--border-subtle)] text-[var(--text-primary)] text-[11px] font-medium active:scale-95 shrink-0 transition-colors disabled:opacity-40 disabled:pointer-events-none"
               >
                 {track.hasAudio ? "Replace" : "Import"}
               </button>
@@ -297,20 +246,7 @@ export function TrackRow({
       </div>
     </article>
   );
-}
-
-function GripIcon() {
-  return (
-    <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden="true">
-      <circle cx="3" cy="2.5" r="1.2" />
-      <circle cx="7" cy="2.5" r="1.2" />
-      <circle cx="3" cy="7"   r="1.2" />
-      <circle cx="7" cy="7"   r="1.2" />
-      <circle cx="3" cy="11.5" r="1.2" />
-      <circle cx="7" cy="11.5" r="1.2" />
-    </svg>
-  );
-}
+});
 
 function ToggleButton({
   active,

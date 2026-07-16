@@ -88,17 +88,16 @@ The product exists to capture musical ideas at the moment of inspiration — whe
 The constraint shaping every choice: **low-latency multitrack audio in a mobile browser, exported on-device.** This rules out most server-rendered or heavyweight frameworks.
 
 ### Frontend framework
-- **Next.js 15 (App Router) + React 19** — PWA-friendly, mature, Vercel deploy is one click. Static export mode keeps the app fully client-side; no SSR audio gymnastics required.
+- **Next.js 16.2 (App Router) + React 19.2** — static export mode keeps the app fully client-side and deployable to GitHub Pages.
 - **TypeScript** throughout.
 
 ### Audio engine
 - **Web Audio API** — the only viable browser API for sample-accurate scheduling and multi-track mixing.
 - **Tone.js** as a thin convenience layer over Web Audio for transport, scheduling, and the metronome. Avoids reinventing the clock. Drop down to raw `AudioContext` for buffer manipulation and routing.
-- **AudioWorklet** for the recording path so mic capture runs off the main thread (critical for latency on mobile Safari).
-- **MediaRecorder API** as a fallback recording path on browsers where AudioWorklet input capture is constrained.
+- **MediaRecorder API** for the recording path, with Web Audio analyser nodes for metering and decoded `AudioBuffer`s for playback/editing.
 
 ### Waveform rendering
-- **wavesurfer.js v7** — battle-tested, supports regions/trimming, mobile-friendly. Backed by a single `<canvas>` per track so 6 waveforms stay cheap.
+- **Custom canvas peak renderer** — immutable `AudioBuffer`s are summarized once into cached min/max bins, so resize and remount work stays bounded even for long recordings.
 
 ### Encoding / export
 - **`@mediabunny/mp3-encoder`** or **`lamejs`** (WASM build) for mp3 export — runs in a Web Worker so the UI stays responsive.
@@ -108,21 +107,19 @@ The constraint shaping every choice: **low-latency multitrack audio in a mobile 
 ### State & persistence
 - **Zustand** for app/transport state — lighter than Redux, no provider boilerplate, plays well with React 19.
 - **IndexedDB via `idb`** for project persistence (audio buffers as `Blob`s, project metadata as JSON). LocalStorage is too small for audio.
-- **Origin Private File System (OPFS)** for large temporary buffers during recording where supported (Chrome/Edge), falling back to IndexedDB.
 
 ### UI
-- **Tailwind CSS v4** + **shadcn/ui** for the controls. Custom canvas/SVG for the timeline, transport, and meters.
-- **Framer Motion** sparingly for transport-state transitions.
+- **Tailwind CSS v4** with semantic custom controls. Canvas/SVG handle waveforms, the timeline, transport icons, and meters.
 
 ### PWA
-- **next-pwa** or **Serwist** for the service worker. Cache the app shell + WASM encoder; don't cache user audio.
+- **Generated service worker** with a content-revisioned static-export manifest. User recordings remain in IndexedDB and are never placed in HTTP caches.
 
 ### Tooling
-- **pnpm**, **Biome** (lint+format), **Vitest** for unit tests, **Playwright** for the export-pipeline e2e (it can drive `getUserMedia` with a fake audio source).
+- **pnpm**, **ESLint**, Node's test runner, and **Playwright** for persistence/offline browser regressions.
 - **Sentry** for error tracking once we ship.
 
 ### Hosting
-- **Vercel** or **Cloudflare Pages**. No backend in v1 — everything is static + client-side.
+- **GitHub Pages**. No backend in v1 — everything is static + client-side.
 
 ### Why not …
 - **Native (React Native / Expo)** — defers v1 by months; the spec says mobile *web* app, and `getUserMedia` + Web Audio cover the requirement.
@@ -136,7 +133,7 @@ The constraint shaping every choice: **low-latency multitrack audio in a mobile 
 ┌────────────────────────────────────────────────────────┐
 │  React UI (Next.js, Tailwind, shadcn)                  │
 │   ├─ Transport / Track List / Mixer                    │
-│   └─ Waveform views (wavesurfer.js)                    │
+│   └─ Cached canvas waveform views                      │
 ├────────────────────────────────────────────────────────┤
 │  Zustand store  ⇄  IndexedDB (idb) / OPFS              │
 ├────────────────────────────────────────────────────────┤
@@ -144,7 +141,7 @@ The constraint shaping every choice: **low-latency multitrack audio in a mobile 
 │   ├─ Tone.Transport (clock, metronome)                 │
 │   ├─ Per-track GainNode → PannerNode → master bus      │
 │   ├─ Master bus → DynamicsCompressor (limiter) → dest  │
-│   ├─ Recording: getUserMedia → AudioWorklet → Buffer   │
+│   ├─ Recording: getUserMedia → MediaRecorder → Buffer  │
 │   └─ Export: OfflineAudioContext → WAV/MP3 (Worker)    │
 └────────────────────────────────────────────────────────┘
 ```

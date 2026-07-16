@@ -3,20 +3,22 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
 concurrency:
-  group: pages
+  # Keep each PR independent while sharing one group for push/manual deployments.
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.event.pull_request.number) || 'pages-deploy' }}
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # configure-pages reads the existing Pages site metadata.
+      pages: read
     steps:
       - uses: actions/checkout@v4
 
@@ -33,21 +35,54 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Build (static export)
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Dependency audit
+        run: pnpm audit --audit-level low
+
+      - name: Build (root export for browser tests)
         run: pnpm build
 
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Browser regression tests
+        run: pnpm test:e2e
+
+      - if: github.event_name != 'pull_request'
+        id: pages
+        name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - if: github.event_name != 'pull_request'
+        name: Build Pages artifact
+        run: pnpm build
+        env:
+          NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+
       # Disable Jekyll so files/folders starting with _ (e.g. _next) aren't ignored.
-      - run: touch out/.nojekyll
+      - if: github.event_name != 'pull_request'
+        run: touch out/.nojekyll
 
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: out
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

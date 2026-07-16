@@ -3,6 +3,17 @@
 // Uses lamejs (no types).
 // @ts-expect-error - lamejs has no type declarations
 import lamejs from "lamejs";
+// lamejs@1.2.1's package entry leaves these symbols as globals even though
+// its encoder modules reference them. Import and expose the package's own
+// implementations before constructing Mp3Encoder.
+// @ts-expect-error - lamejs has no type declarations or exported subpath types
+import Lame from "lamejs/src/js/Lame.js";
+// @ts-expect-error - lamejs has no type declarations or exported subpath types
+import BitStream from "lamejs/src/js/BitStream.js";
+// @ts-expect-error - lamejs has no type declarations or exported subpath types
+import MPEGMode from "lamejs/src/js/MPEGMode.js";
+
+Object.assign(globalThis, { BitStream, Lame, MPEGMode });
 
 interface EncodeMessage {
   type: "encode";

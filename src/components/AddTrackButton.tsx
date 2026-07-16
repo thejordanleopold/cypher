@@ -12,10 +12,17 @@ interface Props {
 }
 
 interface PopoverPos {
-  top: number;
+  top?: number;
+  bottom?: number;
   left: number;
   width: number;
+  maxHeight: number;
 }
+
+const POPOVER_WIDTH = 224;
+const POPOVER_MIN_HEIGHT = 112;
+const VIEWPORT_PADDING = 12;
+const POPOVER_GAP = 8;
 
 export function AddTrackButton({ variant, stripHeight }: Props) {
   const addTrack = useCypher((s) => s.addTrack);
@@ -23,19 +30,63 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
   const [pos, setPos] = useState<PopoverPos | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
+  const focusedForOpenRef = useRef(false);
 
   useLayoutEffect(() => {
     if (!open || !btnRef.current) return;
     const update = () => {
       const r = btnRef.current!.getBoundingClientRect();
-      setPos({ top: r.bottom + 6, left: r.right + 8, width: r.width });
+      const viewportWidth = window.visualViewport?.width ?? window.innerWidth;
+      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+      const width = Math.min(
+        POPOVER_WIDTH,
+        Math.max(0, viewportWidth - VIEWPORT_PADDING * 2),
+      );
+      const rightCandidate = r.right + POPOVER_GAP;
+      const leftCandidate = r.left - POPOVER_GAP - width;
+      const left =
+        rightCandidate + width <= viewportWidth - VIEWPORT_PADDING
+          ? rightCandidate
+          : Math.max(
+              VIEWPORT_PADDING,
+              Math.min(leftCandidate, viewportWidth - VIEWPORT_PADDING - width),
+            );
+      const spaceBelow = viewportHeight - r.bottom - POPOVER_GAP - VIEWPORT_PADDING;
+      const spaceAbove = r.top - POPOVER_GAP - VIEWPORT_PADDING;
+
+      if (Math.max(spaceBelow, spaceAbove) < POPOVER_MIN_HEIGHT) {
+        setPos({
+          top: VIEWPORT_PADDING,
+          left,
+          width,
+          maxHeight: Math.max(0, viewportHeight - VIEWPORT_PADDING * 2),
+        });
+      } else if (spaceBelow >= POPOVER_MIN_HEIGHT || spaceBelow >= spaceAbove) {
+        setPos({
+          top: r.bottom + POPOVER_GAP,
+          left,
+          width,
+          maxHeight: Math.max(0, spaceBelow),
+        });
+      } else {
+        setPos({
+          bottom: viewportHeight - r.top + POPOVER_GAP,
+          left,
+          width,
+          maxHeight: Math.max(0, spaceAbove),
+        });
+      }
     };
     update();
     window.addEventListener("resize", update);
     window.addEventListener("scroll", update, true);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
     return () => {
       window.removeEventListener("resize", update);
       window.removeEventListener("scroll", update, true);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
     };
   }, [open]);
 
@@ -50,7 +101,10 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        setOpen(false);
+        btnRef.current?.focus();
+      }
     };
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onKey);
@@ -60,9 +114,25 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
     };
   }, [open]);
 
+  useEffect(() => {
+    if (!open) {
+      focusedForOpenRef.current = false;
+      return;
+    }
+    if (!pos || focusedForOpenRef.current) return;
+    focusedForOpenRef.current = true;
+    const frame = requestAnimationFrame(() => {
+      popRef.current
+        ?.querySelector<HTMLButtonElement>('[role="menuitem"]')
+        ?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [open, pos]);
+
   const choose = (kind: TrackKind) => {
     setOpen(false);
     void addTrack(kind);
+    requestAnimationFrame(() => btnRef.current?.focus());
   };
 
   // Wide: two explicit side-by-side buttons, no popover needed.
@@ -95,8 +165,34 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
       ref={popRef}
       role="menu"
       aria-label="Choose track type"
-      style={{ position: "fixed", top: pos.top, left: pos.left, zIndex: 9999 }}
-      className="w-56 glass-raised rounded-xl p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
+      onKeyDown={(e) => {
+        const items = Array.from(
+          e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+        );
+        if (items.length === 0) return;
+        const current = items.indexOf(document.activeElement as HTMLButtonElement);
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          const delta = e.key === "ArrowDown" ? 1 : -1;
+          items[(current + delta + items.length) % items.length]?.focus();
+        } else if (e.key === "Home") {
+          e.preventDefault();
+          items[0]?.focus();
+        } else if (e.key === "End") {
+          e.preventDefault();
+          items.at(-1)?.focus();
+        }
+      }}
+      style={{
+        position: "fixed",
+        top: pos.top,
+        bottom: pos.bottom,
+        left: pos.left,
+        width: pos.width,
+        maxHeight: pos.maxHeight,
+        zIndex: 9999,
+      }}
+      className="overflow-y-auto overscroll-contain glass-raised rounded-xl p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.5)]"
     >
       <MenuOption
         onClick={() => choose("audio")}

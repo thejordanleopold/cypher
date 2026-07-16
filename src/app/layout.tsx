@@ -5,6 +5,7 @@ import { SwRegister } from "@/components/SwRegister";
 import { VisibilityHandler } from "@/components/VisibilityHandler";
 import { WakeLockHandler } from "@/components/WakeLockHandler";
 import { Toaster } from "@/components/Toaster";
+import { getBasePath } from "@/base-path";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -22,7 +23,7 @@ const bebas = Bebas_Neue({
   subsets: ["latin"],
 });
 
-const BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+const BASE = getBasePath();
 
 export const metadata: Metadata = {
   title: "Cypher",
@@ -46,8 +47,6 @@ export const metadata: Metadata = {
 export const viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
   viewportFit: "cover" as const,
   themeColor: "#050a18",
 };

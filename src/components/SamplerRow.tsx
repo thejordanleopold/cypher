@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { memo, useRef, useState } from "react";
 import {
   useCypher,
   SAMPLER_PAD_COUNT,
@@ -8,15 +8,18 @@ import {
   type SamplerPadState,
   type TrackState,
 } from "@/state/store";
+import { ReorderGrip } from "@/components/ReorderGrip";
 
 const BANK_LABELS = ["A", "B", "C", "D"] as const;
 
-export function SamplerRow({
+export const SamplerRow = memo(function SamplerRow({
   track,
   onDragStart,
+  onMove,
 }: {
   track: TrackState;
   onDragStart?: (trackId: string, pointerX: number, pointerY: number) => void;
+  onMove?: (trackId: string, direction: -1 | 1) => void;
 }) {
   const setVolume = useCypher((s) => s.setVolume);
   const setPan = useCypher((s) => s.setPan);
@@ -26,123 +29,37 @@ export function SamplerRow({
   const armSamplerRecord = useCypher((s) => s.armSamplerRecord);
   const clearSamplerPattern = useCypher((s) => s.clearSamplerPattern);
   const isPlaying = useCypher((s) => s.isPlaying);
-  const cardRef = useRef<HTMLElement>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [activeBank, setActiveBank] = useState(0);
 
   const bankOffset = activeBank * SAMPLER_BANK_SIZE;
   const bankPads = track.pads.slice(bankOffset, bankOffset + SAMPLER_BANK_SIZE);
   const totalLoaded = track.pads.filter((p) => p.hasAudio).length;
+  const confirmRemove = () => {
+    if (!window.confirm(`Delete "${track.name}"? You can undo this action.`)) return;
+    void removeTrack(track.id);
+  };
 
   return (
     <article
-      ref={cardRef as React.RefObject<HTMLElement>}
       data-track-id={track.id}
-      onPointerDown={(e) => {
-        if ((e.target as Element).closest("button, input, [role='slider']")) return;
-        const startX = e.clientX;
-        const startY = e.clientY;
-        let locked: "none" | "h" | "v" = "none";
-        const card = cardRef.current!;
-
-        const onMove = (mv: PointerEvent) => {
-          const dx = mv.clientX - startX;
-          const dy = mv.clientY - startY;
-          if (locked === "none") {
-            if (dx > 10 && dx > Math.abs(dy)) locked = "h";
-            else if (Math.abs(dy) > 10 || dx < -10) locked = "v";
-            return;
-          }
-          if (locked === "h") card.style.transform = `translateX(${Math.max(0, dx)}px)`;
-        };
-
-        const snapBack = () => {
-          card.style.transition = "transform 200ms ease-out";
-          card.style.transform = "translateX(0)";
-          setTimeout(() => { card.style.transition = ""; }, 200);
-        };
-
-        const onUp = (mv: PointerEvent) => {
-          cleanup();
-          if (locked !== "h") return;
-          const dx = mv.clientX - startX;
-          if (dx > 100) {
-            card.style.transition = "transform 180ms ease-out";
-            card.style.transform = `translateX(${window.innerWidth}px)`;
-            setTimeout(() => removeTrack(track.id), 180);
-          } else {
-            snapBack();
-          }
-        };
-
-        const onCancel = () => { cleanup(); snapBack(); };
-
-        const cleanup = () => {
-          document.removeEventListener("pointermove", onMove);
-          document.removeEventListener("pointerup", onUp);
-          document.removeEventListener("pointercancel", onCancel);
-        };
-
-        document.addEventListener("pointermove", onMove);
-        document.addEventListener("pointerup", onUp);
-        document.addEventListener("pointercancel", onCancel);
-      }}
-      className="glass rounded-xl"
+      className="glass rounded-xl touch-pan-y"
       aria-label={track.name}
     >
-      {/* Header — click to collapse, hold to drag */}
-      <header
-        className="flex items-center gap-1 px-2.5 pt-1.5 pb-1 cursor-pointer touch-none [&_button]:cursor-pointer"
-        onPointerDown={(e) => {
-          if ((e.target as Element).closest("button")) return;
-          const startX = e.clientX;
-          const startY = e.clientY;
-          let currentX = e.clientX;
-          let currentY = e.clientY;
-          let didDrag = false;
-          let scrollCancelled = false;
-
-          const timer = setTimeout(() => {
-            if (scrollCancelled) return;
-            didDrag = true;
-            cleanup();
-            onDragStart?.(track.id, currentX, currentY);
-          }, 260);
-
-          const onMove = (mv: PointerEvent) => {
-            currentX = mv.clientX;
-            currentY = mv.clientY;
-            if (!scrollCancelled && (Math.abs(mv.clientY - startY) > 8 || Math.abs(mv.clientX - startX) > 8)) {
-              scrollCancelled = true;
-              clearTimeout(timer);
-              cleanup();
-            }
-          };
-
-          const onUp = () => {
-            cleanup();
-            if (!didDrag && !scrollCancelled) setCollapsed((v) => !v);
-          };
-
-          const cleanup = () => {
-            clearTimeout(timer);
-            document.removeEventListener("pointermove", onMove);
-            document.removeEventListener("pointerup", onUp);
-            document.removeEventListener("pointercancel", onUp);
-          };
-
-          document.addEventListener("pointermove", onMove);
-          document.addEventListener("pointerup", onUp);
-          document.addEventListener("pointercancel", onUp);
-        }}
-      >
-        {/* Collapse indicator — visual only */}
-        <div className="h-5 w-4 flex items-center justify-center shrink-0 pointer-events-none text-[var(--text-faint)]" aria-hidden="true">
+      <header className="flex flex-wrap items-center gap-1 px-2.5 pt-1.5 pb-1">
+        <button
+          type="button"
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${track.name}`}
+          aria-expanded={!collapsed}
+          aria-controls={`track-body-${track.id}`}
+          onClick={() => setCollapsed((value) => !value)}
+          className="h-7 w-5 flex items-center justify-center shrink-0 text-[var(--text-faint)] hover:text-[var(--text-primary)] rounded-md"
+        >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform duration-150 ${collapsed ? "" : "rotate-90"}`}>
             <path d="M9 18l6-6-6-6" />
           </svg>
-        </div>
-        <div className="min-w-0 flex-1 flex items-baseline gap-2">
+        </button>
+        <div className="min-w-[7rem] flex-1 flex items-baseline gap-2">
           <div className="font-[family-name:var(--font-bebas)] tracking-[0.08em] text-sm text-[var(--text-primary)] truncate leading-none shrink-0">
             {track.name}
           </div>
@@ -150,44 +67,69 @@ export function SamplerRow({
             sampler · {totalLoaded}/{SAMPLER_PAD_COUNT} loaded
           </div>
         </div>
-        <ToggleButton
-          active={track.muted}
-          activeClass="bg-amber-500 text-black"
-          ariaLabel="Mute"
-          onClick={() => toggleMute(track.id)}
-        >
-          M
-        </ToggleButton>
-        <ToggleButton
-          active={track.soloed}
-          activeClass="bg-cyan-400 text-black"
-          ariaLabel="Solo"
-          onClick={() => toggleSolo(track.id)}
-        >
-          S
-        </ToggleButton>
-        <ToggleButton
-          active={track.samplerRecArmed}
-          activeClass="bg-red-600 text-white"
-          ariaLabel={
-            track.samplerRecArmed
-              ? "Disable pattern recording"
-              : "Enable pattern recording — pad hits will be recorded while transport plays"
-          }
-          onClick={() => armSamplerRecord(track.id)}
-        >
-          ●
-        </ToggleButton>
-        {/* Grip — right, visual affordance for hold-to-drag */}
-        <div className="-mr-1 h-7 w-5 flex items-center justify-center shrink-0 pointer-events-none text-[var(--text-faint)]" aria-hidden="true">
-          <GripIcon />
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+          <ToggleButton
+            active={track.muted}
+            activeClass="bg-amber-500 text-black"
+            ariaLabel="Mute"
+            onClick={() => toggleMute(track.id)}
+          >
+            M
+          </ToggleButton>
+          <ToggleButton
+            active={track.soloed}
+            activeClass="bg-cyan-400 text-black"
+            ariaLabel="Solo"
+            onClick={() => toggleSolo(track.id)}
+          >
+            S
+          </ToggleButton>
+          <ToggleButton
+            active={track.samplerRecArmed}
+            activeClass="bg-red-600 text-white"
+            ariaLabel={
+              track.samplerRecArmed
+                ? "Disable pattern recording"
+                : "Enable pattern recording — pad hits will be recorded while transport plays"
+            }
+            onClick={() => armSamplerRecord(track.id)}
+          >
+            ●
+          </ToggleButton>
+          <button
+            type="button"
+            onClick={confirmRemove}
+            aria-label={`Delete ${track.name}`}
+            title={`Delete ${track.name}`}
+            className="h-7 w-7 rounded-md bg-white/[0.05] hover:bg-red-500/15 border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-red-300 flex items-center justify-center active:scale-95 transition-colors shrink-0"
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 10v6M14 10v6" />
+            </svg>
+          </button>
+          <ReorderGrip
+            trackId={track.id}
+            trackName={track.name}
+            onDragStart={onDragStart}
+            onMove={onMove}
+          />
         </div>
       </header>
 
       {/* Compact pad strip — single horizontal row when collapsed */}
       {collapsed && (
         <div className="px-2.5 pb-2 pt-1 flex items-center gap-1.5">
-          <div className="flex-1 grid grid-cols-8 gap-1">
+          <div className="sampler-compact-pads flex-1 grid grid-cols-8 gap-1">
             {bankPads.map((pad, i) => (
               <CompactPad
                 key={bankOffset + i}
@@ -198,7 +140,7 @@ export function SamplerRow({
             ))}
           </div>
           {/* Tiny bank switcher — 2×2 grid */}
-          <div className="grid grid-cols-2 gap-0.5 shrink-0">
+          <div className="sampler-bank-switcher grid grid-cols-2 gap-0.5 shrink-0">
             {(BANK_LABELS as readonly string[]).map((label, i) => {
               const isActive = i === activeBank;
               const hasContent = track.pads
@@ -228,6 +170,9 @@ export function SamplerRow({
       )}
 
       <div
+        id={`track-body-${track.id}`}
+        inert={collapsed}
+        aria-hidden={collapsed ? "true" : undefined}
         className={`grid transition-[grid-template-rows] duration-200 ease-out ${
           collapsed ? "grid-rows-[0fr]" : "grid-rows-[1fr]"
         }`}
@@ -288,7 +233,7 @@ export function SamplerRow({
                       {track.samplerPattern.length === 1 ? "event" : "events"}
                     </span>
                     <button
-                      onClick={() => clearSamplerPattern(track.id)}
+                      onClick={() => void clearSamplerPattern(track.id)}
                       className="text-[var(--text-faint)] hover:text-red-400 transition-colors uppercase tracking-wider"
                     >
                       Clear
@@ -299,7 +244,7 @@ export function SamplerRow({
             )}
             <div className="flex gap-1.5 items-stretch">
               <PadGrid trackId={track.id} pads={bankPads} bankOffset={bankOffset} />
-              <div className="flex flex-col gap-1 w-7 shrink-0">
+              <div className="sampler-bank-column flex flex-col gap-1 w-7 shrink-0">
                 {(BANK_LABELS as readonly string[]).map((label, i) => {
                   const start = i * SAMPLER_BANK_SIZE;
                   const hasContent = track.pads
@@ -336,7 +281,7 @@ export function SamplerRow({
       </div>
     </article>
   );
-}
+});
 
 function PadGrid({
   trackId,
@@ -355,7 +300,6 @@ function PadGrid({
     </div>
   );
 }
-
 function Pad({
   trackId,
   padIdx,
@@ -401,11 +345,18 @@ function Pad({
   };
 
   return (
-    <div className="relative">
+    <div className="flex flex-col gap-1">
       <button
+        type="button"
         onPointerDown={(e) => {
+          if (e.button !== 0) return;
           e.preventDefault();
           onTap();
+        }}
+        onClick={(e) => {
+          // Native keyboard and assistive-technology activation dispatches a
+          // click without pointer detail. Pointer input already fired above.
+          if (e.detail === 0) onTap();
         }}
         aria-label={
           pad.hasAudio
@@ -427,41 +378,32 @@ function Pad({
           {pad.hasAudio ? padLabel(pad.fileName) : "+"}
         </span>
       </button>
-      <button
-        onPointerDown={(e) => {
-          // Stop the underlying pad's pointerdown from firing — without this
-          // both buttons get a hit and the pad would trigger right before
-          // the file picker opened.
-          e.stopPropagation();
-        }}
-        onClick={(e) => {
-          e.stopPropagation();
-          fileRef.current?.click();
-        }}
-        aria-label={
-          pad.hasAudio
-            ? `Replace sample on pad ${padIdx + 1}`
-            : `Load sample to pad ${padIdx + 1}`
-        }
-        className="absolute top-0.5 left-0.5 w-4 h-4 rounded text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-black/40 flex items-center justify-center"
-      >
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <path d="M12 16V4M6 10l6-6 6 6M4 20h16" />
-        </svg>
-      </button>
-      {pad.hasAudio && (
+      <div className="sampler-pad-actions grid grid-cols-2 gap-1">
         <button
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.stopPropagation();
-            clearPadSample(trackId, padIdx);
-          }}
-          aria-label={`Clear pad ${padIdx + 1}`}
-          className="absolute top-0.5 right-0.5 w-4 h-4 rounded text-[var(--text-faint)] hover:text-red-400 hover:bg-black/40 flex items-center justify-center text-[10px] leading-none"
+          onClick={() => fileRef.current?.click()}
+          aria-label={
+            pad.hasAudio
+              ? `Replace sample on pad ${padIdx + 1}`
+              : `Load sample to pad ${padIdx + 1}`
+          }
+          className={`h-7 rounded-md bg-white/[0.04] border border-[var(--border-subtle)] text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-white/[0.08] flex items-center justify-center ${
+            pad.hasAudio ? "" : "col-span-2"
+          }`}
         >
-          ×
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 16V4M6 10l6-6 6 6M4 20h16" />
+          </svg>
         </button>
-      )}
+        {pad.hasAudio && (
+          <button
+            onClick={() => clearPadSample(trackId, padIdx)}
+            aria-label={`Clear pad ${padIdx + 1}`}
+            className="h-7 rounded-md bg-white/[0.04] border border-[var(--border-subtle)] text-[var(--text-faint)] hover:text-red-400 hover:bg-red-500/10 flex items-center justify-center text-[14px] leading-none"
+          >
+            ×
+          </button>
+        )}
+      </div>
       <input
         ref={fileRef}
         type="file"
@@ -502,16 +444,22 @@ function CompactPad({
 
   return (
     <button
+      type="button"
+      disabled={!pad.hasAudio}
       onPointerDown={(e) => {
+        if (e.button !== 0 || !pad.hasAudio) return;
         e.preventDefault();
         onTap();
+      }}
+      onClick={(e) => {
+        if (e.detail === 0) onTap();
       }}
       aria-label={
         pad.hasAudio
           ? `Trigger pad ${(padIdx % SAMPLER_BANK_SIZE) + 1}: ${pad.fileName ?? "sample"}`
           : `Pad ${(padIdx % SAMPLER_BANK_SIZE) + 1} — empty`
       }
-      className={`aspect-square rounded border text-[8px] flex flex-col items-center justify-center gap-px transition-colors select-none touch-none ${
+      className={`sampler-compact-pad aspect-square rounded border text-[8px] flex flex-col items-center justify-center gap-px transition-colors select-none touch-none disabled:cursor-default ${
         active
           ? "bg-[var(--accent)] text-[#031024] border-[var(--accent)]"
           : pad.hasAudio
@@ -605,19 +553,5 @@ function SliderRow({
         {formatValue(value)}
       </span>
     </label>
-  );
-}
-
-
-function GripIcon() {
-  return (
-    <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden="true">
-      <circle cx="3" cy="2.5" r="1.2" />
-      <circle cx="7" cy="2.5" r="1.2" />
-      <circle cx="3" cy="7"   r="1.2" />
-      <circle cx="7" cy="7"   r="1.2" />
-      <circle cx="3" cy="11.5" r="1.2" />
-      <circle cx="7" cy="11.5" r="1.2" />
-    </svg>
   );
 }

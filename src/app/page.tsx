@@ -1,6 +1,13 @@
 "use client";
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useCypher } from "@/state/store";
 import { Transport } from "@/components/Transport";
 import { Timeline } from "@/components/Timeline";
@@ -18,30 +25,40 @@ export default function Home() {
   const tracks = useCypher((s) => s.tracks);
   const projectName = useCypher((s) => s.currentProjectName);
   const isLoaded = useCypher((s) => s.isLoaded);
+  const loadError = useCypher((s) => s.loadError);
   const initProject = useCypher((s) => s.initProject);
   const createProject = useCypher((s) => s.createProject);
   const startDemo = useCypher((s) => s.startDemo);
   const isDemoMode = useCypher((s) => s.isDemoMode);
+  const isApplyingHistory = useCypher((s) => s.isApplyingHistory);
   const reorderTracks = useCypher((s) => s.reorderTracks);
 
   const [splashDone, setSplashDone] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>("track");
+  const [viewMode, setViewMode] = useStoredViewMode();
   const [showResume, setShowResume] = useState(false);
   const [showSongEditor, setShowSongEditor] = useState(false);
   const [demoLoading, setDemoLoading] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [draggingTrack, setDraggingTrack] = useState<(typeof tracks)[number] | null>(null);
   const [insertBefore, setInsertBefore] = useState<number | null>(null);
-  // Guard so the dialog only fires once per page load.
-  const resumeChecked = useRef(false);
   const insertBeforeRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const ghostRef = useRef<HTMLDivElement>(null);
   const ghostOffsetY = useRef(0);
-  const ghostRectRef = useRef<{ left: number; top: number; width: number } | null>(null);
+  const [ghostRect, setGhostRect] = useState<{
+    left: number;
+    top: number;
+    width: number;
+  } | null>(null);
+  const closeSongEditor = useCallback(() => setShowSongEditor(false), []);
 
-  function handleDragStart(trackId: string, pointerX: number, pointerY: number) {
-    const fromIdx = tracks.findIndex((t) => t.id === trackId);
+  const handleDragStart = useCallback((
+    trackId: string,
+    _pointerX: number,
+    pointerY: number,
+  ) => {
+    const currentTracks = useCypher.getState().tracks;
+    const fromIdx = currentTracks.findIndex((track) => track.id === trackId);
     if (fromIdx === -1) return;
 
     const cardEl = containerRef.current?.querySelector<HTMLElement>(
@@ -49,23 +66,19 @@ export default function Home() {
     );
     const rect = cardEl?.getBoundingClientRect();
     if (rect) {
-      ghostRectRef.current = { left: rect.left, top: rect.top, width: rect.width };
+      setGhostRect({ left: rect.left, top: rect.top, width: rect.width });
       ghostOffsetY.current = pointerY - rect.top;
     }
 
     setDraggingId(trackId);
-    setDraggingTrack(tracks[fromIdx]);
+    setDraggingTrack(currentTracks[fromIdx]);
     insertBeforeRef.current = null;
 
     const onMove = (ev: PointerEvent) => {
-      // Direct DOM update — bypasses React for butter-smooth 60fps ghost movement.
-      if (ghostRef.current && ghostRectRef.current) {
-        const dy = ev.clientY - ghostOffsetY.current - ghostRectRef.current.top;
-        ghostRef.current.style.transform = `translateY(${dy}px) scale(1.025)`;
-      }
-
       const container = containerRef.current;
       if (!container) return;
+      // Read layout before mutating the drag ghost's style. Keeping DOM reads
+      // together avoids a forced style/layout flush on every pointer move.
       const cards = Array.from(
         container.querySelectorAll<HTMLElement>("[data-track-id]"),
       );
@@ -81,50 +94,65 @@ export default function Home() {
         insertBeforeRef.current = newInsertBefore;
         setInsertBefore(newInsertBefore);
       }
+
+      // Direct DOM update keeps the drag ghost responsive without a React
+      // render for every pointer coordinate.
+      if (ghostRef.current && rect) {
+        const dy = ev.clientY - ghostOffsetY.current - rect.top;
+        ghostRef.current.style.transform = `translateY(${dy}px) scale(1.025)`;
+      }
     };
 
-    const onUp = () => {
+    const finishDrag = (commit: boolean) => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
-      document.removeEventListener("pointercancel", onUp);
+      document.removeEventListener("pointercancel", onCancel);
       const ib = insertBeforeRef.current;
-      if (ib !== null && ib !== fromIdx && ib !== fromIdx + 1) {
+      if (commit && ib !== null && ib !== fromIdx && ib !== fromIdx + 1) {
         reorderTracks(fromIdx, ib > fromIdx ? ib - 1 : ib);
       }
       setDraggingId(null);
       setDraggingTrack(null);
       setInsertBefore(null);
       insertBeforeRef.current = null;
-      ghostRectRef.current = null;
+      setGhostRect(null);
     };
+    const onUp = () => finishDrag(true);
+    const onCancel = () => finishDrag(false);
 
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp);
-    document.addEventListener("pointercancel", onUp);
-  }
+    document.addEventListener("pointercancel", onCancel);
+  }, [reorderTracks]);
+
+  const handleMoveTrack = useCallback(
+    (trackId: string, direction: -1 | 1) => {
+      const currentTracks = useCypher.getState().tracks;
+      const fromIdx = currentTracks.findIndex((track) => track.id === trackId);
+      const toIdx = fromIdx + direction;
+      if (fromIdx < 0 || toIdx < 0 || toIdx >= currentTracks.length) return;
+      reorderTracks(fromIdx, toIdx);
+    },
+    [reorderTracks],
+  );
 
   useEffect(() => {
-    initProject();
+    let cancelled = false;
+    void initProject()
+      .then(() => {
+        if (!cancelled && useCypher.getState().tracks.length > 0) {
+          setShowResume(true);
+        }
+      })
+      .catch(() => {
+        // The store exposes the actionable failure through loadError.
+      });
     const t = setTimeout(() => setSplashDone(true), 2500);
-    return () => clearTimeout(t);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
   }, [initProject]);
-
-  // After the splash clears and the project is loaded, show the resume dialog
-  // if there is an existing session with tracks.
-  useEffect(() => {
-    if (!splashDone || !isLoaded || resumeChecked.current) return;
-    resumeChecked.current = true;
-    if (tracks.length > 0) setShowResume(true);
-  }, [splashDone, isLoaded, tracks.length]);
-
-  // Persist view choice locally so it survives reloads.
-  useEffect(() => {
-    const saved = localStorage.getItem("cypher.viewMode");
-    if (saved === "mixer" || saved === "track") setViewMode(saved);
-  }, []);
-  useEffect(() => {
-    localStorage.setItem("cypher.viewMode", viewMode);
-  }, [viewMode]);
 
   if (!splashDone) {
     const letters = "CYPHER".split("");
@@ -173,8 +201,25 @@ export default function Home() {
     );
   }
 
+  if (!isLoaded) {
+    return (
+      <ProjectLoadState
+        error={loadError}
+        onRetry={() => {
+          void initProject().catch(() => {
+            // The store exposes the actionable failure through loadError.
+          });
+        }}
+      />
+    );
+  }
+
   return (
-    <main className="flex-1 flex flex-col text-[var(--text-primary)] overflow-hidden">
+    <main
+      inert={isApplyingHistory}
+      aria-busy={isApplyingHistory}
+      className="flex-1 flex flex-col text-[var(--text-primary)] overflow-hidden"
+    >
       {showResume && (
         <ResumeDialog
           projectName={projectName}
@@ -234,7 +279,7 @@ export default function Home() {
               {/* Insertion indicator — always rendered when dragging, fades in/out */}
               {draggingId && (
                 <div
-                  className={`h-0.5 rounded-full mx-2 shrink-0 transition-all duration-150 ${
+                  className={`h-0.5 rounded-full mx-2 shrink-0 transition-[opacity,transform,background-color] duration-150 ${
                     insertBefore === i
                       ? "bg-[var(--accent)] opacity-100 scale-x-100"
                       : "opacity-0 scale-x-75"
@@ -247,16 +292,24 @@ export default function Home() {
                 }`}
               >
                 {t.kind === "sampler" ? (
-                  <SamplerRow track={t} onDragStart={handleDragStart} />
+                  <SamplerRow
+                    track={t}
+                    onDragStart={handleDragStart}
+                    onMove={handleMoveTrack}
+                  />
                 ) : (
-                  <TrackRow track={t} onDragStart={handleDragStart} />
+                  <TrackRow
+                    track={t}
+                    onDragStart={handleDragStart}
+                    onMove={handleMoveTrack}
+                  />
                 )}
               </div>
             </Fragment>
           ))}
           {draggingId && (
             <div
-              className={`h-0.5 rounded-full mx-2 shrink-0 transition-all duration-150 ${
+              className={`h-0.5 rounded-full mx-2 shrink-0 transition-[opacity,transform,background-color] duration-150 ${
                 insertBefore === tracks.length
                   ? "bg-[var(--accent)] opacity-100 scale-x-100"
                   : "opacity-0 scale-x-75"
@@ -270,18 +323,18 @@ export default function Home() {
       )}
       <RecordingShield />
       {showSongEditor && (
-        <SongEditor onClose={() => setShowSongEditor(false)} />
+        <SongEditor onClose={closeSongEditor} />
       )}
 
       {/* Drag ghost — fixed overlay, updated via direct DOM for 60fps smoothness */}
-      {draggingTrack && ghostRectRef.current && (
+      {draggingTrack && ghostRect && (
         <div
           ref={ghostRef}
           className="fixed pointer-events-none z-[300]"
           style={{
-            left: ghostRectRef.current.left,
-            top: ghostRectRef.current.top,
-            width: ghostRectRef.current.width,
+            left: ghostRect.left,
+            top: ghostRect.top,
+            width: ghostRect.width,
             transform: "scale(1.025)",
             transformOrigin: "center top",
             willChange: "transform",
@@ -320,6 +373,75 @@ export default function Home() {
   );
 }
 
+const VIEW_MODE_KEY = "cypher.viewMode";
+const VIEW_MODE_EVENT = "cypher:view-mode-change";
+
+function readViewMode(): ViewMode {
+  if (typeof window === "undefined") return "track";
+  return localStorage.getItem(VIEW_MODE_KEY) === "mixer" ? "mixer" : "track";
+}
+
+function subscribeViewMode(onStoreChange: () => void) {
+  window.addEventListener("storage", onStoreChange);
+  window.addEventListener(VIEW_MODE_EVENT, onStoreChange);
+  return () => {
+    window.removeEventListener("storage", onStoreChange);
+    window.removeEventListener(VIEW_MODE_EVENT, onStoreChange);
+  };
+}
+
+function useStoredViewMode(): [ViewMode, (mode: ViewMode) => void] {
+  const mode = useSyncExternalStore(
+    subscribeViewMode,
+    readViewMode,
+    (): ViewMode => "track",
+  );
+  const setMode = useCallback((nextMode: ViewMode) => {
+    localStorage.setItem(VIEW_MODE_KEY, nextMode);
+    window.dispatchEvent(new Event(VIEW_MODE_EVENT));
+  }, []);
+  return [mode, setMode];
+}
+
+function ProjectLoadState({
+  error,
+  onRetry,
+}: {
+  error: string | null;
+  onRetry: () => void;
+}) {
+  return (
+    <main
+      className="flex-1 flex items-center justify-center px-6 text-[var(--text-primary)]"
+      aria-busy={error ? undefined : true}
+    >
+      <div className="glass-raised rounded-2xl border border-[var(--border-subtle)] w-full max-w-sm p-6 text-center space-y-4">
+        <h1 className="font-[family-name:var(--font-bebas)] text-3xl tracking-[0.16em]">
+          {error ? "PROJECT UNAVAILABLE" : "RESTORING PROJECT"}
+        </h1>
+        {error ? (
+          <>
+            <p role="alert" className="text-sm text-[var(--text-muted)]">
+              {error}
+            </p>
+            <button
+              type="button"
+              onClick={onRetry}
+              className="h-10 px-5 rounded-xl bg-[var(--accent)] text-[#031024] text-sm font-bold active:scale-95 transition-transform"
+            >
+              Retry
+            </button>
+          </>
+        ) : (
+          <p className="text-sm text-[var(--text-muted)]">
+            Loading saved tracks and samples…
+          </p>
+        )}
+      </div>
+    </main>
+  );
+}
+
 function ResumeDialog({
   projectName,
   trackCount,
@@ -331,8 +453,81 @@ function ResumeDialog({
   onResume: () => void;
   onNew: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const resumeButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const changed: Array<{
+      node: HTMLElement;
+      inert: boolean;
+      ariaHidden: string | null;
+    }> = [];
+    let current: HTMLElement | null = dialog;
+    while (current && current !== document.body) {
+      const container: HTMLElement | null = current.parentElement;
+      if (!container) break;
+      for (const sibling of Array.from(container.children)) {
+        if (sibling === current || !(sibling instanceof HTMLElement)) continue;
+        changed.push({
+          node: sibling,
+          inert: sibling.inert,
+          ariaHidden: sibling.getAttribute("aria-hidden"),
+        });
+        sibling.inert = true;
+        sibling.setAttribute("aria-hidden", "true");
+      }
+      current = container;
+    }
+    const frame = requestAnimationFrame(() => resumeButtonRef.current?.focus());
+    return () => {
+      cancelAnimationFrame(frame);
+      for (const { node, inert, ariaHidden } of changed.reverse()) {
+        node.inert = inert;
+        if (ariaHidden === null) node.removeAttribute("aria-hidden");
+        else node.setAttribute("aria-hidden", ariaHidden);
+      }
+      previouslyFocused?.focus();
+    };
+  }, []);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center px-5">
+    <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="resume-title"
+      aria-describedby="resume-description"
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          onResume();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = Array.from(
+          dialogRef.current?.querySelectorAll<HTMLButtonElement>(
+            "button:not(:disabled)",
+          ) ?? [],
+        );
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center px-5"
+    >
       {/* Backdrop */}
       <div
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
@@ -340,19 +535,26 @@ function ResumeDialog({
       />
       {/* Card */}
       <div className="relative glass-raised rounded-2xl px-6 py-6 w-full max-w-xs flex flex-col items-center gap-4 shadow-2xl animate-[fade-up_220ms_cubic-bezier(0.22,1,0.36,1)_both]">
-        <h1 className="font-[family-name:var(--font-bebas)] text-4xl tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
+        <h1
+          id="resume-title"
+          className="font-[family-name:var(--font-bebas)] text-4xl tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent"
+        >
           CYPHER
         </h1>
         <div className="text-center space-y-1">
           <p className="text-[var(--text-primary)] text-sm font-semibold">
             Welcome back
           </p>
-          <p className="text-[var(--text-faint)] text-xs truncate max-w-full">
+          <p
+            id="resume-description"
+            className="text-[var(--text-faint)] text-xs truncate max-w-full"
+          >
             {projectName} · {trackCount} {trackCount === 1 ? "track" : "tracks"}
           </p>
         </div>
         <div className="flex flex-col gap-2 w-full">
           <button
+            ref={resumeButtonRef}
             onClick={onResume}
             className="w-full h-10 rounded-xl bg-[var(--accent)] text-[#031024] text-sm font-bold tracking-wide active:scale-95 transition-transform"
           >

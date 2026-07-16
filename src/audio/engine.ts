@@ -1,8 +1,19 @@
 import * as Tone from "tone";
+import {
+  DEFAULT_TIME_SIGNATURE,
+  type TimeSignature,
+} from "@/audio/time-signature";
+import { hasUsableRecordingAfterLead } from "@/audio/recording-duration";
 
 export type TrackId = string;
 
 export type TrackKind = "audio" | "sampler";
+
+export interface RecordingInterruption {
+  trackId: TrackId;
+  reason: "input-ended" | "recorder-error" | "recorder-stopped";
+  error?: Error;
+}
 
 export interface Track {
   id: TrackId;
@@ -35,6 +46,7 @@ export interface Track {
 
 interface RecordingSession {
   trackId: TrackId;
+  audioSessionToken: symbol;
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
@@ -44,11 +56,20 @@ interface RecordingSession {
   chunks: Blob[];
   mimeType: string;
   startedAt: number;
+  transportStartAt: number | null;
   capturedSampleRate: number;
   routerEl: HTMLAudioElement | null;
+  expectedStop: boolean;
+  interruptionReported: boolean;
+  stopped: Promise<void>;
+  resolveStopped: () => void;
+  cleanupInterruptionListeners: () => void;
 }
 
 const DEFAULT_RECORDER_BITRATE = 512_000;
+const RECORDING_START_AHEAD_SEC = 0.05;
+const TONE_LOOKAHEAD_SEC = 0.02;
+const TRANSPORT_SCHEDULE_MARGIN_SEC = 0.01;
 // Decode recordings into a 48 kHz buffer so the saved WAV preserves the
 // mic's full bandwidth even on iOS Safari, where the live AudioContext
 // is often clamped to 24 kHz when the speaker route is active.
@@ -74,29 +95,11 @@ function disconnectSessionNodes(session: RecordingSession) {
   }
 }
 
-function createIosRouter(stream: MediaStream): HTMLAudioElement | null {
-  if (typeof document === "undefined") return null;
-  try {
-    const el = document.createElement("audio");
-    el.muted = true;
-    el.autoplay = true;
-    el.setAttribute("playsinline", "");
-    el.setAttribute("webkit-playsinline", "");
-    el.srcObject = stream;
-    el.style.position = "fixed";
-    el.style.width = "0";
-    el.style.height = "0";
-    el.style.opacity = "0";
-    el.style.pointerEvents = "none";
-    document.body.appendChild(el);
-    el.play().catch(() => {
-      // Autoplay may be blocked off-gesture; the muted hint usually allows
-      // it, but failures here are non-fatal — we still capture audio.
-    });
-    return el;
-  } catch {
-    return null;
-  }
+function throwIfRecordingStartAborted(signal?: AbortSignal) {
+  if (!signal?.aborted) return;
+  const error = new Error("Recording start cancelled");
+  error.name = "AbortError";
+  throw error;
 }
 
 function softClipSample(v: number): number {
@@ -136,6 +139,27 @@ function applyInputGain(buf: AudioBuffer, gain: number): AudioBuffer {
     }
   }
   return buf;
+}
+
+function trimBufferStart(buf: AudioBuffer, seconds: number): AudioBuffer {
+  const frames = Math.min(
+    Math.max(0, Math.round(seconds * buf.sampleRate)),
+    Math.max(0, buf.length - 1),
+  );
+  if (frames === 0) return buf;
+  const length = Math.max(1, buf.length - frames);
+  const trimmed = new AudioBuffer({
+    length,
+    numberOfChannels: buf.numberOfChannels,
+    sampleRate: buf.sampleRate,
+  });
+  for (let channel = 0; channel < buf.numberOfChannels; channel++) {
+    trimmed.copyToChannel(
+      buf.getChannelData(channel).subarray(frames, frames + length),
+      channel,
+    );
+  }
+  return trimmed;
 }
 
 async function decodeRecording(
@@ -202,6 +226,15 @@ function setAudioSessionType(type: AudioSessionType) {
   }
 }
 
+function needsIosRecordingOutputBridge(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  return (
+    /iPad|iPhone|iPod/.test(ua) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
 function pickRecorderMimeType(): string {
   const candidates = [
     "audio/webm;codecs=opus",
@@ -225,9 +258,14 @@ class AudioEngine {
   private nativeCtx: AudioContext | null = null;
   private recording: RecordingSession | null = null;
   private multiRecording = new Map<TrackId, RecordingSession>();
+  // A token exists from the moment a recording session starts opening until
+  // its stream is released. This also covers sessions that have opened but
+  // have not yet been installed in `recording` / `multiRecording`.
+  private recordingAudioSessionTokens = new Set<symbol>();
   private metronomeSynth: Tone.MembraneSynth | null = null;
   private metronomeLoop: Tone.Loop | null = null;
   private metronomeOn = false;
+  private timeSignature: TimeSignature = { ...DEFAULT_TIME_SIGNATURE };
   private toneStartCalled = false;
   // Output bridge: while a mic is open on iOS Safari the AudioContext's
   // destination gets routed to the receiver/earpiece (or muted entirely on
@@ -241,6 +279,27 @@ class AudioEngine {
   // path is used when only HTMLMediaElement.setSinkId is available; the ctx
   // path is preferred otherwise.
   private activeSinkRoute: "ctx" | "bridge" = "ctx";
+  private transportPositionSec = 0;
+
+  private syncAudioSessionType() {
+    setAudioSessionType(
+      this.recordingAudioSessionTokens.size > 0
+        ? "play-and-record"
+        : "playback",
+    );
+  }
+
+  private acquireRecordingAudioSession(): symbol {
+    const token = Symbol("recording-audio-session");
+    this.recordingAudioSessionTokens.add(token);
+    this.syncAudioSessionType();
+    return token;
+  }
+
+  private releaseRecordingAudioSession(token: symbol) {
+    if (!this.recordingAudioSessionTokens.delete(token)) return;
+    this.syncAudioSessionType();
+  }
 
   async start() {
     // Idempotent. Safe to call from any user gesture or even non-gesture
@@ -251,18 +310,32 @@ class AudioEngine {
     if (!this.nativeCtx) {
       this.nativeCtx = new AudioContext({ latencyHint: "interactive" });
       Tone.setContext(this.nativeCtx);
+      // Tone's default 100 ms lookahead is too large for an overdubbing UI.
+      // Keep a small scheduler cushion, then place Transport events just past
+      // it so Parts/metronome callbacks are never scheduled in the past.
+      Tone.getContext().lookAhead = TONE_LOOKAHEAD_SEC;
     }
     // Hint WebKit (iOS 17+) to use the high-fidelity Playback audio session
     // when we're not actively recording. Without this, the default "auto"
     // category often demotes the session to a voice profile (16 kHz,
     // earpiece route) the moment the page touches anything mic-adjacent.
-    setAudioSessionType("playback");
+    this.syncAudioSessionType();
     if (this.nativeCtx.state === "suspended") {
-      try {
-        await this.nativeCtx.resume();
-      } catch {
+      const resumeAttempt = this.nativeCtx.resume().catch(() => {
         // Will retry on the next call (likely from a user gesture).
-      }
+      });
+      const hasUserActivation =
+        typeof navigator !== "undefined" &&
+        (
+          navigator as Navigator & {
+            userActivation?: { isActive: boolean };
+          }
+        ).userActivation?.isActive === true;
+      // Safari can leave resume() pending indefinitely when initialization
+      // runs outside a user gesture. Build the graph immediately in that
+      // case; gesture-driven calls still wait for the resume attempt so the
+      // context is running before playback starts.
+      if (hasUserActivation) await resumeAttempt;
     }
     if (!this.started) {
       // Create the graph nodes synchronously — Tone constructors are safe on
@@ -286,6 +359,10 @@ class AudioEngine {
       });
       this.master.connect(this.limiter);
       this.limiter.toDestination();
+      if (this.metronomeSynth) {
+        this.metronomeSynth.disconnect();
+        this.metronomeSynth.connect(this.master);
+      }
       this.started = true;
       // Set up the output bridge (muted by default) inside this potentially
       // gesture-bearing call. iOS Safari blocks HTMLAudioElement.play() outside
@@ -340,18 +417,18 @@ class AudioEngine {
   private enableOutputBridge() {
     this.outputBridgeRefs += 1;
     if (!this.outputBridgeEl || !this.nativeCtx) return;
-    // Only unmute on browsers without ctx.setSinkId — i.e. iOS Safari, where
-    // ctx.destination gets routed away during recording. On desktop and
-    // Android Chrome, ctx.destination keeps working through the recording
-    // session, so leaving the bridge muted avoids a double-output.
-    const ctx = this.nativeCtx as AudioContext & {
-      setSinkId?: (id: string) => Promise<void>;
-    };
-    const desktopRouteWorks = typeof ctx.setSinkId === "function";
-    if (!desktopRouteWorks) {
+    // This bridge is an iOS/WebKit recording-session workaround, not a proxy
+    // for setSinkId feature support. Firefox and desktop WebKit can lack
+    // AudioContext.setSinkId while their native destination remains audible;
+    // unmuting there would double-play the mix and create comb filtering.
+    if (needsIosRecordingOutputBridge()) {
       this.outputBridgeEl.muted = false;
       this.outputBridgeEl.play().catch(() => {
-        // ignore — already playing or autoplay-blocked
+        // Fall back to the native destination if autoplay policy blocks the
+        // workaround instead of leaving a half-enabled bridge route.
+        if (this.outputBridgeEl && this.activeSinkRoute !== "bridge") {
+          this.outputBridgeEl.muted = true;
+        }
       });
     }
   }
@@ -442,6 +519,17 @@ class AudioEngine {
     }
   }
 
+  private stopActivePadSources(track: Track) {
+    for (const src of track.activePadSources) {
+      try {
+        src.stop();
+      } catch {
+        // The source may already have ended.
+      }
+    }
+    track.activePadSources.clear();
+  }
+
   // Build a Tone.Part from recorded events and schedule it to fire at the
   // appropriate transport positions. Called from the store before transport
   // starts so the Part is ready to fire on play. The Part calls triggerPad
@@ -478,11 +566,9 @@ class AudioEngine {
     padIdx: number,
     file: File,
   ): Promise<AudioBuffer> {
-    const t = this.tracks.get(id);
-    if (!t) throw new Error(`No track ${id}`);
-    const arrayBuf = await file.arrayBuffer();
-    const audioBuf = await this.context().decodeAudioData(arrayBuf.slice(0));
-    t.pads.set(padIdx, audioBuf);
+    if (!this.tracks.has(id)) throw new Error(`No track ${id}`);
+    const audioBuf = await this.decodeFile(file);
+    this.setPadBuffer(id, padIdx, audioBuf);
     return audioBuf;
   }
 
@@ -497,10 +583,7 @@ class AudioEngine {
     if (!t) return;
     t.player?.dispose();
     t.samplerPart?.dispose();
-    for (const src of t.activePadSources) {
-      try { src.stop(); } catch { /* already ended */ }
-    }
-    t.activePadSources.clear();
+    this.stopActivePadSources(t);
     t.gain.dispose();
     t.panner.dispose();
     t.pads.clear();
@@ -509,14 +592,12 @@ class AudioEngine {
 
   clearAllTracks() {
     this.abortAllRecording();
-    Tone.getTransport().stop();
+    Tone.getTransport().stop(Tone.now());
+    this.transportPositionSec = 0;
     for (const t of this.tracks.values()) {
       t.player?.dispose();
       t.samplerPart?.dispose();
-      for (const src of t.activePadSources) {
-        try { src.stop(); } catch { /* already ended */ }
-      }
-      t.activePadSources.clear();
+      this.stopActivePadSources(t);
       t.gain.dispose();
       t.panner.dispose();
       t.pads.clear();
@@ -524,11 +605,14 @@ class AudioEngine {
     this.tracks.clear();
   }
 
-  async loadFileToTrack(id: TrackId, file: File): Promise<AudioBuffer> {
+  async decodeFile(file: Blob): Promise<AudioBuffer> {
+    const arrayBuf = await file.arrayBuffer();
+    return this.context().decodeAudioData(arrayBuf.slice(0));
+  }
+
+  setTrackBuffer(id: TrackId, audioBuf: AudioBuffer) {
     const t = this.tracks.get(id);
     if (!t) throw new Error(`No track ${id}`);
-    const arrayBuf = await file.arrayBuffer();
-    const audioBuf = await this.context().decodeAudioData(arrayBuf.slice(0));
     t.player?.dispose();
     const player = new Tone.Player(audioBuf);
     player.connect(t.gain);
@@ -536,7 +620,34 @@ class AudioEngine {
     t.buffer = audioBuf;
     t.trimInSec = 0;
     t.trimOutSec = null;
+    // Normalization belongs to the previous waveform, not the track slot.
+    // A replacement import/take must start at unity or a quiet old buffer's
+    // large multiplier can hard-clip unrelated new audio.
+    t.normalizationGain = 1;
+    t.gain.gain.rampTo(this.effectiveGain(t), 0.01);
+  }
+
+  async loadFileToTrack(id: TrackId, file: File): Promise<AudioBuffer> {
+    if (!this.tracks.has(id)) throw new Error(`No track ${id}`);
+    const audioBuf = await this.decodeFile(file);
+    this.setTrackBuffer(id, audioBuf);
     return audioBuf;
+  }
+
+  clearTrackAudio(id: TrackId) {
+    const t = this.tracks.get(id);
+    if (!t) return;
+    try {
+      t.player?.stop(Tone.now());
+    } catch {
+      // The player may already be stopped.
+    }
+    t.player?.dispose();
+    t.player = null;
+    t.buffer = null;
+    t.trimInSec = 0;
+    t.trimOutSec = null;
+    t.normalizationGain = 1;
   }
 
   setTrim(id: TrackId, inSec: number, outSec: number | null) {
@@ -611,50 +722,92 @@ class AudioEngine {
     return this.recording?.trackId === id || this.multiRecording.has(id);
   }
 
-  async play() {
+  private transportSecondsAt(time = Tone.immediate()) {
+    return Tone.getTransport().getSecondsAtTime(time);
+  }
+
+  private scheduledTransportTime(extraSeconds = 0) {
+    return (
+      Tone.now() +
+      TRANSPORT_SCHEDULE_MARGIN_SEC +
+      Math.max(0, extraSeconds)
+    );
+  }
+
+  async play(scheduleAheadSec = 0): Promise<number> {
     await this.start();
     const transport = Tone.getTransport();
-    if (transport.state === "started") return;
-    const now = Tone.now() + 0.05;
+    if (transport.state === "started") return Tone.immediate();
+    const startAt = this.scheduledTransportTime(scheduleAheadSec);
+    const position = this.transportPositionSec;
     for (const t of this.tracks.values()) {
       // Don't sound a track that's actively being recorded — the previous
       // take would otherwise play back through the speaker and bleed into
       // the mic, fighting the new take we're trying to capture.
       if (this.isCapturing(t.id)) continue;
       if (t.player && t.buffer) {
-        const offset = t.trimInSec + transport.seconds;
+        const offset = t.trimInSec + position;
         const end = t.trimOutSec ?? t.buffer.duration;
-        const dur = Math.max(0, end - t.trimInSec - transport.seconds);
-        if (dur > 0) t.player.start(now, offset, dur);
+        const dur = Math.max(0, end - t.trimInSec - position);
+        if (dur > 0) t.player.start(startAt, offset, dur);
       }
     }
-    transport.start(now);
+    transport.start(startAt, position);
+    return startAt;
   }
 
-  pause() {
+  pause(): number {
     const transport = Tone.getTransport();
-    transport.pause();
-    for (const t of this.tracks.values()) t.player?.stop();
+    const now = Tone.now();
+    const position = this.transportSecondsAt(now);
+    // stop() cancels a start that may still be queued just beyond Tone's
+    // lookahead. We retain the musical position ourselves and pass it back as
+    // an explicit offset on play(), so pause semantics stay intact.
+    transport.stop(now);
+    for (const t of this.tracks.values()) {
+      t.player?.stop(now);
+      this.stopActivePadSources(t);
+    }
+    this.transportPositionSec = position;
+    return position;
   }
 
   stop() {
     const transport = Tone.getTransport();
-    transport.stop();
+    const now = Tone.now();
+    transport.stop(now);
+    this.transportPositionSec = 0;
     for (const t of this.tracks.values()) {
-      t.player?.stop();
-      for (const src of t.activePadSources) {
-        try { src.stop(); } catch { /* already ended */ }
-      }
-      t.activePadSources.clear();
+      t.player?.stop(now);
+      this.stopActivePadSources(t);
     }
   }
 
   seconds() {
-    return Tone.getTransport().seconds;
+    return Tone.getTransport().state === "started"
+      ? this.transportSecondsAt()
+      : this.transportPositionSec;
   }
 
   isPlaying(): boolean {
     return Tone.getTransport().state === "started";
+  }
+
+  rescheduleTrack(id: TrackId) {
+    const transport = Tone.getTransport();
+    if (transport.state !== "started") return;
+    const track = this.tracks.get(id);
+    if (!track?.player || !track.buffer) return;
+    const scheduleAt = this.scheduledTransportTime();
+    const position = this.transportSecondsAt(scheduleAt);
+    track.player.stop(scheduleAt);
+    if (this.isCapturing(id)) return;
+    const offset = track.trimInSec + position;
+    const end = track.trimOutSec ?? track.buffer.duration;
+    const duration = Math.max(0, end - track.trimInSec - position);
+    if (duration > 0) {
+      track.player.start(scheduleAt, offset, duration);
+    }
   }
 
   projectDuration(): number {
@@ -672,20 +825,25 @@ class AudioEngine {
     await this.start();
     const transport = Tone.getTransport();
     const wasPlaying = transport.state === "started";
-    for (const t of this.tracks.values()) t.player?.stop();
-    transport.pause();
-    transport.seconds = Math.max(0, seconds);
+    const position = Math.max(0, seconds);
+    const controlAt = Tone.now();
+    for (const t of this.tracks.values()) {
+      t.player?.stop(controlAt);
+      this.stopActivePadSources(t);
+    }
+    transport.stop(controlAt);
+    this.transportPositionSec = position;
     if (wasPlaying) {
-      const now = Tone.now() + 0.05;
+      const restartAt = this.scheduledTransportTime();
       for (const t of this.tracks.values()) {
         if (this.isCapturing(t.id)) continue;
         if (!t.player || !t.buffer) continue;
-        const offset = t.trimInSec + transport.seconds;
+        const offset = t.trimInSec + position;
         const end = t.trimOutSec ?? t.buffer.duration;
-        const dur = Math.max(0, end - t.trimInSec - transport.seconds);
-        if (dur > 0) t.player.start(now, offset, dur);
+        const dur = Math.max(0, end - t.trimInSec - position);
+        if (dur > 0) t.player.start(restartAt, offset, dur);
       }
-      transport.start(now);
+      transport.start(restartAt, position);
     }
   }
 
@@ -693,34 +851,67 @@ class AudioEngine {
     Tone.getTransport().bpm.value = bpm;
   }
 
+  setTimeSignature(signature: TimeSignature) {
+    this.timeSignature = { ...signature };
+    Tone.getTransport().timeSignature = [
+      signature.numerator,
+      signature.denominator,
+    ];
+    if (this.metronomeOn) this.rebuildMetronomeLoop();
+  }
+
   bpm() {
     return Tone.getTransport().bpm.value;
   }
 
+  recordingStartOffsetFromToneNow() {
+    return TRANSPORT_SCHEDULE_MARGIN_SEC + RECORDING_START_AHEAD_SEC;
+  }
+
+  playStartOffsetFromToneNow() {
+    return TRANSPORT_SCHEDULE_MARGIN_SEC;
+  }
+
   // ---- Metronome ----
+  private ensureMetronomeSynth(): Tone.MembraneSynth {
+    if (this.metronomeSynth) return this.metronomeSynth;
+    const synth = new Tone.MembraneSynth({
+      pitchDecay: 0.01,
+      octaves: 2,
+      envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 },
+      volume: -10,
+    });
+    // Keep clicks on the same master/limiter/output-bridge path as tracks so
+    // selected sinks and iOS recording routes hear the same signal.
+    if (this.master) synth.connect(this.master);
+    else synth.toDestination();
+    this.metronomeSynth = synth;
+    return synth;
+  }
+
   setMetronome(enabled: boolean) {
     this.metronomeOn = enabled;
     if (enabled) {
-      if (!this.metronomeSynth) {
-        this.metronomeSynth = new Tone.MembraneSynth({
-          pitchDecay: 0.01,
-          octaves: 2,
-          envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 },
-          volume: -10,
-        }).toDestination();
-      }
-      if (!this.metronomeLoop) {
-        let beat = 0;
-        this.metronomeLoop = new Tone.Loop((time) => {
-          const note = beat % 4 === 0 ? "C5" : "C4";
-          this.metronomeSynth?.triggerAttackRelease(note, "16n", time);
-          beat++;
-        }, "4n");
-      }
-      this.metronomeLoop.start(0);
+      this.ensureMetronomeSynth();
+      this.rebuildMetronomeLoop();
     } else {
-      this.metronomeLoop?.stop();
+      this.metronomeLoop?.dispose();
+      this.metronomeLoop = null;
     }
+  }
+
+  private rebuildMetronomeLoop() {
+    this.metronomeLoop?.dispose();
+    const { numerator, denominator } = this.timeSignature;
+    this.metronomeLoop = new Tone.Loop((time) => {
+      const ticksPerPulse = Tone.getTransport().PPQ * (4 / denominator);
+      const pulse = Math.round(
+        Tone.getTransport().getTicksAtTime(time) / ticksPerPulse,
+      );
+      const note = pulse % numerator === 0 ? "C5" : "C4";
+      this.metronomeSynth?.triggerAttackRelease(note, "16n", time);
+    }, `${denominator}n`);
+    this.metronomeLoop.start(0);
   }
 
   isMetronomeOn() {
@@ -728,15 +919,10 @@ class AudioEngine {
   }
 
   tickClick(accent: boolean) {
-    if (!this.metronomeSynth) {
-      this.metronomeSynth = new Tone.MembraneSynth({
-        pitchDecay: 0.01,
-        octaves: 2,
-        envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 },
-        volume: -10,
-      }).toDestination();
-    }
-    this.metronomeSynth.triggerAttackRelease(accent ? "C5" : "C4", "16n");
+    this.ensureMetronomeSynth().triggerAttackRelease(
+      accent ? "C5" : "C4",
+      "16n",
+    );
   }
 
   // ---- Recording ----
@@ -802,9 +988,12 @@ class AudioEngine {
     await bridge.setSinkId(sinkId);
     bridge.muted = false;
     try {
-      bridge.play();
-    } catch {
-      // ignore — autoplay race
+      await bridge.play();
+    } catch (err) {
+      // Keep the native destination audible if autoplay policy prevents the
+      // selected sink from starting.
+      bridge.muted = true;
+      throw err;
     }
     // Silence the native destination so we don't double-play through the
     // browser's default speakers and the user's chosen sink.
@@ -842,7 +1031,7 @@ class AudioEngine {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
     } finally {
-      setAudioSessionType("playback");
+      this.syncAudioSessionType();
     }
   }
 
@@ -850,18 +1039,25 @@ class AudioEngine {
     trackId: TrackId,
     deviceId?: string,
     gainValue = 1,
+    onInterrupted?: (interruption: RecordingInterruption) => void,
   ): Promise<RecordingSession> {
-    await this.start();
     const track = this.tracks.get(trackId);
     if (!track) throw new Error(`No track ${trackId}`);
     if (typeof MediaRecorder === "undefined") {
       throw new Error("MediaRecorder is not supported in this browser");
     }
+    const audioSessionToken = this.acquireRecordingAudioSession();
+    try {
+      await this.start();
+    } catch (err) {
+      this.releaseRecordingAudioSession(audioSessionToken);
+      throw err;
+    }
     // Tell WebKit we are about to record. This selects the high-fidelity
     // play-and-record profile rather than the voice-call category that iOS
     // would otherwise default to (which forces the bottom mic and clamps
     // bandwidth to ~8 kHz).
-    setAudioSessionType("play-and-record");
+    this.syncAudioSessionType();
     // Engage the output bridge before getUserMedia so the audio session is
     // established with the loud-speaker route already in place on iOS.
     this.enableOutputBridge();
@@ -871,9 +1067,7 @@ class AudioEngine {
         this.disableOutputBridge();
         bridgeOpen = false;
       }
-      // Restore the playback profile so output quality bounces back even
-      // if mic permission was denied or the device couldn't open.
-      setAudioSessionType("playback");
+      this.releaseRecordingAudioSession(audioSessionToken);
       throw err;
     };
     // Disable browser DSP — AGC chases the backing track and pumps the
@@ -897,6 +1091,8 @@ class AudioEngine {
     const stream = await navigator.mediaDevices
       .getUserMedia({ audio: audioConstraints })
       .catch(releaseBridgeOnError) as MediaStream;
+    const setupNodes: AudioNode[] = [];
+    try {
     // iOS suspends the AudioContext when it switches the audio session to
     // "play and record" during getUserMedia.  Re-wake it here while we are
     // still inside the getUserMedia resolution chain (iOS treats this as an
@@ -953,12 +1149,15 @@ class AudioEngine {
 
     const ctx = this.context();
     const source = ctx.createMediaStreamSource(stream);
+    setupNodes.push(source);
     const analyser = ctx.createAnalyser();
+    setupNodes.push(analyser);
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0;
     // Force the analyser to be pulled by the audio graph so it actually
     // updates its time-domain buffer (used by the live waveform).
     const sink = ctx.createGain();
+    setupNodes.push(sink);
     sink.gain.value = 0;
     sink.connect(ctx.destination);
     source.connect(analyser);
@@ -990,8 +1189,13 @@ class AudioEngine {
     // capture down to ~16 kHz.
     const routerEl: HTMLAudioElement | null = null;
 
-    return {
+    let resolveStopped = () => {};
+    const stopped = new Promise<void>((resolve) => {
+      resolveStopped = resolve;
+    });
+    const session: RecordingSession = {
       trackId,
+      audioSessionToken,
       stream,
       source,
       analyser,
@@ -1001,9 +1205,68 @@ class AudioEngine {
       chunks,
       mimeType: recorder.mimeType || mimeType || "audio/webm",
       startedAt: ctx.currentTime,
+      transportStartAt: null,
       capturedSampleRate,
       routerEl,
+      expectedStop: false,
+      interruptionReported: false,
+      stopped,
+      resolveStopped,
+      cleanupInterruptionListeners: () => {},
     };
+    const reportInterruption = (
+      reason: RecordingInterruption["reason"],
+      error?: Error,
+    ) => {
+      if (session.expectedStop || session.interruptionReported) return;
+      session.interruptionReported = true;
+      queueMicrotask(() => onInterrupted?.({ trackId, reason, error }));
+    };
+    const onTrackEnded = () => reportInterruption("input-ended");
+    const onRecorderError = (event: Event) => {
+      const recorderError = (event as Event & { error?: DOMException }).error;
+      reportInterruption(
+        "recorder-error",
+        recorderError
+          ? new Error(recorderError.message, { cause: recorderError })
+          : new Error("The browser reported a recording error"),
+      );
+    };
+    const onRecorderStop = () => {
+      session.resolveStopped();
+      reportInterruption("recorder-stopped");
+    };
+    audioTrack?.addEventListener("ended", onTrackEnded);
+    recorder.addEventListener("error", onRecorderError);
+    recorder.addEventListener("stop", onRecorderStop);
+    session.cleanupInterruptionListeners = () => {
+      audioTrack?.removeEventListener("ended", onTrackEnded);
+      recorder.removeEventListener("error", onRecorderError);
+      recorder.removeEventListener("stop", onRecorderStop);
+    };
+    return session;
+    } catch (err) {
+      for (const node of setupNodes.reverse()) {
+        try {
+          node.disconnect();
+        } catch {
+          // Ignore partially connected graph nodes.
+        }
+      }
+      stream.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // Ignore a track that already ended during setup.
+        }
+      });
+      if (bridgeOpen) {
+        this.disableOutputBridge();
+        bridgeOpen = false;
+      }
+      this.releaseRecordingAudioSession(audioSessionToken);
+      throw err;
+    }
   }
 
   capturedSampleRate(trackId: TrackId): number | null {
@@ -1022,25 +1285,32 @@ class AudioEngine {
     // decoder produces audible glitches at every boundary, heard as periodic
     // clicks/clipping. Letting the recorder buffer the whole session and
     // emit a single blob on stop keeps the container intact.
+    session.startedAt = this.context().currentTime;
     session.recorder.start();
   }
 
-  private async finalizeSession(session: RecordingSession): Promise<AudioBuffer | null> {
+  private async stopSessionRecorder(session: RecordingSession): Promise<void> {
+    session.expectedStop = true;
     if (session.recorder.state !== "inactive") {
-      await new Promise<void>((resolve) => {
-        session.recorder.onstop = () => resolve();
-        try {
-          session.recorder.stop();
-        } catch {
-          resolve();
-        }
-      });
+      try {
+        session.recorder.stop();
+      } catch {
+        session.resolveStopped();
+      }
     }
+    await session.stopped;
+  }
+
+  private releaseSession(session: RecordingSession) {
+    session.expectedStop = true;
+    session.cleanupInterruptionListeners();
     disconnectSessionNodes(session);
     session.stream.getTracks().forEach((t) => t.stop());
     this.disableOutputBridge();
-    this.maybeRestorePlaybackSession();
+    this.releaseRecordingAudioSession(session.audioSessionToken);
+  }
 
+  private async decodeSession(session: RecordingSession): Promise<AudioBuffer | null> {
     if (session.chunks.length === 0) {
       throw Object.assign(new Error("Recording captured no audio"), {
         name: "EmptyRecordingError",
@@ -1060,19 +1330,29 @@ class AudioEngine {
         { name: "DecodeFailedError" },
       );
     }
+    const scheduledLead = Math.max(
+      0,
+      (session.transportStartAt ?? session.startedAt) - session.startedAt,
+    );
+    if (!hasUsableRecordingAfterLead(buf.duration, scheduledLead)) {
+      throw Object.assign(new Error("Recording captured no audio"), {
+        name: "EmptyRecordingError",
+      });
+    }
+    buf = trimBufferStart(buf, scheduledLead);
     buf = applyInputGain(buf, session.inputGainValue);
 
-    const track = this.tracks.get(session.trackId);
-    if (track) {
-      track.player?.dispose();
-      const player = new Tone.Player(buf);
-      player.connect(track.gain);
-      track.player = player;
-      track.buffer = buf;
-      track.trimInSec = 0;
-      track.trimOutSec = null;
-    }
+    // Return an unattached buffer. The state layer first saves the take, then
+    // validates the project/track and swaps the engine plus metadata together
+    // on its serialized commit boundary.
     return buf;
+  }
+
+  private async finalizeSession(session: RecordingSession): Promise<AudioBuffer | null> {
+    await this.stopSessionRecorder(session);
+    this.releaseSession(session);
+    this.maybeRestorePlaybackSession();
+    return this.decodeSession(session);
   }
 
   private abortAllRecording() {
@@ -1082,10 +1362,13 @@ class AudioEngine {
     this.recording = null;
     this.multiRecording.clear();
     for (const s of sessions) {
+      s.expectedStop = true;
+      s.cleanupInterruptionListeners();
       try {
         if (s.recorder.state !== "inactive") s.recorder.stop();
+        else s.resolveStopped();
       } catch {
-        // ignore
+        s.resolveStopped();
       }
       disconnectSessionNodes(s);
       s.stream.getTracks().forEach((t) => {
@@ -1096,6 +1379,7 @@ class AudioEngine {
         }
       });
       this.disableOutputBridge();
+      this.releaseRecordingAudioSession(s.audioSessionToken);
     }
     if (sessions.length > 0) this.maybeRestorePlaybackSession();
   }
@@ -1104,46 +1388,71 @@ class AudioEngine {
   // session is left active. Guards against flipping while another track
   // is still recording in a multi-record run.
   private maybeRestorePlaybackSession() {
-    if (this.recording) return;
-    if (this.multiRecording.size > 0) return;
-    setAudioSessionType("playback");
+    this.syncAudioSessionType();
   }
 
   async startRecording(
     trackId: TrackId,
     deviceId?: string,
     inputGain = 1,
+    signal?: AbortSignal,
+    onInterrupted?: (interruption: RecordingInterruption) => void,
   ): Promise<void> {
     this.abortAllRecording();
+    throwIfRecordingStartAborted(signal);
     const session = await this.openRecordingSession(
       trackId,
       deviceId,
       inputGain,
+      onInterrupted,
     );
-    this.recording = session;
-    // Start playback of any existing tracks so the user can record along to
-    // them. Without this, single-track recording is silent against the mix.
-    await this.play();
-    this.startSession(session);
+    try {
+      throwIfRecordingStartAborted(signal);
+      this.recording = session;
+      this.startSession(session);
+      // Start playback of any existing tracks so the user can record along to
+      // them. Without this, single-track recording is silent against the mix.
+      session.transportStartAt = await this.play(RECORDING_START_AHEAD_SEC);
+      throwIfRecordingStartAborted(signal);
+    } catch (err) {
+      this.recording = null;
+      this.releaseSession(session);
+      this.maybeRestorePlaybackSession();
+      this.stop();
+      throw err;
+    }
   }
 
   async startMultiRecording(
     requests: Array<{ trackId: TrackId; deviceId?: string; inputGain?: number }>,
+    signal?: AbortSignal,
+    onInterrupted?: (interruption: RecordingInterruption) => void,
+    beforeStart?: () => Promise<void>,
   ): Promise<void> {
     this.abortAllRecording();
+    throwIfRecordingStartAborted(signal);
     if (requests.length === 0) return;
     const sessions: RecordingSession[] = [];
     try {
       for (const r of requests) {
         sessions.push(
-          await this.openRecordingSession(r.trackId, r.deviceId, r.inputGain ?? 1),
+          await this.openRecordingSession(
+            r.trackId,
+            r.deviceId,
+            r.inputGain ?? 1,
+            onInterrupted,
+          ),
         );
+        // getUserMedia itself cannot be cancelled consistently across
+        // browsers. Check immediately after each acquisition so Stop still
+        // closes a stream that resolves after the user cancelled.
+        throwIfRecordingStartAborted(signal);
       }
     } catch (err) {
       for (const s of sessions) {
-        disconnectSessionNodes(s);
-        s.stream.getTracks().forEach((t) => t.stop());
+        this.releaseSession(s);
       }
+      this.maybeRestorePlaybackSession();
       throw err;
     }
     for (const s of sessions) this.multiRecording.set(s.trackId, s);
@@ -1154,11 +1463,20 @@ class AudioEngine {
     // making dur = 0 for all of them and producing silence.
     // transport.stop() resets seconds to 0 so the offset calculation in
     // play() always yields a positive duration.
-    const transport = Tone.getTransport();
-    transport.stop();
-    for (const t of this.tracks.values()) t.player?.stop();
-    await this.play();
-    for (const s of sessions) this.startSession(s);
+    this.stop();
+    try {
+      throwIfRecordingStartAborted(signal);
+      await beforeStart?.();
+      throwIfRecordingStartAborted(signal);
+      for (const s of sessions) this.startSession(s);
+      const transportStartAt = await this.play(RECORDING_START_AHEAD_SEC);
+      for (const s of sessions) s.transportStartAt = transportStartAt;
+      throwIfRecordingStartAborted(signal);
+    } catch (err) {
+      this.abortAllRecording();
+      this.stop();
+      throw err;
+    }
   }
 
   async stopMultiRecording(): Promise<{
@@ -1169,18 +1487,28 @@ class AudioEngine {
     const errors = new Map<TrackId, Error>();
     if (this.multiRecording.size === 0) return { results, errors };
     const sessions = [...this.multiRecording.values()];
+
+    // Tell every recorder to stop before waiting for any decoding. Stopping
+    // and decoding one session at a time lets the remaining recorders keep
+    // capturing for the full decode duration, which produces misaligned takes.
+    await Promise.all(sessions.map((session) => this.stopSessionRecorder(session)));
+    for (const session of sessions) this.releaseSession(session);
     this.multiRecording.clear();
-    for (const s of sessions) {
-      try {
-        results.set(s.trackId, await this.finalizeSession(s));
-      } catch (err) {
-        errors.set(
-          s.trackId,
-          err instanceof Error ? err : new Error(String(err)),
-        );
-      }
-    }
+    this.maybeRestorePlaybackSession();
     this.pause();
+
+    await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          results.set(session.trackId, await this.decodeSession(session));
+        } catch (err) {
+          errors.set(
+            session.trackId,
+            err instanceof Error ? err : new Error(String(err)),
+          );
+        }
+      }),
+    );
     return { results, errors };
   }
 
@@ -1206,7 +1534,9 @@ class AudioEngine {
     const session = this.recording;
     if (!session) return null;
     this.recording = null;
-    return this.finalizeSession(session);
+    const buffer = await this.finalizeSession(session);
+    this.pause();
+    return buffer;
   }
 
   isRecording() {

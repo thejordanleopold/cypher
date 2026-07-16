@@ -10,7 +10,10 @@ import { useCypher } from "@/state/store";
  */
 export function WakeLockHandler() {
   const isRecording = useCypher(
-    (s) => s.isMultiRecording || s.recordingTrackId !== null,
+    (s) =>
+      s.isMultiRecording ||
+      s.recordingTrackId !== null ||
+      s.isFinalizingRecording,
   );
   const isPlaying = useCypher((s) => s.isPlaying);
   const wantLock = isRecording || isPlaying;
@@ -32,9 +35,13 @@ export function WakeLockHandler() {
         sentinel = lock;
         // Re-acquire on visibility change (browsers auto-release when tab is hidden).
         const reacquire = async () => {
+          const state = useCypher.getState();
           if (
             document.visibilityState === "visible" &&
-            useCypher.getState().isMultiRecording
+            (state.isMultiRecording ||
+              state.recordingTrackId !== null ||
+              state.isFinalizingRecording ||
+              state.isPlaying)
           ) {
             try {
               sentinel = await navigator.wakeLock.request("screen");

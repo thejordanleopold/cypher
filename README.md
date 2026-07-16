@@ -10,6 +10,18 @@ pnpm dev
 # open http://localhost:3000
 ```
 
+Run the same quality gates as CI with `pnpm verify`; dependency advisories are
+checked separately with `pnpm audit --audit-level low`.
+
+For a static deployment below a URL prefix, build with a normalized path such
+as `NEXT_PUBLIC_BASE_PATH=/cypher pnpm build`. Next.js, public demo samples,
+PWA metadata, and service-worker scope all use that build-time prefix.
+
+The `pnpm.overrides` entries in `package.json` are narrow security exceptions
+for vulnerable transitive versions, including Next.js's currently pinned
+PostCSS. The production build and browser suite cover the override; remove each
+exception once its parent dependency resolves to an audited version.
+
 ## Testing on a real phone
 
 Mic capture (`getUserMedia`) requires a **secure origin** in every modern browser. `localhost` is exempt; the LAN IP printed by `next dev` is **not** — Safari and Chrome will silently refuse the mic prompt over plain HTTP. Use one of these:
@@ -40,7 +52,7 @@ Follow the prompts. You'll get a permanent `https://*.vercel.app` URL. Re-deploy
 
 ## What to test on device
 
-- **First run:** tap **▶ Play** once. iOS Safari requires a real user gesture before any audio plays — the engine handles this lazily, but verifying the first tap unlocks audio is worth it.
+- **First run:** start the demo, enable pattern recording on the Drum Kit, then tap **▶ Play**. Play stays disabled for a truly silent project, but an armed sampler with a loaded pad can roll before its first event. iOS Safari requires a real user gesture before audio starts, so this also verifies audio unlock.
 - **Recording:** pick a mic with the mic picker, hit transport **●**, talk, hit **●** again. The waveform should turn green afterward and you should hear the recording when you tap **▶**.
 - **Background:** background the tab during a recording — it should auto-stop and save what was captured up to that point. Returning to the foreground should leave the audio context working.
 - **Bluetooth:** with AirPods connected, recording typically falls back to the phone's built-in mic (iOS limitation, not the app's). Wired headphones or a USB mic work as expected.
@@ -65,7 +77,7 @@ src/
     Transport.tsx       Top bar: play/stop/record + BPM + ☰ menu
     Timeline.tsx        Project-wide playhead and scrubber
     TrackRow.tsx        One row per track: M/S/R, mic picker, sliders, waveform
-    Waveform.tsx        Static wavesurfer.js display with trim region
+    Waveform.tsx        Cached canvas peak display with accessible trim controls
     LiveWaveform.tsx    Live bar-graph during recording (canvas)
     InputPicker.tsx     Per-track mic device dropdown
     MainMenu.tsx        Library + export hamburger menu

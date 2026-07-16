@@ -5,6 +5,9 @@
 
 export interface MixTrack {
   buffer: AudioBuffer | null;
+  // One-shot samples scheduled on the project timeline. Sampler tracks use
+  // these instead of a single linear buffer.
+  events?: readonly MixEvent[];
   volume: number;
   pan: number;
   trimInSec: number;
@@ -12,31 +15,52 @@ export interface MixTrack {
   normalizationGain?: number;
 }
 
-const FALLBACK_RATE = 48_000;
-const MAX_RATE = 96_000;
-const MIN_RATE = 8_000;
+export interface MixEvent {
+  buffer: AudioBuffer;
+  timeSec: number;
+}
+
+// All exports use the project's delivery format. AudioBufferSourceNode
+// resamples source buffers to the OfflineAudioContext rate while rendering,
+// so WAV and MP3 mixdowns (including stems) share the same 44.1 kHz clock.
+export const MIXDOWN_SAMPLE_RATE = 44_100;
 
 export async function mixdown(tracks: MixTrack[]): Promise<AudioBuffer> {
-  const playable = tracks.filter((t) => t.buffer);
+  const playable = tracks.filter(
+    (t) => t.buffer !== null || (t.events?.length ?? 0) > 0,
+  );
   if (playable.length === 0) {
-    const ctx = new OfflineAudioContext(2, FALLBACK_RATE, FALLBACK_RATE);
+    const ctx = new OfflineAudioContext(
+      2,
+      MIXDOWN_SAMPLE_RATE,
+      MIXDOWN_SAMPLE_RATE,
+    );
     return ctx.startRendering();
   }
 
-  // Match the highest source rate so a 48 kHz recording isn't silently
-  // downsampled to 44.1 on the way out. Clamp to OfflineAudioContext's
-  // valid range.
-  const sourceRate = Math.max(...playable.map((t) => t.buffer!.sampleRate));
-  const sampleRate = Math.min(MAX_RATE, Math.max(MIN_RATE, sourceRate));
-
   const lengthSec = Math.max(
     ...playable.map((t) => {
-      const end = t.trimOutSec ?? t.buffer!.duration;
-      return Math.max(0, end - t.trimInSec);
+      const linearDuration = t.buffer
+        ? Math.max(0, (t.trimOutSec ?? t.buffer.duration) - t.trimInSec)
+        : 0;
+      const eventDuration = Math.max(
+        0,
+        ...(t.events?.map((event) =>
+          Math.max(0, event.timeSec) + event.buffer.duration,
+        ) ?? []),
+      );
+      return Math.max(linearDuration, eventDuration);
     }),
   );
-  const totalSamples = Math.max(1, Math.ceil(lengthSec * sampleRate));
-  const ctx = new OfflineAudioContext(2, totalSamples, sampleRate);
+  const totalSamples = Math.max(
+    1,
+    Math.ceil(lengthSec * MIXDOWN_SAMPLE_RATE),
+  );
+  const ctx = new OfflineAudioContext(
+    2,
+    totalSamples,
+    MIXDOWN_SAMPLE_RATE,
+  );
 
   // Match the engine's playback compressor — see engine.ts for the
   // rationale on the slow release.
@@ -49,16 +73,33 @@ export async function mixdown(tracks: MixTrack[]): Promise<AudioBuffer> {
   limiter.connect(ctx.destination);
 
   for (const t of playable) {
-    const src = ctx.createBufferSource();
-    src.buffer = t.buffer!;
     const gain = ctx.createGain();
     gain.gain.value = t.volume * (t.normalizationGain ?? 1);
     const panner = ctx.createStereoPanner();
     panner.pan.value = t.pan;
-    src.connect(gain).connect(panner).connect(limiter);
-    const end = t.trimOutSec ?? t.buffer!.duration;
-    const dur = Math.max(0, end - t.trimInSec);
-    if (dur > 0) src.start(0, t.trimInSec, dur);
+    gain.connect(panner).connect(limiter);
+
+    if (t.buffer) {
+      const src = ctx.createBufferSource();
+      src.buffer = t.buffer;
+      src.connect(gain);
+      const end = t.trimOutSec ?? t.buffer.duration;
+      const dur = Math.max(0, end - t.trimInSec);
+      if (dur > 0) src.start(0, t.trimInSec, dur);
+    }
+
+    for (const event of t.events ?? []) {
+      const src = ctx.createBufferSource();
+      src.buffer = event.buffer;
+      src.connect(gain);
+      // Patterns normally contain non-negative transport positions. If an
+      // older/corrupt project contains a negative value, trim the sample by
+      // the amount that would have occurred before project time zero.
+      const startAt = Math.max(0, event.timeSec);
+      const offset = Math.max(0, -event.timeSec);
+      const duration = Math.max(0, event.buffer.duration - offset);
+      if (duration > 0) src.start(startAt, offset, duration);
+    }
   }
 
   return ctx.startRendering();

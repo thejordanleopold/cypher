@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useCypher } from "@/state/store";
 import { getEngine } from "@/audio/engine";
@@ -25,16 +31,26 @@ const MIN_POPUP_HEIGHT = 200;
 const VIEWPORT_PADDING = 12;
 
 export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
-  const {
-    inputDevices,
-    refreshInputDevices,
-    setInputDevice,
-  } = useCypher();
+  const inputDevices = useCypher((state) => state.inputDevices);
+  const refreshInputDevices = useCypher((state) => state.refreshInputDevices);
+  const setInputDevice = useCypher((state) => state.setInputDevice);
   const [open, setOpen] = useState(false);
   const [rescanning, setRescanning] = useState(false);
   const [rect, setRect] = useState<PopupRect | null>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
+  const focusedForOpenRef = useRef(false);
+  const initialFocusFrameRef = useRef<number | null>(null);
+
+  const closeAndRestoreFocus = useCallback(() => {
+    if (initialFocusFrameRef.current !== null) {
+      cancelAnimationFrame(initialFocusFrameRef.current);
+      initialFocusFrameRef.current = null;
+    }
+    focusedForOpenRef.current = false;
+    setOpen(false);
+    buttonRef.current?.focus({ preventScroll: true });
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -89,11 +105,49 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
       ) {
         return;
       }
+      if (initialFocusFrameRef.current !== null) {
+        cancelAnimationFrame(initialFocusFrameRef.current);
+        initialFocusFrameRef.current = null;
+      }
+      focusedForOpenRef.current = false;
       setOpen(false);
     };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeAndRestoreFocus();
+    };
     document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open]);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeAndRestoreFocus, open]);
+
+  useEffect(() => {
+    if (!open) {
+      focusedForOpenRef.current = false;
+      return;
+    }
+    if (!rect || focusedForOpenRef.current) return;
+
+    initialFocusFrameRef.current = requestAnimationFrame(() => {
+      initialFocusFrameRef.current = null;
+      const firstOption =
+        popupRef.current?.querySelector<HTMLButtonElement>("button");
+      if (!firstOption) return;
+      focusedForOpenRef.current = true;
+      firstOption.focus({ preventScroll: true });
+    });
+
+    return () => {
+      if (initialFocusFrameRef.current !== null) {
+        cancelAnimationFrame(initialFocusFrameRef.current);
+        initialFocusFrameRef.current = null;
+      }
+    };
+  }, [open, rect]);
 
   const selected =
     inputDevices.find((d) => d.deviceId === selectedDeviceId) ?? null;
@@ -126,7 +180,7 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
         disabled={disabled}
         className="h-9 w-full px-2.5 rounded-md bg-neutral-800 text-neutral-200 text-xs flex items-center gap-2 disabled:opacity-50 active:scale-[0.98]"
         title={label}
-        aria-haspopup="listbox"
+        aria-haspopup="dialog"
         aria-expanded={open}
       >
         <MicIcon />
@@ -139,7 +193,8 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
         createPortal(
           <div
             ref={popupRef}
-            role="listbox"
+            role="dialog"
+            aria-label="Select audio input"
             style={{
               position: "fixed",
               top: rect.top,
@@ -155,7 +210,7 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
               selected={selectedDeviceId === "default"}
               onPick={() => {
                 setInputDevice(trackId, "default");
-                setOpen(false);
+                closeAndRestoreFocus();
               }}
             />
             {inputDevices
@@ -167,7 +222,7 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
                   selected={selectedDeviceId === d.deviceId}
                   onPick={() => {
                     setInputDevice(trackId, d.deviceId);
-                    setOpen(false);
+                    closeAndRestoreFocus();
                   }}
                 />
               ))}
@@ -226,8 +281,7 @@ function DeviceOption({
       className={`block w-full text-left px-3 py-3 text-sm truncate hover:bg-neutral-800 active:bg-neutral-800 ${
         selected ? "text-[var(--accent)]" : "text-neutral-100"
       }`}
-      role="option"
-      aria-selected={selected}
+      aria-pressed={selected}
     >
       {selected ? "✓ " : ""}
       {label}

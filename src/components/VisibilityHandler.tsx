@@ -15,12 +15,18 @@ export function VisibilityHandler() {
   useEffect(() => {
     if (typeof document === "undefined") return;
 
-    const onVisibility = async () => {
+    const stopForBackground = async () => {
       const state = useCypher.getState();
+      if (state.isStartingRecording) state.stop();
+      if (state.isMultiRecording) await state.stopArmedRecording();
+      if (state.recordingTrackId) await state.stopRecording();
+      const current = useCypher.getState();
+      if (current.isPlaying) current.pause();
+    };
+
+    const onVisibility = async () => {
       if (document.visibilityState === "hidden") {
-        if (state.isMultiRecording) await state.stopArmedRecording();
-        if (state.recordingTrackId) await state.stopRecording();
-        if (state.isPlaying) state.pause();
+        await stopForBackground();
       } else {
         // Returning to foreground — resume the AudioContext if iOS suspended it.
         try {
@@ -30,13 +36,19 @@ export function VisibilityHandler() {
         }
       }
     };
+    // pagehide can precede visibilitychange, with visibilityState still
+    // reporting "visible". It is always a background/teardown signal and
+    // must never take the foreground resume branch.
+    const onPageHide = () => {
+      void stopForBackground();
+    };
 
     document.addEventListener("visibilitychange", onVisibility);
     // pagehide fires on iOS when navigating away or switching apps.
-    window.addEventListener("pagehide", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("pagehide", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
     };
   }, []);
 

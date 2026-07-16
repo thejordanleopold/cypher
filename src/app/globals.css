@@ -1,6 +1,7 @@
 @import "tailwindcss";
 
 :root {
+  color-scheme: dark;
   /* Deep blue-black base, not pure black. Two-stop radial keeps it from
      reading as flat tar. */
   --bg-base: #050a18;
@@ -12,7 +13,7 @@
   --border-strong: rgba(140, 180, 230, 0.22);
   --text-primary: #e7eef9;
   --text-muted: #8295b3;
-  --text-faint: #4d6080;
+  --text-faint: #768aac;
   --accent: #60a5fa; /* blue-400 — bright but not neon */
   --accent-strong: #3b82f6; /* blue-500 */
   --accent-deep: #1d4ed8; /* blue-700 — for borders/backgrounds */
@@ -46,8 +47,9 @@ html, body {
   font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, sans-serif;
   overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
-  /* Prevent pinch-zoom and horizontal browser swipe navigation. */
-  touch-action: pan-y;
+  /* Keep native panning and pinch zoom available while removing the
+     double-tap activation delay. Drag surfaces opt into stricter behavior. */
+  touch-action: manipulation;
 }
 
 /* Disable accidental text selection everywhere except editable fields. */
@@ -131,7 +133,10 @@ input[type="range"]::-moz-range-thumb {
   background: var(--accent);
   border: 2px solid #0a1228;
 }
-input[type="range"]:focus-visible { outline: none; }
+input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 input[type="range"]:focus-visible::-webkit-slider-thumb {
   box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.35);
 }
@@ -152,6 +157,65 @@ input[type="number"] {
   -moz-appearance: textfield;
 }
 
+/* Keep the dense desktop mixer compact while giving coarse-pointer devices
+   genuinely finger-sized controls. The sampler's smallest grids need a
+   touch-specific layout change so enlarged targets never overlap. */
+@media (pointer: coarse) {
+  button,
+  [role="button"] {
+    min-inline-size: 44px;
+    min-block-size: 44px;
+  }
+
+  select,
+  input:not([type="hidden"]):not([type="file"]),
+  [role="slider"] {
+    min-block-size: 44px;
+  }
+
+  .mixer-channel-strip {
+    inline-size: 108px;
+  }
+
+  .mixer-toggle-grid {
+    grid-template-columns: repeat(2, minmax(44px, 1fr));
+  }
+
+  .mixer-fader {
+    inline-size: 44px;
+  }
+
+  .sampler-compact-pads {
+    display: flex;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  .sampler-compact-pads::-webkit-scrollbar {
+    display: none;
+  }
+
+  .sampler-compact-pad {
+    inline-size: 44px;
+    block-size: 44px;
+    aspect-ratio: auto;
+    flex: 0 0 44px;
+  }
+
+  .sampler-bank-column {
+    inline-size: 44px;
+  }
+
+  .sampler-pad-actions {
+    grid-template-columns: minmax(44px, 1fr);
+  }
+
+  .sampler-pad-actions > button {
+    grid-column: 1 / -1;
+  }
+}
+
 @keyframes fade-up {
   from {
     opacity: 0;
@@ -169,5 +233,28 @@ input[type="number"] {
   }
   to {
     transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+
+  /* The splash's keyframes begin transparent; keep its static wordmark
+     visible for the existing loading interval when motion is reduced. */
+  .cypher-splash,
+  .cypher-letter {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+    filter: none !important;
   }
 }

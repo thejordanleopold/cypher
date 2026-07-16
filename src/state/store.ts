@@ -1,20 +1,42 @@
 import { create } from "zustand";
-import { getEngine } from "@/audio/engine";
+import {
+  getEngine,
+  type RecordingInterruption,
+} from "@/audio/engine";
 import { mixdown, type MixTrack } from "@/audio/mixdown";
 import { encodeBuffer, downloadBlob, type ExportFormat } from "@/audio/export";
 import { audioBufferToWavBlob } from "@/audio/wav";
 import {
-  saveProject,
+  canRunTransport,
+  clampProjectTime,
+  hasSamplerCaptureSource,
+  projectDuration,
+  sanitizeSamplerEvent,
+} from "@/audio/project-time";
+import {
+  DEFAULT_TIME_SIGNATURE,
+  isSignatureAccent,
+  sanitizeTimeSignature,
+  signaturePulseMs,
+  type TimeSignature,
+} from "@/audio/time-signature";
+import { getBasePath } from "@/base-path";
+import {
+  saveProjectIfRevision,
   loadProject,
   saveAudio,
+  clearPendingAudioForProject,
   loadAudio,
   deleteAudio,
-  listAudioKeysForProject,
   makeAudioKey,
   makePadAudioKey,
   listProjects,
+  createProjectAndSetCurrent,
   deleteProject as dbDeleteProject,
+  cleanupDeletedProjectAudio,
   duplicateProject,
+  compactProject as dbCompactProject,
+  materializeRecoveryProject,
   getCurrentProjectId,
   setCurrentProjectId,
   getOutputDeviceId,
@@ -22,6 +44,7 @@ import {
   getDefaultInputDeviceId,
   setDefaultInputDeviceId,
   type PersistedProject,
+  type PersistedSamplerEvent,
   type PersistedSamplerPad,
   type PersistedTrack,
   type ProjectSummary,
@@ -83,7 +106,8 @@ export interface TrackState {
   normalized: boolean;
   normalizationGain: number;
   pads: SamplerPadState[];
-  // Sampler pattern recording — session-only (not persisted to IndexedDB).
+  // Sampler pattern recording. The armed flag is session-only; events are
+  // persisted and rendered into exports.
   samplerRecArmed: boolean;
   samplerPattern: SamplerEvent[];
 }
@@ -95,6 +119,7 @@ interface CypherState {
   tracks: TrackState[];
   isPlaying: boolean;
   bpm: number;
+  timeSignature: TimeSignature;
   positionSec: number;
   metronomeOn: boolean;
   recordingTrackId: string | null;
@@ -104,6 +129,7 @@ interface CypherState {
   currentProjectName: string;
   projects: ProjectSummary[];
   isLoaded: boolean;
+  loadError: string | null;
   isDemoMode: boolean;
   refreshProjects: () => Promise<void>;
   createProject: (name?: string) => Promise<void>;
@@ -111,6 +137,9 @@ interface CypherState {
   openProject: (id: string) => Promise<void>;
   renameProject: (name: string) => Promise<void>;
   saveProjectAs: (name: string) => Promise<void>;
+  compactCurrentProject: () => Promise<void>;
+  restoreRecoveryBackup: (key: string) => Promise<boolean>;
+  deleteRecoveryBackup: (key: string) => Promise<boolean>;
   deleteCurrentProject: () => Promise<void>;
   saveNow: () => Promise<void>;
   lastSavedAt: number | null;
@@ -145,14 +174,17 @@ interface CypherState {
   stop: () => void;
   seek: (seconds: number) => Promise<void>;
   setBpm: (bpm: number) => void;
+  setTimeSignature: (signature: TimeSignature) => void;
   toggleMetronome: () => void;
   startRecording: (trackId: string) => Promise<void>;
   stopRecording: () => Promise<void>;
+  isStartingRecording: boolean;
+  isFinalizingRecording: boolean;
   toggleArm: (id: string) => void;
   toggleNormalize: (id: string) => void;
   isMultiRecording: boolean;
   armSamplerRecord: (id: string) => void;
-  clearSamplerPattern: (id: string) => void;
+  clearSamplerPattern: (id: string) => Promise<void>;
 
   countInBeats: number; // 0 = disabled, otherwise N beats of click before record
   setCountInBeats: (n: number) => void;
@@ -173,11 +205,11 @@ interface CypherState {
 
   // Undo / redo. Covers parameter changes (volume, pan, mute, solo, trim,
   // normalize, input gain, BPM), track removal, recording, and file import.
-  // Track add and project rename are NOT in history. Audio blobs are kept
-  // alive while referenced by current state or any snapshot; gcOrphanedAudio
-  // sweeps the rest.
+  // Project rename is not in history. Audio blobs are kept
+  // alive while referenced by current state or any snapshot.
   undoStack: HistorySnapshot[];
   redoStack: HistorySnapshot[];
+  isApplyingHistory: boolean;
   undo: () => Promise<void>;
   redo: () => Promise<void>;
 
@@ -189,6 +221,7 @@ interface CypherState {
 interface HistorySnapshot {
   tracks: TrackState[];
   bpm: number;
+  timeSignature: TimeSignature;
 }
 
 let trackCounter = 0;
@@ -196,11 +229,443 @@ const nextId = () => `t${++trackCounter}`;
 
 let initialized = false;
 let initInFlight: Promise<void> | null = null;
+let recordingStartInFlight: Promise<void> | null = null;
+let recordingStopInFlight: Promise<void> | null = null;
+let recordingInterruptionInFlight: Promise<void> | null = null;
+let recordingStartAbortController: AbortController | null = null;
+let recordingStartGeneration = 0;
+let countInCancelled = false;
+const activeMultiRecordingTrackIds = new Set<string>();
+const trimRescheduleTimers = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>();
+
+interface ProjectIdentity {
+  id: string;
+  epoch: number;
+}
+
+interface RecordingStartAttempt {
+  generation: number;
+  controller: AbortController;
+}
+
+function beginRecordingStartAttempt(): RecordingStartAttempt {
+  const controller = new AbortController();
+  recordingStartGeneration += 1;
+  recordingStartAbortController = controller;
+  countInCancelled = false;
+  return { generation: recordingStartGeneration, controller };
+}
+
+function isRecordingStartAttemptCurrent(
+  attempt: RecordingStartAttempt,
+  project: ProjectIdentity,
+) {
+  return (
+    recordingStartGeneration === attempt.generation &&
+    recordingStartAbortController === attempt.controller &&
+    !attempt.controller.signal.aborted &&
+    isProjectIdentityCurrent(project)
+  );
+}
+
+function cancelPendingRecordingStart() {
+  recordingStartGeneration += 1;
+  countInCancelled = true;
+  recordingStartAbortController?.abort();
+}
+
+function handleRecordingInterruption(
+  project: ProjectIdentity,
+  mode: "single" | "multi",
+  interruption: RecordingInterruption,
+) {
+  if (recordingInterruptionInFlight) return;
+  const operation = (async () => {
+    // An input can disappear in the narrow window after MediaRecorder starts
+    // but before the start action publishes its Zustand flags. Let that action
+    // finish first so the existing finalizer captures the right track ids.
+    const starting = recordingStartInFlight;
+    if (starting) await starting.catch(() => {});
+    if (!isProjectIdentityCurrent(project)) return;
+
+    const state = useCypher.getState();
+    const trackName =
+      state.tracks.find((track) => track.id === interruption.trackId)?.name ??
+      "Recording input";
+    let finalized = false;
+    if (mode === "multi" && state.isMultiRecording) {
+      finalized = true;
+      await state.stopArmedRecording();
+    } else if (
+      mode === "single" &&
+      state.recordingTrackId === interruption.trackId
+    ) {
+      finalized = true;
+      await state.stopRecording();
+    }
+    if (!finalized || !isProjectIdentityCurrent(project)) return;
+
+    const reason =
+      interruption.reason === "input-ended"
+        ? "The microphone disconnected or permission was revoked."
+        : interruption.error?.message ?? "The browser stopped the recorder.";
+    useCypher.getState().pushToast({
+      variant: "warn",
+      title: `${trackName} stopped unexpectedly`,
+      message: `${reason} The partial take was saved when possible.`,
+      ttlMs: 8000,
+    });
+  })();
+  recordingInterruptionInFlight = operation;
+  void operation
+    .finally(() => {
+      if (recordingInterruptionInFlight === operation) {
+        recordingInterruptionInFlight = null;
+      }
+    })
+    .catch(() => {});
+}
+
+// Long-running decode/record operations capture this identity before their
+// first await. A project transition advances the epoch so stale completions
+// cannot attach audio or state to whichever project happens to be current.
+let projectEpoch = 0;
+let projectTransitioning = false;
+let recordingStartBlockCount = 0;
+let projectOperationTail: Promise<void> = Promise.resolve();
+// History snapshots cover the whole project, so every sampler participating
+// in one overdub pass must share a single grouping marker.
+let samplerHistoryProjectId: string | null = null;
+// Newly saved blobs live here until their short metadata/engine commit lands.
+// GC treats them as roots so a simultaneous edit cannot sweep the blob during
+// the detached decode/save window.
+const pendingAudioKeys = new Set<string>();
+const audioReplacementTokens = new Map<string, symbol>();
+
+function trackAudioTarget(projectId: string, trackId: string) {
+  return `${projectId}\u0000track\u0000${trackId}`;
+}
+
+function padAudioTarget(projectId: string, trackId: string, padIdx: number) {
+  return `${projectId}\u0000pad\u0000${trackId}\u0000${padIdx}`;
+}
+
+function beginAudioReplacement(target: string) {
+  const token = Symbol(target);
+  audioReplacementTokens.set(target, token);
+  return token;
+}
+
+function isCurrentAudioReplacement(target: string, token: symbol) {
+  return audioReplacementTokens.get(target) === token;
+}
+
+function invalidateAudioReplacement(target: string) {
+  audioReplacementTokens.set(target, Symbol(`${target}:invalidated`));
+}
+
+function finishAudioReplacement(target: string, token: symbol) {
+  if (isCurrentAudioReplacement(target, token)) {
+    audioReplacementTokens.delete(target);
+  }
+}
+
+/**
+ * Serialize every operation that can rebuild or replace the singleton audio
+ * graph. Epoch checks fence stale leaf operations; this lock prevents two
+ * legitimate project loaders from interleaving destructive engine mutations.
+ */
+async function withProjectOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = projectOperationTail;
+  let release!: () => void;
+  projectOperationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+function supportsCrossTabProjectStorageLease() {
+  return (
+    typeof navigator !== "undefined" &&
+    typeof navigator.locks?.request === "function"
+  );
+}
+
+async function withProjectStorageLease<T>(
+  projectId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!supportsCrossTabProjectStorageLease()) return operation();
+  return navigator.locks.request(
+    `cypher:project-storage:${projectId}`,
+    { mode: "exclusive" },
+    operation,
+  );
+}
+
+interface ProjectSessionLease {
+  projectId: string;
+  release: () => void;
+  ready: Promise<void>;
+  finished: Promise<unknown>;
+}
+
+const projectSessionLeases = new Map<string, ProjectSessionLease>();
+
+function projectSessionLockName(projectId: string) {
+  return `cypher:project-session:${projectId}`;
+}
+
+function projectCompactionAttemptLockName(projectId: string) {
+  return `cypher:project-compaction-attempt:${projectId}`;
+}
+
+async function releaseProjectSessionLease(projectId: string) {
+  const lease = projectSessionLeases.get(projectId);
+  if (!lease) return;
+  if (projectSessionLeases.get(projectId) === lease) {
+    projectSessionLeases.delete(projectId);
+  }
+  lease.release();
+  await lease.finished.catch(() => {});
+}
+
+async function releaseOtherProjectSessionLeases(projectId: string) {
+  await Promise.all(
+    [...projectSessionLeases.keys()]
+      .filter((candidate) => candidate !== projectId)
+      .map((candidate) => releaseProjectSessionLease(candidate)),
+  );
+}
+
+async function holdProjectSessionLease(projectId: string) {
+  if (!supportsCrossTabProjectStorageLease()) return;
+  for (;;) {
+    const existing = projectSessionLeases.get(projectId);
+    if (existing) {
+      // Map presence alone is not ownership: the shared request may still be
+      // queued behind another tab's exclusive delete/compaction operation.
+      // Every caller must wait for that exact lease to enter its callback.
+      await existing.ready;
+      if (projectSessionLeases.get(projectId) === existing) return;
+      continue;
+    }
+
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let acquired!: () => void;
+    let acquisitionFailed!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      acquired = resolve;
+      acquisitionFailed = reject;
+    });
+    const finished = navigator.locks.request(
+      projectSessionLockName(projectId),
+      { mode: "shared" },
+      async () => {
+        acquired();
+        await released;
+      },
+    );
+    // A document can become ineligible for Web Locks while its request is
+    // queued. Propagate that failure to every acquisition waiter; otherwise
+    // the callback never runs and project startup/navigation hangs forever.
+    void finished.catch(acquisitionFailed);
+    const lease: ProjectSessionLease = {
+      projectId,
+      release,
+      ready,
+      finished,
+    };
+    projectSessionLeases.set(projectId, lease);
+    try {
+      await ready;
+    } catch (error) {
+      if (projectSessionLeases.get(projectId) === lease) {
+        projectSessionLeases.delete(projectId);
+      }
+      release();
+      await finished.catch(() => {});
+      throw error;
+    }
+    // A concurrent project switch may have released/replaced this request
+    // while it was queued. Loop until this caller observes a live owned lease.
+    if (projectSessionLeases.get(projectId) === lease) return;
+    release();
+    await finished.catch(() => {});
+  }
+}
+
+async function withExclusiveProjectSession<T>(
+  projectId: string,
+  operation: () => Promise<T>,
+): Promise<{ acquired: boolean; value?: T }> {
+  if (!supportsCrossTabProjectStorageLease()) return { acquired: false };
+  // Serialize the entire shared→exclusive→shared upgrade. Without this outer
+  // mutex, two tabs clicking Compact together could both drop their shared
+  // roots before either performs its ifAvailable check.
+  return navigator.locks.request(
+    projectCompactionAttemptLockName(projectId),
+    { mode: "exclusive" },
+    async () => {
+      const shouldReacquire = projectSessionLeases.has(projectId);
+      if (shouldReacquire) await releaseProjectSessionLease(projectId);
+      try {
+        return await navigator.locks.request(
+          projectSessionLockName(projectId),
+          { mode: "exclusive", ifAvailable: true },
+          async (lock) =>
+            lock
+              ? { acquired: true, value: await operation() }
+              : { acquired: false },
+        );
+      } finally {
+        if (
+          shouldReacquire &&
+          useCypher.getState().currentProjectId === projectId
+        ) {
+          await holdProjectSessionLease(projectId);
+        }
+      }
+    },
+  );
+}
+
+const PROJECT_COORDINATION_CHANNEL = "cypher:project-coordination";
+let projectCoordinationChannel: BroadcastChannel | null = null;
+
+function installProjectCoordinationChannel() {
+  if (
+    projectCoordinationChannel ||
+    typeof BroadcastChannel === "undefined"
+  ) {
+    return;
+  }
+  projectCoordinationChannel = new BroadcastChannel(
+    PROJECT_COORDINATION_CHANNEL,
+  );
+  projectCoordinationChannel.addEventListener("message", (event) => {
+    const data = event.data as {
+      type?: unknown;
+      projectId?: unknown;
+      sourceSessionId?: unknown;
+    };
+    if (
+      data.type !== "project-compacted" ||
+      typeof data.projectId !== "string" ||
+      data.sourceSessionId === getRecoverySessionId() ||
+      data.projectId !== useCypher.getState().currentProjectId
+    ) {
+      return;
+    }
+
+    const hadPendingChanges =
+      dirtyPersistSnapshot?.state.currentProjectId === data.projectId;
+    const pendingPreserved =
+      !hadPendingChanges || writeRecoverySnapshot();
+    if (hadPendingChanges && pendingPreserved) discardPendingPersist(false);
+    getEngine().stop();
+    useCypher.setState({
+      isPlaying: false,
+      positionSec: 0,
+      undoStack: [],
+      redoStack: [],
+      isLoaded: false,
+      loadError: hadPendingChanges && pendingPreserved
+        ? "This project was compacted in another tab. Your pending changes were preserved. Retry to reopen the compacted project."
+        : hadPendingChanges
+          ? "This project was compacted in another tab. Browser recovery storage is unavailable, so keep this tab open and Retry to preserve your pending changes."
+          : "This project was compacted in another tab. Retry to reopen the compacted project.",
+    });
+  });
+}
+
+function broadcastProjectCompacted(projectId: string, updatedAt: number) {
+  installProjectCoordinationChannel();
+  projectCoordinationChannel?.postMessage({
+    type: "project-compacted",
+    projectId,
+    updatedAt,
+    sourceSessionId: getRecoverySessionId(),
+  });
+}
+
+function captureProjectIdentity(state: Pick<CypherState, "currentProjectId">): ProjectIdentity | null {
+  if (projectTransitioning) return null;
+  return { id: state.currentProjectId, epoch: projectEpoch };
+}
+
+function isProjectIdentityCurrent(
+  identity: ProjectIdentity,
+  state: Pick<CypherState, "currentProjectId"> = useCypher.getState(),
+) {
+  return (
+    !projectTransitioning &&
+    identity.epoch === projectEpoch &&
+    identity.id === state.currentProjectId
+  );
+}
+
+function beginProjectTransition() {
+  projectEpoch += 1;
+  projectTransitioning = true;
+  cancelPendingRecordingStart();
+  samplerHistoryProjectId = null;
+  activeMultiRecordingTrackIds.clear();
+  audioReplacementTokens.clear();
+  for (const timer of trimRescheduleTimers.values()) clearTimeout(timer);
+  trimRescheduleTimers.clear();
+  // A transition hides the current project immediately, so clear any
+  // session-only countdown state at the same boundary.
+  useCypher.setState({ countdownActive: false, countdownBeat: 0 });
+  return projectEpoch;
+}
+
+function hasActiveProjectCapture(state = useCypher.getState()) {
+  return (
+    state.recordingTrackId !== null ||
+    state.isMultiRecording ||
+    state.isStartingRecording ||
+    state.isFinalizingRecording
+  );
+}
+
+function warnProjectTransitionDuringCapture(action: string) {
+  useCypher.getState().pushToast({
+    variant: "warn",
+    title: "Finish recording first",
+    message: `Stop or cancel the active take before ${action}.`,
+  });
+}
+
+async function withRecordingStartBlocked<T>(operation: () => Promise<T>) {
+  recordingStartBlockCount += 1;
+  try {
+    return await operation();
+  } finally {
+    recordingStartBlockCount -= 1;
+  }
+}
+
+function completeProjectTransition(epoch: number) {
+  if (projectEpoch === epoch) projectTransitioning = false;
+}
 
 export const useCypher = create<CypherState>((set, get) => ({
   tracks: [],
   isPlaying: false,
   bpm: 120,
+  timeSignature: { ...DEFAULT_TIME_SIGNATURE },
   positionSec: 0,
   metronomeOn: false,
   recordingTrackId: null,
@@ -211,10 +676,13 @@ export const useCypher = create<CypherState>((set, get) => ({
   currentOutputDeviceId: "default",
   outputSelectable: false,
   isMultiRecording: false,
+  isStartingRecording: false,
+  isFinalizingRecording: false,
   currentProjectId: DEFAULT_PROJECT_ID,
   currentProjectName: "Untitled",
   projects: [],
   isLoaded: false,
+  loadError: null,
   isDemoMode: false,
   lastSavedAt: null,
   toasts: [],
@@ -225,59 +693,125 @@ export const useCypher = create<CypherState>((set, get) => ({
   isCalibrating: false,
   undoStack: [],
   redoStack: [],
+  isApplyingHistory: false,
 
   undo: async () => {
-    if (historyApplyInFlight) return;
-    historyApplyInFlight = true;
+    // Undo is a semantic fence: detached decodes/saves initiated before this
+    // click must not land afterward and silently reverse the restored state.
+    audioReplacementTokens.clear();
+    historyApplicationCount += 1;
+    set({ isApplyingHistory: true });
     try {
-      const s = get();
-      if (s.undoStack.length === 0) return;
-      const prev = s.undoStack[s.undoStack.length - 1];
-      set({
-        undoStack: s.undoStack.slice(0, -1),
-        redoStack: [...s.redoStack, captureHistorySnapshot(s)],
-      });
-      await applyHistorySnapshot(prev);
-      resetHistoryCoalesce();
+      const leaseProjectId = get().currentProjectId;
+      await withProjectStorageLease(leaseProjectId, () =>
+        withProjectOperation(async () => {
+          const s = get();
+          const project = captureProjectIdentity(s);
+          if (
+            !project ||
+            project.id !== leaseProjectId ||
+            s.undoStack.length === 0
+          ) {
+            return;
+          }
+        const prev = s.undoStack[s.undoStack.length - 1];
+        const current = captureHistorySnapshot(s);
+        try {
+          await applyHistorySnapshot(prev, project);
+        } catch (error) {
+          // Snapshot application can involve several IndexedDB reads. Keep
+          // the history entry in place and best-effort restore the graph if a
+          // read/decode fails partway through.
+          await applyHistorySnapshot(current, project, true).catch(() => {});
+          get().pushToast({
+            variant: "error",
+            title: "Undo failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
+        set({
+          undoStack: s.undoStack.slice(0, -1),
+          redoStack: [...s.redoStack, current],
+        });
+          resetSamplerHistoryGrouping();
+        }),
+      );
       // No GC: undo just shuffles snapshots between stacks, so the union
       // of referenced audio keys is unchanged.
     } finally {
-      historyApplyInFlight = false;
+      historyApplicationCount -= 1;
+      if (historyApplicationCount === 0) set({ isApplyingHistory: false });
     }
   },
 
   redo: async () => {
-    if (historyApplyInFlight) return;
-    historyApplyInFlight = true;
+    audioReplacementTokens.clear();
+    historyApplicationCount += 1;
+    set({ isApplyingHistory: true });
     try {
-      const s = get();
-      if (s.redoStack.length === 0) return;
-      const next = s.redoStack[s.redoStack.length - 1];
-      set({
-        undoStack: [...s.undoStack, captureHistorySnapshot(s)],
-        redoStack: s.redoStack.slice(0, -1),
-      });
-      await applyHistorySnapshot(next);
-      resetHistoryCoalesce();
+      const leaseProjectId = get().currentProjectId;
+      await withProjectStorageLease(leaseProjectId, () =>
+        withProjectOperation(async () => {
+          const s = get();
+          const project = captureProjectIdentity(s);
+          if (
+            !project ||
+            project.id !== leaseProjectId ||
+            s.redoStack.length === 0
+          ) {
+            return;
+          }
+        const next = s.redoStack[s.redoStack.length - 1];
+        const current = captureHistorySnapshot(s);
+        try {
+          await applyHistorySnapshot(next, project);
+        } catch (error) {
+          await applyHistorySnapshot(current, project, true).catch(() => {});
+          get().pushToast({
+            variant: "error",
+            title: "Redo failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
+        set({
+          undoStack: [...s.undoStack, current],
+          redoStack: s.redoStack.slice(0, -1),
+        });
+          resetSamplerHistoryGrouping();
+        }),
+      );
     } finally {
-      historyApplyInFlight = false;
+      historyApplicationCount -= 1;
+      if (historyApplicationCount === 0) set({ isApplyingHistory: false });
     }
   },
 
-  setCountInBeats: (n) => set({ countInBeats: Math.max(0, Math.min(8, n)) }),
-  cancelCountdown: () => {
-    countInCancelled = true;
+  setCountInBeats: (n) => {
+    set({ countInBeats: Math.max(0, Math.min(8, n)) });
+    schedulePersist(get());
   },
-  setLatencyOffsetMs: (ms) =>
-    set({ latencyOffsetMs: Math.max(-200, Math.min(500, Math.round(ms))) }),
+  cancelCountdown: () => {
+    cancelPendingRecordingStart();
+    set({ countdownActive: false, countdownBeat: 0 });
+  },
+  setLatencyOffsetMs: (ms) => {
+    set({ latencyOffsetMs: Math.max(-200, Math.min(500, Math.round(ms))) });
+    schedulePersist(get());
+  },
 
   calibrateLatency: async (deviceId) => {
     if (get().isCalibrating) return;
+    const project = captureProjectIdentity(get());
+    if (!project) return;
     set({ isCalibrating: true });
     try {
       const ms = await measureLatency(deviceId);
+      if (!isProjectIdentityCurrent(project)) return;
       if (ms !== null) {
         set({ latencyOffsetMs: ms });
+        schedulePersist(get());
         get().pushToast({
           variant: "info",
           title: `Calibrated: ${ms} ms latency`,
@@ -295,7 +829,7 @@ export const useCypher = create<CypherState>((set, get) => ({
         });
       }
     } finally {
-      set({ isCalibrating: false });
+      if (isProjectIdentityCurrent(project)) set({ isCalibrating: false });
     }
   },
 
@@ -314,10 +848,29 @@ export const useCypher = create<CypherState>((set, get) => ({
 
   initProject: async () => {
     if (initInFlight) return initInFlight;
-    if (initialized && get().tracks.length > 0) return;
+    if (initialized && get().isLoaded) return;
     initInFlight = (async () => {
-      const savedId = (await getCurrentProjectId()) ?? DEFAULT_PROJECT_ID;
-      await loadProjectIntoEngine(savedId, set);
+      const storedProjectId = await getCurrentProjectId();
+      const savedId = storedProjectId ?? DEFAULT_PROJECT_ID;
+      await holdProjectSessionLease(savedId);
+      const recoveryWarning = await withProjectStorageLease(savedId, () =>
+        recoverProjectSnapshot(savedId),
+      );
+      // Older builds could commit the current-project pointer just before a
+      // crash without ever creating its project row. Once the shared session
+      // lease is held, a still-matching pointer proves this is a stranded
+      // creation rather than a cooperating delete that is still in flight.
+      const savedProject = await loadProject(savedId);
+      const pointerStillMatches =
+        (await getCurrentProjectId()) === storedProjectId;
+      const shouldCreateMissingProject =
+        storedProjectId === undefined ||
+        (!savedProject && pointerStillMatches);
+      await loadProjectIntoEngine(
+        savedId,
+        set,
+        shouldCreateMissingProject,
+      );
       await get().refreshProjects();
       // Restore the previously chosen output device, if any. Best-effort:
       // a device id from a previous session may no longer be present (USB
@@ -351,10 +904,25 @@ export const useCypher = create<CypherState>((set, get) => ({
         });
       }
       installLifecycleHooks();
+      void retryPendingRecoveryCleanup();
       initialized = true;
+      if (recoveryWarning) {
+        get().pushToast({
+          variant: "warn",
+          title: "Pending changes need review",
+          message: recoveryWarning,
+          ttlMs: 10_000,
+        });
+      }
     })();
     try {
       await initInFlight;
+    } catch (error) {
+      // Failures that happen before loadProjectIntoEngine (notably a blocked
+      // IndexedDB upgrade) still need to leave the splash screen with an
+      // actionable Retry path.
+      set({ isLoaded: false, loadError: projectLoadError(error) });
+      throw error;
     } finally {
       initInFlight = null;
     }
@@ -367,58 +935,177 @@ export const useCypher = create<CypherState>((set, get) => ({
 
   createProject: async (name = "Untitled") => {
     const id = makeId();
-    await switchToProject(id, name, /* initialTracks */ false, set);
-    set({ isDemoMode: false });
-    await get().refreshProjects();
+    await holdProjectSessionLease(id);
+    try {
+      await withProjectOperation(async () => {
+        if (hasActiveProjectCapture()) {
+          warnProjectTransitionDuringCapture("creating a project");
+          await releaseProjectSessionLease(id);
+          return;
+        }
+        await withRecordingStartBlocked(() =>
+          switchToProjectUnlocked(id, name, /* initialTracks */ false, set),
+        );
+        set({ isDemoMode: false });
+        await get().refreshProjects();
+      });
+    } catch (error) {
+      if (get().currentProjectId !== id) await releaseProjectSessionLease(id);
+      throw error;
+    }
   },
 
   startDemo: async () => {
-    void getEngine().start();
     const id = makeId();
-    await switchToProject(id, "Demo", false, set);
-    set({ isDemoMode: true });
-    await get().refreshProjects();
+    await holdProjectSessionLease(id);
+    try {
+      await withProjectStorageLease(id, () =>
+        withProjectOperation(async () => {
+        if (hasActiveProjectCapture()) {
+          warnProjectTransitionDuringCapture("starting the demo");
+          await releaseProjectSessionLease(id);
+          return;
+        }
+        void getEngine().start();
+        await withRecordingStartBlocked(() =>
+          switchToProjectUnlocked(id, "Demo", false, set),
+        );
+      const project = captureProjectIdentity(get());
+      if (!project) return;
+      // Keep the shell gated until the demo graph, metadata, and samples all
+      // refer to the same project. The local operation lock prevents a queued
+      // Open/New/Delete action from interleaving this bootstrap, while the
+      // cross-tab storage lease keeps compaction away from prepared blobs.
+      set({ isDemoMode: true, isLoaded: false, loadError: null });
 
-    const samplerId = nextId();
-    await getEngine().addTrack(samplerId, "Drum Kit", "sampler");
-    const samplerT = emptyTrack(samplerId, "Drum Kit", "sampler");
-    set((s) => ({ tracks: [...s.tracks, samplerT] }));
-
-    const audioId = nextId();
-    await getEngine().addTrack(audioId, "Track 1", "audio");
-    const audioT = emptyTrack(audioId, "Track 1", "audio");
-    audioT.inputDeviceId = get().defaultInputDeviceId;
-    set((s) => ({ tracks: [...s.tracks, audioT] }));
-
-    schedulePersist(get());
-
-    const DEMO_PADS: Array<{ url: string; name: string }> = [
-      { url: "/demo/neptunes-80.wav",   name: "[CC] Neptunes (80).wav" },
-      { url: "/demo/bang-bang-808.wav", name: "Bang Bang 808.wav" },
-      { url: "/demo/desire-clap.wav",   name: "Desire Clap.wav" },
-      { url: "/demo/tr808hh1.wav",      name: "TR808HH1.WAV" },
-      { url: "/demo/clap-yikes.wav",    name: "Clap (Yikes).wav" },
-      { url: "/demo/kanye-vox.wav",     name: "Kanye Vox.wav" },
-    ];
-
-    for (let i = 0; i < DEMO_PADS.length; i++) {
-      const { url, name } = DEMO_PADS[i];
       try {
-        const resp = await fetch(url);
-        const blob = await resp.blob();
-        const file = new File([blob], name, { type: "audio/wav" });
-        await get().loadPadSample(samplerId, i, file);
-      } catch {
-        // skip failed pad, continue loading the rest
+        const samplerId = nextId();
+        await getEngine().addTrack(samplerId, "Drum Kit", "sampler");
+        if (!isProjectIdentityCurrent(project)) return;
+        const samplerT = emptyTrack(samplerId, "Drum Kit", "sampler");
+        set((s) => ({ tracks: [...s.tracks, samplerT] }));
+
+        const audioId = nextId();
+        await getEngine().addTrack(audioId, "Track 1", "audio");
+        if (!isProjectIdentityCurrent(project)) return;
+        const audioT = emptyTrack(audioId, "Track 1", "audio");
+        audioT.inputDeviceId = get().defaultInputDeviceId;
+        set((s) => ({ tracks: [...s.tracks, audioT] }));
+        schedulePersist(get());
+
+        const basePath = getBasePath();
+        const demoPads: Array<{ url: string; name: string }> = [
+          { url: `${basePath}/demo/neptunes-80.wav`, name: "[CC] Neptunes (80).wav" },
+          { url: `${basePath}/demo/bang-bang-808.wav`, name: "Bang Bang 808.wav" },
+          { url: `${basePath}/demo/desire-clap.wav`, name: "Desire Clap.wav" },
+          { url: `${basePath}/demo/tr808hh1.wav`, name: "TR808HH1.WAV" },
+          { url: `${basePath}/demo/clap-yikes.wav`, name: "Clap (Yikes).wav" },
+          { url: `${basePath}/demo/kanye-vox.wav`, name: "Kanye Vox.wav" },
+        ];
+
+        for (let i = 0; i < demoPads.length; i++) {
+          if (!isProjectIdentityCurrent(project)) return;
+          const { url, name } = demoPads[i];
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`Demo sample request failed (${resp.status})`);
+            const blob = await resp.blob();
+            const file = new File([blob], name, { type: "audio/wav" });
+            // Demo bootstrap already owns the project-operation lock, so use
+            // the same prepare/commit boundary inline instead of calling the
+            // public action (which acquires that lock for its commit).
+            const buf = await getEngine().decodeFile(file);
+            const audioKey = makePadAudioKey(project.id, samplerId, i);
+            await saveAudio(audioKey, audioBufferToWavBlob(buf));
+            pendingAudioKeys.add(audioKey);
+            try {
+              if (!isProjectIdentityCurrent(project)) {
+                await deleteAudio(audioKey);
+                return;
+              }
+              getEngine().setPadBuffer(samplerId, i, buf);
+              set((s) => ({
+                tracks: s.tracks.map((track) => {
+                  if (track.id !== samplerId) return track;
+                  const pads = track.pads.slice();
+                  pads[i] = {
+                    hasAudio: true,
+                    fileName: name,
+                    durationSec: buf.duration,
+                    audioKey,
+                    bufferRevision: (pads[i]?.bufferRevision ?? 0) + 1,
+                  };
+                  return { ...track, pads };
+                }),
+              }));
+              // Each durable blob must immediately have recoverable metadata;
+              // the final demo flush may never run if the tab is killed.
+              schedulePersist(get());
+            } finally {
+              pendingAudioKeys.delete(audioKey);
+            }
+          } catch {
+            // A missing optional demo pad should not prevent the rest loading.
+          }
+        }
+        if (!isProjectIdentityCurrent(project)) return;
+        schedulePersist(get());
+        await flushPersist();
+        await get().refreshProjects();
+        set({ isLoaded: true, loadError: null });
+      } catch (error) {
+        if (isProjectIdentityCurrent(project)) {
+          set({ isLoaded: true, loadError: projectLoadError(error) });
+        }
+        throw error;
       }
+        }),
+      );
+    } catch (error) {
+      if (get().currentProjectId !== id) {
+        await releaseProjectSessionLease(id);
+      }
+      throw error;
     }
   },
 
   openProject: async (id) => {
     if (id === get().currentProjectId) return;
-    await loadProjectIntoEngine(id, set);
-    set({ isDemoMode: false });
-    await get().refreshProjects();
+    await holdProjectSessionLease(id);
+    try {
+      await withProjectOperation(async () => {
+        if (id === get().currentProjectId) return;
+        // A project transition ahead of this queued operation may have
+        // released our speculative destination lease. Re-acquire it inside
+        // the serialized boundary before recovery reads any source blobs.
+        await holdProjectSessionLease(id);
+        if (hasActiveProjectCapture()) {
+          warnProjectTransitionDuringCapture("opening another project");
+          await releaseProjectSessionLease(id);
+          return;
+        }
+        const recoveryWarning = await withRecordingStartBlocked(async () => {
+          const warning = await withProjectStorageLease(id, () =>
+            recoverProjectSnapshot(id),
+          );
+          await loadProjectIntoEngineUnlocked(id, set);
+          return warning;
+        });
+        set({ isDemoMode: false });
+        await get().refreshProjects();
+        if (recoveryWarning) {
+          get().pushToast({
+            variant: "warn",
+            title: "Pending changes need review",
+            message: recoveryWarning,
+            ttlMs: 10_000,
+          });
+        }
+      });
+    } catch (error) {
+      if (get().currentProjectId !== id) await releaseProjectSessionLease(id);
+      throw error;
+    }
   },
 
   renameProject: async (name) => {
@@ -433,98 +1120,642 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   saveProjectAs: async (name) => {
-    const sourceId = get().currentProjectId;
-    // Flush pending auto-save first so the duplicate captures the latest.
-    await flushPersist();
     const newId = makeId();
-    const copy = await duplicateProject(sourceId, newId, name);
-    if (!copy) return;
-    await setCurrentProjectId(newId);
-    set({ currentProjectId: newId, currentProjectName: name });
-    await get().refreshProjects();
+    await holdProjectSessionLease(newId);
+    try {
+      await withProjectOperation(async () => {
+      // Another queued transition can release speculative destination leases.
+      // Pin this copy's id again at the point where the serialized operation
+      // actually begins, so releaseOtherProjectSessionLeases retains it.
+      await holdProjectSessionLease(newId);
+      if (hasActiveProjectCapture()) {
+        warnProjectTransitionDuringCapture("saving a project copy");
+        await releaseProjectSessionLease(newId);
+        return;
+      }
+      const { sourceId, sourceRevision, transition } =
+        await withRecordingStartBlocked(async () => {
+          const sourceId = get().currentProjectId;
+          // Persist a fresh snapshot even when no autosave is pending. Some
+          // project settings may be the only thing changed since the last save.
+          schedulePersist(get());
+          await flushPersist();
+          const sourceRevision = persistedProjectRevisions.get(sourceId);
+          const transition = beginProjectTransition();
+          return { sourceId, sourceRevision, transition };
+        });
+      set({ isLoaded: false, loadError: null });
+      try {
+        const copy = await duplicateProject(
+          sourceId,
+          newId,
+          name,
+          sourceRevision ?? undefined,
+        );
+        if (!copy) throw new Error("The source project no longer exists.");
+        persistedProjectRevisions.set(copy.id, copy.updatedAt);
+        if (transition !== projectEpoch) return;
+
+        const copiedById = new Map(
+          copy.tracks.map((track) => [track.id, track]),
+        );
+        const tracks = get().tracks.map((track) => {
+          const copied = copiedById.get(track.id);
+          if (!copied) return track;
+          return {
+            ...track,
+            audioKey: copied.audioKey,
+            pads: track.pads.map((pad, index) => ({
+              ...pad,
+              audioKey: copied.pads?.[index]?.audioKey ?? null,
+            })),
+          };
+        });
+
+        await setCurrentProjectId(newId);
+        if (transition !== projectEpoch) return;
+        await releaseOtherProjectSessionLeases(newId);
+        set({
+          tracks,
+          bpm: copy.bpm,
+          timeSignature: sanitizeTimeSignature(copy.timeSignature),
+          currentProjectId: newId,
+          currentProjectName: copy.name,
+          latencyOffsetMs: copy.latencyOffsetMs ?? 0,
+          countInBeats: copy.countInBeats ?? 0,
+          isLoaded: true,
+          loadError: null,
+          undoStack: [],
+          redoStack: [],
+          lastSavedAt: copy.updatedAt,
+        });
+        resetHistoryCoalesce();
+        completeProjectTransition(transition);
+        schedulePersist(get());
+        await flushPersist();
+        void gcOrphanedAudio();
+        await get().refreshProjects();
+      } catch (error) {
+        if (transition === projectEpoch) set({ isLoaded: true });
+        throw error;
+      } finally {
+        // If duplication failed, leave the source project usable while still
+        // invalidating media operations that began before Save As.
+        completeProjectTransition(transition);
+      }
+      });
+    } catch (error) {
+      if (get().currentProjectId !== newId) {
+        await releaseProjectSessionLease(newId);
+      }
+      throw error;
+    }
+  },
+
+  compactCurrentProject: async () => {
+    if (
+      get().recordingTrackId !== null ||
+      get().isMultiRecording ||
+      get().isStartingRecording ||
+      get().isFinalizingRecording
+    ) {
+      get().pushToast({
+        variant: "warn",
+        title: "Finish recording first",
+        message: "Stop or cancel the active take before compacting storage.",
+      });
+      return;
+    }
+    const sourceId = get().currentProjectId;
+    if (!supportsCrossTabProjectStorageLease()) {
+      get().pushToast({
+        variant: "warn",
+        title: "Compaction unavailable",
+        message:
+          "This browser cannot coordinate project storage safely across tabs. Save as a new project, then delete the old copy instead.",
+      });
+      return;
+    }
+    const session = await withExclusiveProjectSession(sourceId, () =>
+      withProjectStorageLease(sourceId, () =>
+        withProjectOperation(async () => {
+        if (get().currentProjectId !== sourceId) return;
+        if (
+          get().recordingTrackId !== null ||
+          get().isMultiRecording ||
+          get().isStartingRecording ||
+          get().isFinalizingRecording
+        ) {
+          get().pushToast({
+            variant: "warn",
+            title: "Finish recording first",
+            message: "Stop or cancel the active take before compacting storage.",
+          });
+          return;
+        }
+        // Hide/epoch-fence the editor synchronously before the first await.
+        // Otherwise an edit can capture revision R while IndexedDB is
+        // committing compaction R+1, manufacturing a same-tab CAS conflict
+        // and a false recovered branch.
+        set({ isLoaded: false, loadError: null });
+        const transition = beginProjectTransition();
+        schedulePersist(get(), true);
+        getEngine().stop();
+        set({ isPlaying: false });
+        try {
+          // Commit the latest full snapshot before pinning the revision that
+          // the atomic compaction transaction is allowed to sweep.
+          await flushPersist();
+          const sourceRevision = persistedProjectRevisions.get(sourceId);
+          if (typeof sourceRevision !== "number") {
+            throw new Error("The current project has not finished saving yet.");
+          }
+
+          removeRetiredLegacyRecoveryEntriesUnderExclusiveSession(
+            sourceId,
+            false,
+          );
+          const protectedRecoveryAudio = recoveryAudioReferences(sourceId);
+          const result = await dbCompactProject(
+            sourceId,
+            sourceRevision,
+            protectedRecoveryAudio,
+          );
+          try {
+            removeRetiredLegacyRecoveryEntriesUnderExclusiveSession(sourceId);
+          } catch {
+            // The metadata/audio compaction already committed. A stale
+            // retirement marker is harmless and can be retried later.
+          }
+          persistedProjectRevisions.set(sourceId, result.project.updatedAt);
+          lastDirtyAt = Math.max(lastDirtyAt, result.project.updatedAt);
+          set({
+            undoStack: [],
+            redoStack: [],
+            lastSavedAt: result.project.updatedAt,
+          });
+          resetHistoryCoalesce();
+          broadcastProjectCompacted(sourceId, result.project.updatedAt);
+          await get().refreshProjects().catch(() => {});
+          get().pushToast({
+            variant: "info",
+            title: "Project storage compacted",
+            message:
+              result.removedAudioCount === 0
+                ? "No unused takes were found. Undo history was cleared."
+                : `${result.removedAudioCount} unused ${
+                    result.removedAudioCount === 1 ? "take was" : "takes were"
+                  } removed. Undo history was cleared.`,
+          });
+        } catch (error) {
+          if (
+            transition === projectEpoch &&
+            get().loadError !== null &&
+            dirtyPersistSnapshot?.state.currentProjectId === sourceId
+          ) {
+            // The scheduled preflight save reported while the transition gate
+            // was active, so its first journal attempt was intentionally
+            // blocked. End the gate and publish the full snapshot now.
+            completeProjectTransition(transition);
+            reportPersistFailure(error);
+          }
+          get().pushToast({
+            variant: "error",
+            title: "Compaction failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          if (transition === projectEpoch) {
+            completeProjectTransition(transition);
+            if (get().loadError === null) set({ isLoaded: true });
+          }
+        }
+        }),
+      ),
+    );
+    if (!session.acquired) {
+      get().pushToast({
+        variant: "warn",
+        title: "Close other project tabs",
+        message:
+          "This project is active in another tab. Close that tab, then run compaction again so none of its audio references are removed.",
+      });
+    }
+  },
+
+  restoreRecoveryBackup: async (key) => {
+    if (
+      typeof localStorage === "undefined" ||
+      !key.startsWith(RECOVERY_CONFLICT_PREFIX)
+    ) {
+      return false;
+    }
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return false;
+      const parsed = JSON.parse(raw) as { project?: unknown };
+      const keyProjectId = projectIdFromRecoveryConflictKey(key);
+      if (
+        !isPersistedProject(parsed.project) ||
+        keyProjectId !== parsed.project.id
+      ) {
+        throw new Error("The backup metadata is not valid.");
+      }
+      const recoveryProject = parsed.project;
+      const newId = makeId();
+      const recoveredName = `${recoveryProject.name} (Recovered backup)`;
+      const cleanup = await withProjectStorageLease(recoveryProject.id, async () => {
+        // Conflict keys are immutable. If the user removed this entry from
+        // another tab before the copy begins, do not create a duplicate.
+        if (localStorage.getItem(key) !== raw) {
+          throw new Error("This recovery backup changed or was already removed.");
+        }
+        await materializeRecoveryProject(
+          recoveryProject,
+          newId,
+          recoveredName,
+        );
+        await clearPendingAudioForProject(recoveryProject).catch(() => {});
+        let backupRemoved = false;
+        let cleanupKey: string | null = null;
+        try {
+          // Publish an immutable retry handle before removing the final
+          // recovery key. A crash or transient IDB failure can then never
+          // strand the deleted source prefix with no discoverable owner.
+          cleanupKey = publishRecoveryCleanup(recoveryProject.id);
+          localStorage.removeItem(key);
+          backupRemoved = localStorage.getItem(key) === null;
+        } catch {
+          // The independent project copy is already durable. Keep the visible
+          // backup so the user can retry deleting it later.
+        }
+        let sourceCleaned = true;
+        if (backupRemoved && cleanupKey) {
+          try {
+            await completePublishedRecoveryCleanup(
+              recoveryProject.id,
+              cleanupKey,
+            );
+          } catch {
+            sourceCleaned = false;
+          }
+        }
+        return { backupRemoved, sourceCleaned };
+      });
+      await get().refreshProjects().catch(() => {});
+      get().pushToast({
+        variant:
+          cleanup.backupRemoved && cleanup.sourceCleaned ? "info" : "warn",
+        title: "Recovery backup restored",
+        message:
+          cleanup.backupRemoved && cleanup.sourceCleaned
+            ? `“${recoveredName}” is now available in the project library.`
+            : cleanup.backupRemoved
+              ? `“${recoveredName}” was restored. Original recovery storage cleanup will retry automatically.`
+              : `“${recoveredName}” was restored, but the original backup could not be removed. You can retry deleting it from this menu.`,
+      });
+      return true;
+    } catch (error) {
+      get().pushToast({
+        variant: "error",
+        title: "Recovery failed",
+        message:
+          error instanceof Error ? error.message : "The backup could not be restored.",
+      });
+      return false;
+    }
+  },
+
+  deleteRecoveryBackup: async (key) => {
+    if (typeof localStorage === "undefined") return false;
+    const projectId = projectIdFromRecoveryConflictKey(key);
+    if (!projectId) return false;
+    try {
+      return await withProjectStorageLease(projectId, async () => {
+        if (localStorage.getItem(key) === null) return true;
+        const cleanupKey = publishRecoveryCleanup(projectId);
+        localStorage.removeItem(key);
+        if (localStorage.getItem(key) !== null) {
+          throw new Error("The recovery backup could not be removed.");
+        }
+        try {
+          await completePublishedRecoveryCleanup(projectId, cleanupKey);
+        } catch {
+          get().pushToast({
+            variant: "warn",
+            title: "Backup deleted",
+            message:
+              "The backup was removed. Source-audio cleanup will retry automatically.",
+          });
+          return true;
+        }
+        get().pushToast({
+          variant: "info",
+          title: "Recovery backup deleted",
+        });
+        return true;
+      });
+    } catch (error) {
+      get().pushToast({
+        variant: "error",
+        title: "Backup delete failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   },
 
   saveNow: async () => {
+    schedulePersist(get());
     await flushPersist();
     set({ lastSavedAt: Date.now() });
   },
 
   deleteCurrentProject: async () => {
-    const id = get().currentProjectId;
-    await dbDeleteProject(id);
-    // Open another project, or create a fresh one.
-    const remaining = await listProjects();
-    if (remaining.length > 0) {
-      await loadProjectIntoEngine(remaining[0].id, set);
-    } else {
-      await switchToProject(DEFAULT_PROJECT_ID, "Untitled", false, set);
+    if (
+      get().recordingTrackId !== null ||
+      get().isMultiRecording ||
+      get().isStartingRecording ||
+      get().isFinalizingRecording
+    ) {
+      get().pushToast({
+        variant: "warn",
+        title: "Finish recording first",
+        message: "Stop or cancel the active take before deleting this project.",
+      });
+      return;
     }
-    await get().refreshProjects();
+    const id = get().currentProjectId;
+    const deleteOperation = (canRetireMutableJournals: boolean) =>
+      withProjectStorageLease(id, () =>
+        withProjectOperation(async () => {
+      if (get().currentProjectId !== id) return;
+      if (
+        get().recordingTrackId !== null ||
+        get().isMultiRecording ||
+        get().isStartingRecording ||
+        get().isFinalizingRecording
+      ) {
+        get().pushToast({
+          variant: "warn",
+          title: "Finish recording first",
+          message: "Stop or cancel the active take before deleting this project.",
+        });
+        return;
+      }
+      const transition = beginProjectTransition();
+      let deletionCommitted = false;
+      let preparedRecovery: PreparedDeletionRecovery | null = null;
+      set({ isLoaded: false, loadError: null });
+      try {
+        // A timer may already own a pending save. Wait for it before deleting
+        // so it cannot recreate the project afterward.
+        discardPendingPersist();
+        await waitForPersistIdle();
+        preparedRecovery = prepareRecoveryForProjectDeletion(id);
+        const fallbackProjectId = await dbDeleteProject(
+          id,
+          preparedRecovery.protectedAudioKeys,
+        );
+        deletionCommitted = true;
+        persistedProjectRevisions.delete(id);
+        const retiredLegacyKeys = new Set(
+          preparedRecovery.retiredLegacyJournalKeys,
+        );
+        let cleanupKey: string | null = null;
+        if (canRetireMutableJournals && retiredLegacyKeys.size > 0) {
+          try {
+            // These exact legacy values were already copied/promoted and were
+            // intentionally excluded from duplicate conflict backups. Publish
+            // a retryable audio-cleanup handle before removing their last
+            // source metadata roots.
+            cleanupKey = publishRecoveryCleanup(id);
+          } catch {
+            // Keep retired legacy roots when cleanup cannot be made retryable.
+          }
+        }
+        for (const entry of preparedRecovery.journalEntries) {
+          retirePreparedRecoveryEntryAfterExclusiveDelete(
+            id,
+            entry,
+            canRetireMutableJournals &&
+              (!retiredLegacyKeys.has(entry.key) || cleanupKey !== null),
+          );
+        }
+        if (
+          canRetireMutableJournals &&
+          (retiredLegacyKeys.size === 0 || cleanupKey !== null)
+        ) {
+          try {
+            removeRetiredLegacyRecoveryEntriesUnderExclusiveSession(id);
+          } catch {
+            // Journal removal above already committed; stale retirement
+            // metadata is harmless and must not undo a successful deletion.
+          }
+        }
+        if (cleanupKey) {
+          try {
+            await completePublishedRecoveryCleanup(id, cleanupKey);
+          } catch {
+            // The immutable cleanup handle is retried during a future startup.
+          }
+        }
+        // Open another project, or create a fresh one.
+        if (fallbackProjectId) {
+          await holdProjectSessionLease(fallbackProjectId);
+          await loadProjectIntoEngineUnlocked(fallbackProjectId, set);
+        } else {
+          // Always use an unowned identity. Reusing any known id here can
+          // deadlock two concurrent deletions: each tab may hold one project's
+          // exclusive lock while trying to acquire the other's shared lease.
+          const replacementId = makeId();
+          await switchToProjectUnlocked(
+            replacementId,
+            "Untitled",
+            false,
+            set,
+          );
+        }
+        await get().refreshProjects();
+      } catch (error) {
+        if (!deletionCommitted) {
+          rollbackPreparedDeletionRecovery(preparedRecovery);
+        }
+        if (deletionCommitted) {
+          // The authoritative metadata and blobs are already gone. A failed
+          // nested fallback loader advances the project epoch itself, so this
+          // recovery must not depend on the now-superseded outer transition.
+          // Project operations are serialized, and the fresh switch creates
+          // its own epoch fence before it writes any replacement UI state.
+          await switchToProjectUnlocked(
+            makeId(),
+            "Untitled",
+            false,
+            set,
+          );
+          set({ isDemoMode: false });
+          await get().refreshProjects().catch(() => {});
+          get().pushToast({
+            variant: "warn",
+            title: "Project deleted",
+            message:
+              "The library couldn't be refreshed, so a new project was opened.",
+          });
+          return;
+        }
+        if (transition === projectEpoch) {
+          completeProjectTransition(transition);
+          set({ isLoaded: true, loadError: null });
+          // The failed transaction rolled back atomically. Re-queue the UI
+          // snapshot because discardPendingPersist intentionally cleared it.
+          schedulePersist(get());
+          get().pushToast({
+            variant: "error",
+            title: "Delete failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
+        throw error;
+      } finally {
+        completeProjectTransition(transition);
+      }
+        }),
+      );
+    const session = supportsCrossTabProjectStorageLease()
+      ? await withExclusiveProjectSession(id, () => deleteOperation(true))
+      : { acquired: true, value: await deleteOperation(false) };
+    if (!session.acquired) {
+      get().pushToast({
+        variant: "warn",
+        title: "Close other project tabs",
+        message:
+          "This project is active in another tab. Close that tab before deleting it so pending work is not lost.",
+      });
+    }
   },
 
   addTrack: async (kind: TrackKind = "audio") => {
-    const id = nextId();
-    const baseName = kind === "sampler" ? "Sampler" : "Track";
-    const name = `${baseName} ${get().tracks.length + 1}`;
-    await getEngine().addTrack(id, name, kind);
-    const t = emptyTrack(id, name, kind);
-    t.inputDeviceId = get().defaultInputDeviceId;
-    set((s) => ({ tracks: [...s.tracks, t] }));
-    schedulePersist(get());
+    await withProjectOperation(async () => {
+      const project = captureProjectIdentity(get());
+      if (!project) return;
+      const id = nextId();
+      const baseName = kind === "sampler" ? "Sampler" : "Track";
+      const name = `${baseName} ${get().tracks.length + 1}`;
+      await getEngine().addTrack(id, name, kind);
+      if (!isProjectIdentityCurrent(project)) return;
+      const t = emptyTrack(id, name, kind);
+      t.inputDeviceId = get().defaultInputDeviceId;
+      // History snapshots replace the complete track list. Recording the
+      // structural add prevents Undo of an older mix edit from unexpectedly
+      // deleting a track that did not have its own history boundary.
+      pushHistory(get(), `addTrack:${id}`);
+      set((s) => ({ tracks: [...s.tracks, t] }));
+      // A newly-created engine track starts audible by default. Reapply the
+      // aggregate solo mask so it cannot leak through while another track is
+      // soloed.
+      applyMixState(get().tracks);
+      schedulePersist(get());
+    });
   },
 
   loadPadSample: async (trackId, padIdx, file) => {
+    const project = captureProjectIdentity(get());
+    if (!project) return;
     const track = get().tracks.find((t) => t.id === trackId);
     if (!track || track.kind !== "sampler") return;
-    // Wake the AudioContext before decoding. iOS Safari leaves the context
-    // suspended until a user gesture; `decodeAudioData` works on a suspended
-    // context, but addTrack defers Tone.start() and we want a fully-running
-    // graph the moment the pad is triggered.
-    await getEngine().start();
-    pushHistory(get(), `padSample:${trackId}:${padIdx}`);
-    let buf: AudioBuffer;
+    const replacementTarget = padAudioTarget(project.id, trackId, padIdx);
+    const replacementToken = beginAudioReplacement(replacementTarget);
     try {
-      buf = await getEngine().loadFileToPad(trackId, padIdx, file);
-    } catch (err) {
-      const name = err instanceof Error ? err.name : "Error";
-      const msg = err instanceof Error ? err.message : String(err);
-      throw Object.assign(
-        new Error(
-          name === "EncodingError" || /decode/i.test(msg)
-            ? "Couldn't decode that file. Try a WAV, MP3, or M4A."
-            : msg,
-        ),
-        { name },
-      );
+      // Wake the AudioContext before decoding. iOS Safari leaves the context
+      // suspended until a user gesture; invoking start() here preserves that
+      // activation even though the detached decode finishes asynchronously.
+      const startPromise = getEngine().start();
+      let buf: AudioBuffer;
+      try {
+        await startPromise;
+        buf = await getEngine().decodeFile(file);
+      } catch (err) {
+        const name = err instanceof Error ? err.name : "Error";
+        const msg = err instanceof Error ? err.message : String(err);
+        throw Object.assign(
+          new Error(
+            name === "EncodingError" || /decode/i.test(msg)
+              ? "Couldn't decode that file. Try a WAV, MP3, or M4A."
+              : msg,
+          ),
+          { name },
+        );
+      }
+      if (
+        !isProjectIdentityCurrent(project) ||
+        !isCurrentAudioReplacement(replacementTarget, replacementToken)
+      ) {
+        return;
+      }
+      const audioKey = makePadAudioKey(project.id, trackId, padIdx);
+      await withProjectStorageLease(project.id, async () => {
+        await saveAudio(audioKey, audioBufferToWavBlob(buf));
+        pendingAudioKeys.add(audioKey);
+        let committed = false;
+        try {
+          await withProjectOperation(async () => {
+          const currentTrack = get().tracks.find((t) => t.id === trackId);
+          if (
+            !isProjectIdentityCurrent(project) ||
+            !isCurrentAudioReplacement(replacementTarget, replacementToken) ||
+            !currentTrack ||
+            currentTrack.kind !== "sampler" ||
+            !getEngine().getTrack(trackId)
+          ) {
+            return;
+          }
+
+          // Capture history only after decode and durable blob storage succeed.
+          // The short FIFO commit keeps Undo, concurrent loads, and transitions
+          // ordered without holding the project lock during a long decode.
+          getEngine().setPadBuffer(trackId, padIdx, buf);
+          pushHistory(get(), `padSample:${trackId}:${padIdx}`);
+          set((s) => ({
+            tracks: s.tracks.map((t) => {
+              if (t.id !== trackId) return t;
+              const pads = t.pads.slice();
+              pads[padIdx] = {
+                hasAudio: true,
+                fileName: file.name,
+                durationSec: buf.duration,
+                audioKey,
+                bufferRevision: (pads[padIdx]?.bufferRevision ?? 0) + 1,
+              };
+              return { ...t, pads };
+            }),
+          }));
+          committed = true;
+          reconcileTransportAfterDurationChange();
+          // Flush immediately rather than wait for the 400 ms autosave debounce.
+          // The audio blob is already in IDB; if the user reloads the page (or
+          // backgrounds the app on mobile, where pagehide doesn't reliably wait
+          // for async IDB writes) before the project metadata flushes, the pad's
+          // audioKey reference is lost and the blob looks empty on next load.
+          schedulePersist(get());
+            await flushPersist();
+          });
+        } finally {
+          pendingAudioKeys.delete(audioKey);
+          if (!committed) await deleteAudio(audioKey).catch(() => {});
+        }
+      });
+    } finally {
+      finishAudioReplacement(replacementTarget, replacementToken);
     }
-    const audioKey = makePadAudioKey(get().currentProjectId, trackId, padIdx);
-    await saveAudio(audioKey, audioBufferToWavBlob(buf));
-    set((s) => ({
-      tracks: s.tracks.map((t) => {
-        if (t.id !== trackId) return t;
-        const pads = t.pads.slice();
-        pads[padIdx] = {
-          hasAudio: true,
-          fileName: file.name,
-          durationSec: buf.duration,
-          audioKey,
-          bufferRevision: (pads[padIdx]?.bufferRevision ?? 0) + 1,
-        };
-        return { ...t, pads };
-      }),
-    }));
-    // Flush immediately rather than wait for the 400 ms autosave debounce.
-    // The audio blob is already in IDB; if the user reloads the page (or
-    // backgrounds the app on mobile, where pagehide doesn't reliably wait
-    // for async IDB writes) before the project metadata flushes, the pad's
-    // audioKey reference is lost and the blob looks empty on next load.
-    schedulePersist(get());
-    await flushPersist();
   },
 
   clearPadSample: async (trackId, padIdx) => {
     const track = get().tracks.find((t) => t.id === trackId);
     if (!track || track.kind !== "sampler") return;
+    invalidateAudioReplacement(
+      padAudioTarget(get().currentProjectId, trackId, padIdx),
+    );
     if (!track.pads[padIdx]?.hasAudio) return;
     pushHistory(get(), `padClear:${trackId}:${padIdx}`);
     getEngine().setPadBuffer(trackId, padIdx, null);
@@ -536,36 +1767,101 @@ export const useCypher = create<CypherState>((set, get) => ({
         return { ...t, pads };
       }),
     }));
+    reconcileTransportAfterDurationChange();
     schedulePersist(get());
     await flushPersist();
   },
 
   triggerPad: async (trackId, padIdx) => {
+    const project = captureProjectIdentity(get());
+    if (!project) return;
     // Wake the AudioContext from inside the user gesture before doing
     // anything else — iOS Safari treats post-await work as out-of-gesture.
     await getEngine().start();
+    if (!isProjectIdentityCurrent(project)) return;
     getEngine().triggerPad(trackId, padIdx);
     // Record the hit if this sampler is armed and transport is rolling.
     const s = get();
     const track = s.tracks.find((t) => t.id === trackId);
     if (track?.samplerRecArmed && s.isPlaying) {
-      const timeSec = getEngine().seconds();
-      set((s2) => ({
-        tracks: s2.tracks.map((t) =>
-          t.id === trackId
-            ? { ...t, samplerPattern: [...t.samplerPattern, { padIdx, timeSec }] }
-            : t,
-        ),
-      }));
+      const event = sanitizeSamplerEvent(
+        { padIdx, timeSec: getEngine().seconds() },
+        SAMPLER_PAD_COUNT,
+      );
+      if (!event || !track.pads[event.padIdx]?.hasAudio) return;
+      // Pattern commits are serialized so fast pad rolls cannot overwrite one
+      // another. Publish the complete next state before scheduling its write;
+      // every autosave/recovery snapshot now sees the same event list as the
+      // UI, and Undo queues behind the durable flush held by this operation.
+      let applied = false;
+      try {
+        await withProjectOperation(async () => {
+          if (!isProjectIdentityCurrent(project)) return;
+          const current = get();
+          const currentTrack = current.tracks.find((t) => t.id === trackId);
+          if (!currentTrack || currentTrack.kind !== "sampler") return;
+          if (samplerHistoryProjectId !== project.id) {
+            pushHistory(current, "samplerRecord");
+            samplerHistoryProjectId = project.id;
+          }
+          set((currentState) => ({
+            tracks: currentState.tracks.map((candidate) =>
+              candidate.id === trackId
+                ? {
+                    ...candidate,
+                    samplerPattern: [...candidate.samplerPattern, event],
+                  }
+                : candidate,
+            ),
+          }));
+          applied = true;
+          schedulePersist(get());
+          await flushPersist();
+        });
+      } catch (error) {
+        if (isProjectIdentityCurrent(project)) {
+          if (applied) {
+            set((currentState) => ({
+              tracks: currentState.tracks.map((candidate) =>
+                candidate.id === trackId
+                  ? {
+                      ...candidate,
+                      samplerPattern: candidate.samplerPattern.filter(
+                        (candidateEvent) => candidateEvent !== event,
+                      ),
+                    }
+                  : candidate,
+              ),
+            }));
+            schedulePersist(get());
+            await flushPersist().catch(() => {});
+          }
+          get().pushToast({
+            variant: "error",
+            title: "Pattern wasn't saved",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     }
   },
 
   removeTrack: async (id) => {
+    const projectId = get().currentProjectId;
+    invalidateAudioReplacement(trackAudioTarget(projectId, id));
+    for (let padIdx = 0; padIdx < SAMPLER_PAD_COUNT; padIdx += 1) {
+      invalidateAudioReplacement(padAudioTarget(projectId, id, padIdx));
+    }
     pushHistory(get(), `removeTrack:${id}`);
     getEngine().removeTrack(id);
-    // Don't delete the audio blob here — a snapshot in undoStack still
-    // references it. gcOrphanedAudio() cleans up once nothing does.
+    // Don't delete the audio blob here — a snapshot in undoStack may still
+    // reference it. Project deletion removes all owned blobs atomically.
     set((s) => ({ tracks: s.tracks.filter((x) => x.id !== id) }));
+    // Removing the final soloed track changes every survivor's effective
+    // mute state, so reconcile the whole graph rather than only deleting the
+    // removed node.
+    applyMixState(get().tracks);
+    reconcileTransportAfterDurationChange();
     schedulePersist(get());
   },
 
@@ -581,27 +1877,71 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   importFile: async (id, file) => {
-    pushHistory(get(), `importFile:${id}`);
-    const buf = await getEngine().loadFileToTrack(id, file);
-    const audioKey = makeAudioKey(get().currentProjectId, id);
-    await saveAudio(audioKey, audioBufferToWavBlob(buf));
-    set((s) => ({
-      tracks: s.tracks.map((t) =>
-        t.id === id
-          ? {
-              ...t,
-              hasAudio: true,
-              fileName: file.name,
-              durationSec: buf.duration,
-              bufferRevision: t.bufferRevision + 1,
-              audioKey,
-              trimInSec: 0,
-              trimOutSec: null,
-            }
-          : t,
-      ),
-    }));
-    schedulePersist(get());
+    const project = captureProjectIdentity(get());
+    if (!project || !get().tracks.some((track) => track.id === id)) return;
+    const replacementTarget = trackAudioTarget(project.id, id);
+    const replacementToken = beginAudioReplacement(replacementTarget);
+    try {
+      // Decode and persist into a fresh key without touching the live graph.
+      // The graph/state swap happens atomically on the project FIFO below.
+      const buf = await getEngine().decodeFile(file);
+      if (
+        !isProjectIdentityCurrent(project) ||
+        !isCurrentAudioReplacement(replacementTarget, replacementToken)
+      ) {
+        return;
+      }
+      const audioKey = makeAudioKey(project.id, id);
+      await withProjectStorageLease(project.id, async () => {
+        await saveAudio(audioKey, audioBufferToWavBlob(buf));
+        pendingAudioKeys.add(audioKey);
+        let committed = false;
+        try {
+          await withProjectOperation(async () => {
+          const currentTrack = get().tracks.find((track) => track.id === id);
+          if (
+            !isProjectIdentityCurrent(project) ||
+            !isCurrentAudioReplacement(replacementTarget, replacementToken) ||
+            !currentTrack ||
+            !getEngine().getTrack(id)
+          ) {
+            return;
+          }
+
+          getEngine().setTrackBuffer(id, buf);
+          pushHistory(get(), `importFile:${id}`);
+          set((s) => ({
+            tracks: s.tracks.map((t) =>
+              t.id === id
+                ? {
+                    ...t,
+                    hasAudio: true,
+                    fileName: file.name,
+                    durationSec: buf.duration,
+                    bufferRevision: t.bufferRevision + 1,
+                    audioKey,
+                    trimInSec: 0,
+                    trimOutSec: null,
+                    normalized: false,
+                    normalizationGain: 1,
+                  }
+                : t,
+            ),
+          }));
+          committed = true;
+          if (get().isPlaying) getEngine().rescheduleTrack(id);
+          reconcileTransportAfterDurationChange();
+          schedulePersist(get());
+            await flushPersist();
+          });
+        } finally {
+          pendingAudioKeys.delete(audioKey);
+          if (!committed) await deleteAudio(audioKey).catch(() => {});
+        }
+      });
+    } finally {
+      finishAudioReplacement(replacementTarget, replacementToken);
+    }
   },
 
   setVolume: (id, v) => {
@@ -709,6 +2049,7 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   setTrim: (id, inSec, outSec) => {
+    const project = captureProjectIdentity(get());
     pushHistory(get(), `trim:${id}`);
     getEngine().setTrim(id, inSec, outSec);
     set((s) => ({
@@ -716,6 +2057,21 @@ export const useCypher = create<CypherState>((set, get) => ({
         t.id === id ? { ...t, trimInSec: inSec, trimOutSec: outSec } : t,
       ),
     }));
+    if (project && get().isPlaying) {
+      const timerKey = trackAudioTarget(project.id, id);
+      const previous = trimRescheduleTimers.get(timerKey);
+      if (previous) clearTimeout(previous);
+      trimRescheduleTimers.set(
+        timerKey,
+        setTimeout(() => {
+          trimRescheduleTimers.delete(timerKey);
+          if (isProjectIdentityCurrent(project) && get().isPlaying) {
+            getEngine().rescheduleTrack(id);
+          }
+        }, 80),
+      );
+    }
+    reconcileTransportAfterDurationChange();
     schedulePersist(get());
   },
 
@@ -732,44 +2088,107 @@ export const useCypher = create<CypherState>((set, get) => ({
   },
 
   play: async () => {
-    // Schedule sampler patterns before starting the transport so the Part
-    // is ready to fire. Skip if already playing to avoid destroying in-flight Parts.
-    if (!get().isPlaying) {
-      for (const t of get().tracks) {
-        if (t.kind !== "sampler") continue;
-        if (t.samplerPattern.length > 0) {
-          // Always schedule existing patterns — armed tracks overdub on top
-          // (Part-triggered hits go through engine directly, not re-recorded).
-          getEngine().setSamplerPattern(t.id, t.samplerPattern);
-        } else if (t.samplerRecArmed) {
-          // Armed with no recorded events yet — ensure no stale Part lingers.
-          getEngine().clearSamplerPart(t.id);
+    await withProjectOperation(async () => {
+      const project = captureProjectIdentity(get());
+      if (!project) return;
+      // Do not start an unbounded silent transport. A zero-length project can
+      // occur on a fresh project, after destructive edits, or when every clip
+      // is trimmed to zero.
+      if (!canRunTransport(get().tracks)) {
+        getEngine().stop();
+        if (isProjectIdentityCurrent(project)) {
+          set({ isPlaying: false, positionSec: 0 });
+        }
+        return;
+      }
+      const duration = projectDuration(get().tracks);
+      if (
+        !hasSamplerCaptureSource(get().tracks) &&
+        getEngine().seconds() >= duration
+      ) {
+        getEngine().stop();
+        set({ isPlaying: false, positionSec: 0 });
+      }
+      // Schedule sampler patterns before starting the transport so the Part
+      // is ready to fire. Skip if already playing to avoid destroying in-flight Parts.
+      if (!get().isPlaying) {
+        resetSamplerHistoryGrouping();
+        for (const t of get().tracks) {
+          if (t.kind !== "sampler") continue;
+          if (t.samplerPattern.length > 0) {
+            // Always schedule existing patterns — armed tracks overdub on top
+            // (Part-triggered hits go through engine directly, not re-recorded).
+            getEngine().setSamplerPattern(t.id, t.samplerPattern);
+          } else if (t.samplerRecArmed) {
+            // Armed with no recorded events yet — ensure no stale Part lingers.
+            getEngine().clearSamplerPart(t.id);
+          }
         }
       }
-    }
-    await getEngine().play();
-    set({ isPlaying: true });
+      await getEngine().play();
+      if (isProjectIdentityCurrent(project)) set({ isPlaying: true });
+    });
   },
 
   pause: () => {
-    getEngine().pause();
-    set({ isPlaying: false });
+    const positionSec = getEngine().pause();
+    set({ isPlaying: false, positionSec });
   },
 
   stop: () => {
+    // Stop is also the cancellation boundary for count-in and any pending
+    // getUserMedia/setup work. A stream that resolves after this click is
+    // released instead of beginning a take.
+    cancelPendingRecordingStart();
     getEngine().stop();
-    set({ isPlaying: false, positionSec: 0 });
+    set({
+      isPlaying: false,
+      positionSec: 0,
+      countdownActive: false,
+      countdownBeat: 0,
+    });
   },
 
   seek: async (seconds) => {
-    await getEngine().seek(seconds);
-    set({ positionSec: seconds });
+    await withProjectOperation(async () => {
+      const project = captureProjectIdentity(get());
+      if (!project) return;
+      const nextPosition = clampProjectTime(seconds, projectDuration(get().tracks));
+      await getEngine().seek(nextPosition);
+      if (isProjectIdentityCurrent(project)) set({ positionSec: nextPosition });
+    });
   },
 
   setBpm: (bpm) => {
+    const nextBpm = Math.max(40, Math.min(240, Math.round(bpm)));
     pushHistory(get(), "bpm");
-    getEngine().setBpm(bpm);
-    set({ bpm });
+    const engine = getEngine();
+    const wasPlaying = get().isPlaying;
+    const position = wasPlaying ? engine.seconds() : 0;
+    engine.setBpm(nextBpm);
+    set({ bpm: nextBpm });
+    // Tone.Part converts numeric seconds to transport ticks when constructed.
+    // Rebuild after a tempo change so persisted/exported absolute seconds and
+    // live sampler playback remain identical.
+    for (const track of get().tracks) {
+      if (track.kind === "sampler" && track.samplerPattern.length > 0) {
+        engine.setSamplerPattern(track.id, track.samplerPattern);
+      }
+    }
+    if (wasPlaying) {
+      // Numeric Part times are converted to ticks at the new BPM. Restart the
+      // rolling transport from the same absolute project second so its tick
+      // origin and the rebuilt Parts use the same conversion.
+      void engine.seek(position);
+    }
+    schedulePersist(get());
+  },
+
+  setTimeSignature: (signature) => {
+    const next = sanitizeTimeSignature(signature);
+    pushHistory(get(), "timeSignature");
+    getEngine().setTimeSignature(next);
+    set({ timeSignature: next });
     schedulePersist(get());
   },
 
@@ -779,33 +2198,74 @@ export const useCypher = create<CypherState>((set, get) => ({
     set({ metronomeOn: next });
   },
 
-  startRecording: async (trackId) => {
-    // Kick the AudioContext awake inside the user gesture; once we await
-    // anything (enumerateDevices, getUserMedia) iOS Safari treats it as
-    // out-of-gesture and refuses to resume.
-    void getEngine().start();
-    await maybeWarnAboutBluetoothMic(get().pushToast);
-    const t = get().tracks.find((x) => x.id === trackId);
-    try {
-      await getEngine().startRecording(
-        trackId,
-        t?.inputDeviceId,
-        t?.inputGain ?? DEFAULT_INPUT_GAIN,
-      );
-      set({ recordingTrackId: trackId, isMultiRecording: false });
-      maybeWarnAboutLowSampleRate(
-        getEngine().capturedSampleRate(trackId),
-        get().pushToast,
-      );
-    } catch (err) {
-      get().pushToast(toastFromMicError(err));
-    }
+  startRecording: (trackId) => {
+    if (recordingStartBlockCount > 0) return Promise.resolve();
+    if (recordingStartInFlight) return recordingStartInFlight;
+    const attempt = beginRecordingStartAttempt();
+    set({ isStartingRecording: true });
+    const operation = (async () => {
+      const project = captureProjectIdentity(get());
+      if (!project) return;
+      // Kick the AudioContext awake inside the user gesture; once we await
+      // anything (enumerateDevices, getUserMedia) iOS Safari treats it as
+      // out-of-gesture and refuses to resume.
+      void getEngine().start();
+      await maybeWarnAboutBluetoothMic(get().pushToast);
+      if (!isRecordingStartAttemptCurrent(attempt, project)) return;
+      const t = get().tracks.find((x) => x.id === trackId);
+      if (!t) return;
+      try {
+        await getEngine().startRecording(
+          trackId,
+          t.inputDeviceId,
+          t.inputGain ?? DEFAULT_INPUT_GAIN,
+          attempt.controller.signal,
+          (interruption) =>
+            handleRecordingInterruption(project, "single", interruption),
+        );
+        if (!isRecordingStartAttemptCurrent(attempt, project)) {
+          await getEngine().stopRecording().catch(() => null);
+          return;
+        }
+        resetSamplerHistoryGrouping();
+        set({
+          recordingTrackId: trackId,
+          isMultiRecording: false,
+          isPlaying: true,
+        });
+        maybeWarnAboutLowSampleRate(
+          getEngine().capturedSampleRate(trackId),
+          get().pushToast,
+        );
+      } catch (err) {
+        if (isRecordingStartAttemptCurrent(attempt, project)) {
+          get().pushToast(toastFromMicError(err));
+        }
+      }
+    })();
+    recordingStartInFlight = operation;
+    void operation
+      .finally(() => {
+        if (recordingStartInFlight === operation) {
+          recordingStartInFlight = null;
+          if (recordingStartAbortController === attempt.controller) {
+            recordingStartAbortController = null;
+          }
+          set({ isStartingRecording: false });
+        }
+      })
+      .catch(() => {});
+    return operation;
   },
 
   exportMix: async (format) => {
+    const project = captureProjectIdentity(get());
+    if (!project) return;
+    const projectName = get().currentProjectName;
     // Capture the latest unsaved edits in the project before mixing — exports
     // should reflect what's on screen even if the autosave debounce hasn't fired.
     await flushPersist();
+    if (!isProjectIdentityCurrent(project)) return;
     set({ exportProgress: 0 });
     try {
       const mixTracks = collectMixTracks({ includeMuted: false });
@@ -820,10 +2280,16 @@ export const useCypher = create<CypherState>((set, get) => ({
         return;
       }
       const buf = await mixdown(mixTracks);
-      const blob = await encodeBuffer(buf, format, (p) =>
-        set({ exportProgress: p }),
-      );
-      downloadBlob(blob, exportFilename(get().currentProjectName, format));
+      const blob = await encodeBuffer(buf, format, (p) => {
+        if (isProjectIdentityCurrent(project)) set({ exportProgress: p });
+      });
+      downloadBlob(blob, exportFilename(projectName, format));
+      get().pushToast({
+        variant: "info",
+        title: "Export ready",
+        message: `Your ${format.toUpperCase()} mixdown was created.`,
+        ttlMs: 5000,
+      });
     } catch (err) {
       get().pushToast({
         variant: "error",
@@ -832,12 +2298,15 @@ export const useCypher = create<CypherState>((set, get) => ({
         ttlMs: 8000,
       });
     } finally {
-      set({ exportProgress: null });
+      if (isProjectIdentityCurrent(project)) set({ exportProgress: null });
     }
   },
 
   exportStems: async (format) => {
+    const project = captureProjectIdentity(get());
+    if (!project) return;
     await flushPersist();
+    if (!isProjectIdentityCurrent(project)) return;
     const stems = collectStems();
     if (stems.length === 0) {
       get().pushToast({
@@ -856,12 +2325,20 @@ export const useCypher = create<CypherState>((set, get) => ({
         const stem = stems[i];
         const stemBuf = await mixdown([stem.track]);
         const baseFraction = i / stems.length;
-        const blob = await encodeBuffer(stemBuf, format, (p) =>
-          set({ exportProgress: baseFraction + p / stems.length }),
-        );
+        const blob = await encodeBuffer(stemBuf, format, (p) => {
+          if (isProjectIdentityCurrent(project)) {
+            set({ exportProgress: baseFraction + p / stems.length });
+          }
+        });
         const safeName = stem.name.replace(/[^\w-]+/g, "_") || `track-${i + 1}`;
         downloadBlob(blob, `${projectName}-${safeName}.${format}`);
       }
+      get().pushToast({
+        variant: "info",
+        title: "Stems ready",
+        message: `${stems.length} ${format.toUpperCase()} stem${stems.length === 1 ? " was" : "s were"} created.`,
+        ttlMs: 5000,
+      });
     } catch (err) {
       get().pushToast({
         variant: "error",
@@ -870,7 +2347,7 @@ export const useCypher = create<CypherState>((set, get) => ({
         ttlMs: 8000,
       });
     } finally {
-      set({ exportProgress: null });
+      if (isProjectIdentityCurrent(project)) set({ exportProgress: null });
     }
   },
 
@@ -880,6 +2357,7 @@ export const useCypher = create<CypherState>((set, get) => ({
         t.id === id && t.kind !== "sampler" ? { ...t, armed: !t.armed } : t,
       ),
     }));
+    schedulePersist(get());
   },
 
   toggleNormalize: (id) => {
@@ -895,6 +2373,7 @@ export const useCypher = create<CypherState>((set, get) => ({
           x.id === id ? { ...x, normalized: false, normalizationGain: 1 } : x,
         ),
       }));
+      schedulePersist(get());
       return;
     }
     const peak = engine.bufferPeak(id);
@@ -909,6 +2388,7 @@ export const useCypher = create<CypherState>((set, get) => ({
         x.id === id ? { ...x, normalized: true, normalizationGain: gain } : x,
       ),
     }));
+    schedulePersist(get());
   },
 
   armSamplerRecord: (id) => {
@@ -921,35 +2401,56 @@ export const useCypher = create<CypherState>((set, get) => ({
     }));
   },
 
-  clearSamplerPattern: (id) => {
-    getEngine().clearSamplerPart(id);
-    set((s) => ({
-      tracks: s.tracks.map((t) =>
-        t.id === id ? { ...t, samplerPattern: [] } : t,
-      ),
-    }));
+  clearSamplerPattern: async (id) => {
+    const project = captureProjectIdentity(get());
+    if (!project) return;
+    await withProjectOperation(async () => {
+      if (!isProjectIdentityCurrent(project)) return;
+      const track = get().tracks.find((t) => t.id === id);
+      if (!track || track.samplerPattern.length === 0) return;
+      pushHistory(get(), `samplerPattern:${id}`);
+      getEngine().clearSamplerPart(id);
+      set((s) => ({
+        tracks: s.tracks.map((t) =>
+          t.id === id ? { ...t, samplerPattern: [] } : t,
+        ),
+      }));
+      reconcileTransportAfterDurationChange();
+      schedulePersist(get());
+    });
   },
 
-  startArmedRecording: async () => {
+  startArmedRecording: () => {
+    if (recordingStartBlockCount > 0) return Promise.resolve();
+    if (recordingStartInFlight) return recordingStartInFlight;
+    if (get().isMultiRecording || get().recordingTrackId !== null) {
+      return Promise.resolve();
+    }
+    const attempt = beginRecordingStartAttempt();
+    activeMultiRecordingTrackIds.clear();
+    set({ isStartingRecording: true });
+    const operation = (async () => {
+    const project = captureProjectIdentity(get());
+    if (!project) return;
     // Kick the AudioContext awake inside the user gesture; once we await
     // anything (enumerateDevices, getUserMedia) iOS Safari treats it as
     // out-of-gesture and refuses to resume.
     void getEngine().start();
     await maybeWarnAboutBluetoothMic(get().pushToast);
-    const beats = get().countInBeats;
-    if (beats > 0) {
-      const ok = await runCountIn(beats, get().bpm, set);
-      if (!ok) return; // user cancelled
-    }
+    if (!isRecordingStartAttemptCurrent(attempt, project)) return;
     const all = get().tracks;
     // Sampler tracks aren't recordable — they hold per-pad samples loaded
     // by the user, not a single timeline buffer.
     const recordable = all.filter((t) => t.kind !== "sampler");
     let targets = recordable.filter((t) => t.armed);
+    const autoArmedIds = new Set<string>();
     // If the user hasn't armed anything, default to all empty tracks so
     // pressing the master record on a fresh project Just Works without
     // overwriting any imported/recorded audio.
-    if (targets.length === 0) targets = recordable.filter((t) => !t.hasAudio);
+    if (targets.length === 0) {
+      targets = recordable.filter((t) => !t.hasAudio);
+      for (const target of targets) autoArmedIds.add(target.id);
+    }
     // Reflect auto-arming in the UI so the user can see what's recording.
     if (targets.length > 0) {
       const ids = new Set(targets.map((t) => t.id));
@@ -978,7 +2479,47 @@ export const useCypher = create<CypherState>((set, get) => ({
             deviceId: t.inputDeviceId,
             inputGain: t.inputGain,
           })),
+          attempt.controller.signal,
+          (interruption) =>
+            handleRecordingInterruption(project, "multi", interruption),
+          get().countInBeats > 0
+            ? async () => {
+                const ok = await runCountIn(
+                  get().countInBeats,
+                  get().bpm,
+                  get().timeSignature,
+                  getEngine().recordingStartOffsetFromToneNow(),
+                  project,
+                  set,
+                  attempt.controller.signal,
+                );
+                if (!ok) {
+                  const error = new Error("Recording start cancelled");
+                  error.name = "AbortError";
+                  throw error;
+                }
+              }
+            : undefined,
         );
+        if (!isRecordingStartAttemptCurrent(attempt, project)) {
+          await getEngine().stopMultiRecording().catch(() => ({
+            results: new Map<string, AudioBuffer | null>(),
+            errors: new Map<string, Error>(),
+          }));
+          activeMultiRecordingTrackIds.clear();
+          if (isProjectIdentityCurrent(project) && autoArmedIds.size > 0) {
+            set((s) => ({
+              tracks: s.tracks.map((t) =>
+                autoArmedIds.has(t.id) ? { ...t, armed: false } : t,
+              ),
+            }));
+          }
+          return;
+        }
+        for (const target of targets) {
+          activeMultiRecordingTrackIds.add(target.id);
+        }
+        resetSamplerHistoryGrouping();
         set({ isMultiRecording: true, isPlaying: true, recordingTrackId: null });
         const rates = targets
           .map((t) => getEngine().capturedSampleRate(t.id))
@@ -987,112 +2528,381 @@ export const useCypher = create<CypherState>((set, get) => ({
           maybeWarnAboutLowSampleRate(Math.min(...rates), get().pushToast);
         }
       } catch (err) {
-        // Roll back any auto-arm we did so the user isn't stuck in an armed state.
-        set((s) => ({
-          tracks: s.tracks.map((t) => ({ ...t, armed: false })),
-        }));
-        get().pushToast(toastFromMicError(err));
+        activeMultiRecordingTrackIds.clear();
+        if (!isRecordingStartAttemptCurrent(attempt, project)) {
+          if (isProjectIdentityCurrent(project) && autoArmedIds.size > 0) {
+            set((s) => ({
+              tracks: s.tracks.map((t) =>
+                autoArmedIds.has(t.id) ? { ...t, armed: false } : t,
+              ),
+            }));
+          }
+          return;
+        }
+        // Roll back only auto-arming from this attempt. Manually armed tracks
+        // remain the user's explicit selection after a permission/device error.
+        if (isProjectIdentityCurrent(project)) {
+          set((s) => ({
+            tracks: s.tracks.map((t) =>
+              autoArmedIds.has(t.id) ? { ...t, armed: false } : t,
+            ),
+          }));
+          get().pushToast(toastFromMicError(err));
+        }
       }
     } else {
-      // All tracks already have audio; just play.
+      // All recordable tracks already have audio, so this action is playback
+      // only. Sampler-only and fully-trimmed projects may still be silent.
+      const beats = get().countInBeats;
+      if (beats > 0) {
+        const ok = await runCountIn(
+          beats,
+          get().bpm,
+          get().timeSignature,
+          getEngine().playStartOffsetFromToneNow(),
+          project,
+          set,
+          attempt.controller.signal,
+        );
+        if (!ok || !isRecordingStartAttemptCurrent(attempt, project)) return;
+      }
+      if (!canRunTransport(get().tracks)) {
+        getEngine().stop();
+        if (isProjectIdentityCurrent(project)) {
+          set({ isPlaying: false, positionSec: 0 });
+        }
+        return;
+      }
       await getEngine().play();
+      if (!isRecordingStartAttemptCurrent(attempt, project)) {
+        getEngine().stop();
+        return;
+      }
+      resetSamplerHistoryGrouping();
       set({ isPlaying: true });
     }
+    })();
+    recordingStartInFlight = operation;
+    void operation
+      .finally(() => {
+        if (recordingStartInFlight === operation) {
+          recordingStartInFlight = null;
+          if (recordingStartAbortController === attempt.controller) {
+            recordingStartAbortController = null;
+          }
+          set({ isStartingRecording: false });
+        }
+      })
+      .catch(() => {});
+    return operation;
   },
 
-  stopArmedRecording: async () => {
-    let results = new Map<string, AudioBuffer | null>();
-    let errors = new Map<string, Error>();
-    try {
-      const out = await getEngine().stopMultiRecording();
-      results = out.results;
-      errors = out.errors;
-    } catch (err) {
-      get().pushToast(toastFromCaptureError(err));
-    }
-    set({ isMultiRecording: false, isPlaying: false });
-    for (const [trackId, err] of errors) {
-      const t = get().tracks.find((x) => x.id === trackId);
-      const toast = toastFromCaptureError(err);
-      get().pushToast({
-        ...toast,
-        title: t ? `${t.name}: ${toast.title}` : toast.title,
-      });
-    }
-    const updates = new Map<string, { audioKey: string; duration: number }>();
-    if (results.size > 0) {
-      // Snapshot the pre-recording state before any tracks get their new
-      // buffers so the user can undo the entire take in one step. Previous
-      // audio keys stay in IndexedDB so they're still loadable on undo.
-      pushHistory(get(), `recording:${[...results.keys()].sort().join(",")}`);
-    }
-    for (const [trackId, buf] of results) {
-      if (!buf) continue;
-      const audioKey = makeAudioKey(get().currentProjectId, trackId);
-      await saveAudio(audioKey, audioBufferToWavBlob(buf));
-      updates.set(trackId, { audioKey, duration: buf.duration });
-    }
-    if (updates.size > 0) {
-      const latencySec = get().latencyOffsetMs / 1000;
-      for (const [trackId, u] of updates) {
-        const trimIn = Math.max(0, Math.min(u.duration, latencySec));
-        getEngine().setTrim(trackId, trimIn, null);
+  stopArmedRecording: () => {
+    if (recordingStopInFlight) return recordingStopInFlight;
+    set({ isFinalizingRecording: true });
+    const operation = (async () => {
+    const startingState = get();
+    const project = captureProjectIdentity(startingState);
+    const latencyOffsetMs = startingState.latencyOffsetMs;
+    const activeTargetIds = new Set(activeMultiRecordingTrackIds);
+    const replacements = new Map<
+      string,
+      { target: string; token: symbol }
+    >();
+    if (project) {
+      for (const track of startingState.tracks) {
+        if (track.kind === "sampler" || !activeTargetIds.has(track.id)) continue;
+        const target = trackAudioTarget(project.id, track.id);
+        replacements.set(track.id, {
+          target,
+          token: beginAudioReplacement(target),
+        });
       }
-      set((s) => ({
-        tracks: s.tracks.map((t) => {
-          const u = updates.get(t.id);
-          if (!u) return t;
-          const trimIn = Math.max(0, Math.min(u.duration, latencySec));
-          return {
-            ...t,
-            hasAudio: true,
-            fileName: "Recording",
-            durationSec: u.duration,
-            bufferRevision: t.bufferRevision + 1,
-            audioKey: u.audioKey,
-            trimInSec: trimIn,
-            trimOutSec: null,
-          };
-        }),
-      }));
-      schedulePersist(get());
     }
-  },
-
-  stopRecording: async () => {
-    const id = get().recordingTrackId;
-    let buf: AudioBuffer | null = null;
+    const updates = new Map<
+      string,
+      { audioKey: string; duration: number; buffer: AudioBuffer }
+    >();
     try {
-      buf = await getEngine().stopRecording();
-    } catch (err) {
-      get().pushToast(toastFromCaptureError(err));
-    }
-    set({ recordingTrackId: null });
-    if (id && buf) {
-      pushHistory(get(), `recording:${id}`);
-      const audioKey = makeAudioKey(get().currentProjectId, id);
-      await saveAudio(audioKey, audioBufferToWavBlob(buf));
-      const latencySec = get().latencyOffsetMs / 1000;
-      const trimIn = Math.max(0, Math.min(buf.duration, latencySec));
-      getEngine().setTrim(id, trimIn, null);
-      set((s) => ({
-        tracks: s.tracks.map((t) =>
-          t.id === id
-            ? {
-                ...t,
+      let results = new Map<string, AudioBuffer | null>();
+      let errors = new Map<string, Error>();
+      try {
+        const out = await getEngine().stopMultiRecording();
+        results = out.results;
+        errors = out.errors;
+      } catch (err) {
+        if (project && isProjectIdentityCurrent(project)) {
+          get().pushToast(toastFromCaptureError(err));
+        }
+      }
+      if (project && isProjectIdentityCurrent(project)) {
+        set({ isMultiRecording: false, isPlaying: false });
+      }
+      for (const [trackId, err] of errors) {
+        if (!project || !isProjectIdentityCurrent(project)) break;
+        const t = get().tracks.find((x) => x.id === trackId);
+        const toast = toastFromCaptureError(err);
+        get().pushToast({
+          ...toast,
+          title: t ? `${t.name}: ${toast.title}` : toast.title,
+        });
+      }
+      if (!project || !isProjectIdentityCurrent(project)) return;
+
+      await withProjectStorageLease(project.id, async () => {
+        try {
+        for (const [trackId, buf] of results) {
+          if (!buf) continue;
+          const replacement = replacements.get(trackId);
+          if (
+            !replacement ||
+            !isProjectIdentityCurrent(project) ||
+            !isCurrentAudioReplacement(
+              replacement.target,
+              replacement.token,
+            )
+          ) {
+            continue;
+          }
+          const audioKey = makeAudioKey(project.id, trackId);
+          await saveAudio(audioKey, audioBufferToWavBlob(buf));
+          pendingAudioKeys.add(audioKey);
+          updates.set(trackId, {
+            audioKey,
+            duration: buf.duration,
+            buffer: buf,
+          });
+        }
+        } catch (error) {
+        for (const update of updates.values()) {
+          pendingAudioKeys.delete(update.audioKey);
+        }
+        await Promise.all(
+          [...updates.values()].map((update) => deleteAudio(update.audioKey)),
+        );
+        if (isProjectIdentityCurrent(project)) {
+          get().pushToast({
+            variant: "error",
+            title: "Recording wasn't saved",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+          return;
+        }
+
+        const committedAudioKeys = new Set<string>();
+        try {
+          await withProjectOperation(async () => {
+          if (!isProjectIdentityCurrent(project)) return;
+          const stateTrackIds = new Set(get().tracks.map((track) => track.id));
+          const validUpdates = new Map(
+            [...updates].filter(([trackId]) => {
+              const replacement = replacements.get(trackId);
+              if (!replacement) return false;
+              return (
+                stateTrackIds.has(trackId) &&
+                Boolean(getEngine().getTrack(trackId)) &&
+                isCurrentAudioReplacement(
+                  replacement.target,
+                  replacement.token,
+                )
+              );
+            }),
+          );
+          if (validUpdates.size === 0) return;
+
+          // The take is now durable and every target still exists. Attach all
+          // buffers first, then capture the exact pre-commit store state so
+          // intervening edits remain independently undoable.
+          const latencySec = latencyOffsetMs / 1000;
+          for (const [trackId, update] of validUpdates) {
+            getEngine().setTrackBuffer(trackId, update.buffer);
+            const trimIn = Math.max(
+              0,
+              Math.min(update.duration, latencySec),
+            );
+            getEngine().setTrim(trackId, trimIn, null);
+          }
+          pushHistory(
+            get(),
+            `recording:${[...validUpdates.keys()].sort().join(",")}`,
+          );
+          set((s) => ({
+            tracks: s.tracks.map((track) => {
+              const update = validUpdates.get(track.id);
+              if (!update) return track;
+              const trimIn = Math.max(
+                0,
+                Math.min(update.duration, latencySec),
+              );
+              return {
+                ...track,
                 hasAudio: true,
                 fileName: "Recording",
-                durationSec: buf.duration,
-                bufferRevision: t.bufferRevision + 1,
-                audioKey,
+                durationSec: update.duration,
+                bufferRevision: track.bufferRevision + 1,
+                audioKey: update.audioKey,
                 trimInSec: trimIn,
                 trimOutSec: null,
-              }
-            : t,
-        ),
-      }));
-      schedulePersist(get());
+                normalized: false,
+                normalizationGain: 1,
+              };
+            }),
+          }));
+          for (const update of validUpdates.values()) {
+            committedAudioKeys.add(update.audioKey);
+          }
+          schedulePersist(get());
+            await flushPersist();
+          });
+        } finally {
+          for (const update of updates.values()) {
+            pendingAudioKeys.delete(update.audioKey);
+          }
+          await Promise.all(
+            [...updates.values()]
+              .filter((update) => !committedAudioKeys.has(update.audioKey))
+              .map((update) => deleteAudio(update.audioKey).catch(() => {})),
+          );
+        }
+      });
+    } finally {
+      activeMultiRecordingTrackIds.clear();
+      for (const replacement of replacements.values()) {
+        finishAudioReplacement(replacement.target, replacement.token);
+      }
     }
+    })();
+    recordingStopInFlight = operation;
+    void operation
+      .finally(() => {
+        if (recordingStopInFlight === operation) {
+          recordingStopInFlight = null;
+          set({ isFinalizingRecording: false });
+        }
+      })
+      .catch(() => {});
+    return operation;
+  },
+
+  stopRecording: () => {
+    if (recordingStopInFlight) return recordingStopInFlight;
+    set({ isFinalizingRecording: true });
+    const operation = (async () => {
+    const startingState = get();
+    const project = captureProjectIdentity(startingState);
+    const id = startingState.recordingTrackId;
+    const latencyOffsetMs = startingState.latencyOffsetMs;
+    const replacementTarget =
+      project && id ? trackAudioTarget(project.id, id) : null;
+    const replacementToken = replacementTarget
+      ? beginAudioReplacement(replacementTarget)
+      : null;
+    try {
+      let buf: AudioBuffer | null = null;
+      try {
+        buf = await getEngine().stopRecording();
+      } catch (err) {
+        if (project && isProjectIdentityCurrent(project)) {
+          get().pushToast(toastFromCaptureError(err));
+        }
+      }
+      if (project && isProjectIdentityCurrent(project)) {
+        set({ recordingTrackId: null, isPlaying: false });
+      }
+      if (
+        !project ||
+        !isProjectIdentityCurrent(project) ||
+        !id ||
+        !buf ||
+        !replacementTarget ||
+        !replacementToken ||
+        !isCurrentAudioReplacement(replacementTarget, replacementToken)
+      ) {
+        return;
+      }
+
+      const audioKey = makeAudioKey(project.id, id);
+      await withProjectStorageLease(project.id, async () => {
+        try {
+          await saveAudio(audioKey, audioBufferToWavBlob(buf));
+        } catch (error) {
+          if (isProjectIdentityCurrent(project)) {
+            get().pushToast({
+              variant: "error",
+              title: "Recording wasn't saved",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+          return;
+        }
+        pendingAudioKeys.add(audioKey);
+        let committed = false;
+        try {
+          await withProjectOperation(async () => {
+          const targetStillExists = get().tracks.some(
+            (track) => track.id === id,
+          );
+          if (
+            !isProjectIdentityCurrent(project) ||
+            !isCurrentAudioReplacement(
+              replacementTarget,
+              replacementToken,
+            ) ||
+            !targetStillExists ||
+            !getEngine().getTrack(id)
+          ) {
+            return;
+          }
+
+          getEngine().setTrackBuffer(id, buf);
+          pushHistory(get(), `recording:${id}`);
+          const latencySec = latencyOffsetMs / 1000;
+          const trimIn = Math.max(0, Math.min(buf.duration, latencySec));
+          getEngine().setTrim(id, trimIn, null);
+          set((s) => ({
+            tracks: s.tracks.map((t) =>
+              t.id === id
+                ? {
+                    ...t,
+                    hasAudio: true,
+                    fileName: "Recording",
+                    durationSec: buf.duration,
+                    bufferRevision: t.bufferRevision + 1,
+                    audioKey,
+                    trimInSec: trimIn,
+                    trimOutSec: null,
+                    normalized: false,
+                    normalizationGain: 1,
+                  }
+                : t,
+            ),
+          }));
+          committed = true;
+          schedulePersist(get());
+            await flushPersist();
+          });
+        } finally {
+          pendingAudioKeys.delete(audioKey);
+          if (!committed) await deleteAudio(audioKey).catch(() => {});
+        }
+      });
+    } finally {
+      if (replacementTarget && replacementToken) {
+        finishAudioReplacement(replacementTarget, replacementToken);
+      }
+    }
+    })();
+    recordingStopInFlight = operation;
+    void operation
+      .finally(() => {
+        if (recordingStopInFlight === operation) {
+          recordingStopInFlight = null;
+          set({ isFinalizingRecording: false });
+        }
+      })
+      .catch(() => {});
+    return operation;
   },
 }));
 
@@ -1143,21 +2953,39 @@ function emptyTrack(
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingFlush: (() => Promise<void>) | null = null;
+let persistInFlight: Promise<void> | null = null;
 
 interface PersistInput {
   currentProjectId: string;
   currentProjectName: string;
   tracks: TrackState[];
   bpm: number;
+  timeSignature: TimeSignature;
   latencyOffsetMs: number;
   countInBeats: number;
 }
+
+interface DirtyPersistSnapshot {
+  generation: number;
+  changedAt: number;
+  acceptableBaseUpdatedAts: Array<number | null>;
+  state: PersistInput;
+}
+
+let persistGeneration = 0;
+let lastDirtyAt = 0;
+let dirtyPersistSnapshot: DirtyPersistSnapshot | null = null;
+// The revision each open project was loaded or last saved from. A read/write
+// transaction compares this value before replacing the complete snapshot, so
+// delayed work from another tab cannot silently clobber a newer edit.
+const persistedProjectRevisions = new Map<string, number | null>();
 
 function buildPersisted(state: PersistInput): PersistedProject {
   return {
     id: state.currentProjectId,
     name: state.currentProjectName,
     bpm: state.bpm,
+    timeSignature: state.timeSignature,
     tracks: state.tracks.map<PersistedTrack>((t) => ({
       id: t.id,
       name: t.name,
@@ -1184,6 +3012,16 @@ function buildPersisted(state: PersistInput): PersistedProject {
             durationSec: p.durationSec,
           }))
         : undefined,
+      samplerPattern:
+        t.kind === "sampler"
+          ? t.samplerPattern.flatMap<PersistedSamplerEvent>((event) => {
+              const safeEvent = sanitizeSamplerEvent(
+                event,
+                SAMPLER_PAD_COUNT,
+              );
+              return safeEvent ? [safeEvent] : [];
+            })
+          : undefined,
     })),
     createdAt: 0, // filled in by flush — preserves existing createdAt if present.
     updatedAt: Date.now(),
@@ -1192,32 +3030,1241 @@ function buildPersisted(state: PersistInput): PersistedProject {
   };
 }
 
-function schedulePersist(state: PersistInput) {
+const LEGACY_RECOVERY_SNAPSHOT_KEY = "cypher:pending-project-snapshot";
+const RECOVERY_SNAPSHOT_PREFIX = "cypher:pending-project-snapshot:";
+const RECOVERY_CONFLICT_PREFIX = "cypher:conflicted-project-snapshot:";
+const RECOVERY_CLEANUP_PREFIX = "cypher:recovery-audio-cleanup:";
+const RECOVERY_RETIREMENT_PREFIX = "cypher:retired-recovery-journal:";
+
+interface RecoveryEnvelope {
+  version: 3;
+  project: PersistedProject;
+  acceptableBaseUpdatedAts: Array<number | null>;
+}
+
+interface RecoveryEntry {
+  key: string;
+  envelope: RecoveryEnvelope;
+  serialized: string | null;
+}
+
+let recoverySessionId: string | null = null;
+
+function getRecoverySessionId() {
+  if (!recoverySessionId) {
+    recoverySessionId =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : makeId();
+  }
+  return recoverySessionId;
+}
+
+function recoveryConflictKey(projectId: string) {
+  return `${RECOVERY_CONFLICT_PREFIX}${encodeURIComponent(projectId)}:${makeId()}`;
+}
+
+function projectIdFromRecoveryConflictKey(key: string): string | null {
+  if (!key.startsWith(RECOVERY_CONFLICT_PREFIX)) return null;
+  const encodedProjectId = key
+    .slice(RECOVERY_CONFLICT_PREFIX.length)
+    .split(":", 1)[0];
+  if (!encodedProjectId) return null;
+  try {
+    return decodeURIComponent(encodedProjectId);
+  } catch {
+    return null;
+  }
+}
+
+function recoveryCleanupKey(projectId: string) {
+  return `${RECOVERY_CLEANUP_PREFIX}${encodeURIComponent(projectId)}:${makeId()}`;
+}
+
+function projectIdFromRecoveryCleanupKey(key: string): string | null {
+  if (!key.startsWith(RECOVERY_CLEANUP_PREFIX)) return null;
+  const encodedProjectId = key
+    .slice(RECOVERY_CLEANUP_PREFIX.length)
+    .split(":", 1)[0];
+  if (!encodedProjectId) return null;
+  try {
+    return decodeURIComponent(encodedProjectId);
+  } catch {
+    return null;
+  }
+}
+
+function publishRecoveryCleanup(projectId: string): string {
+  if (typeof localStorage === "undefined") {
+    throw new Error("Recovery storage is unavailable.");
+  }
+  const key = recoveryCleanupKey(projectId);
+  localStorage.setItem(key, String(Date.now()));
+  return key;
+}
+
+async function completePublishedRecoveryCleanup(
+  projectId: string,
+  cleanupKey: string,
+) {
+  await cleanupDeletedRecoveryAudioIfSafe(projectId);
+  // Tombstones are immutable and nonce-suffixed. Removing this exact entry
+  // cannot erase a newer cleanup request published by another action/tab.
+  localStorage.removeItem(cleanupKey);
+}
+
+async function retryPendingRecoveryCleanup() {
+  if (typeof localStorage === "undefined") return;
+  const pending: Array<{ key: string; projectId: string }> = [];
+  try {
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(RECOVERY_CLEANUP_PREFIX)) continue;
+      const projectId = projectIdFromRecoveryCleanupKey(key);
+      if (projectId) pending.push({ key, projectId });
+    }
+  } catch {
+    return;
+  }
+  for (const entry of pending) {
+    try {
+      await withProjectStorageLease(entry.projectId, () =>
+        completePublishedRecoveryCleanup(entry.projectId, entry.key),
+      );
+    } catch {
+      // Leave the immutable tombstone for the next startup.
+    }
+  }
+}
+
+interface PreparedDeletionRecovery {
+  journalEntries: RecoveryEntry[];
+  retiredLegacyJournalKeys: string[];
+  createdBackupKeys: string[];
+  protectedAudioKeys: string[];
+}
+
+/** Make every pending journal visible in MainMenu before its project row goes. */
+function prepareRecoveryForProjectDeletion(
+  projectId: string,
+): PreparedDeletionRecovery {
+  if (typeof localStorage === "undefined") {
+    throw new Error("Recovery storage is unavailable.");
+  }
+  const allJournals = readRecoverySnapshotsStrict(projectId, true);
+  // A matching retirement marker proves this exact mutable legacy value was
+  // already promoted/copied. Do not manufacture a duplicate visible backup;
+  // the exclusive delete path below will retire its stale source key.
+  const journals = allJournals.filter(
+    (entry) => !isRetiredLegacyRecoveryEntry(projectId, entry),
+  );
+  const retiredLegacyJournalKeys = allJournals
+    .filter((entry) => isRetiredLegacyRecoveryEntry(projectId, entry))
+    .map(({ key }) => key);
+  const createdBackupKeys: string[] = [];
+  try {
+    for (const entry of journals) {
+      const key = recoveryConflictKey(projectId);
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          ...entry.envelope,
+          currentUpdatedAt: null,
+          conflictedAt: Date.now(),
+        }),
+      );
+      createdBackupKeys.push(key);
+    }
+    return {
+      journalEntries: allJournals,
+      retiredLegacyJournalKeys,
+      createdBackupKeys,
+      protectedAudioKeys: recoveryAudioReferences(projectId),
+    };
+  } catch (error) {
+    for (const key of createdBackupKeys) {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        // The source journals still exist; an extra visible backup is safe.
+      }
+    }
+    throw error;
+  }
+}
+
+function rollbackPreparedDeletionRecovery(
+  prepared: PreparedDeletionRecovery | null,
+) {
+  if (!prepared || typeof localStorage === "undefined") return;
+  for (const key of prepared.createdBackupKeys) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // A duplicate visible backup is preferable to losing the journal.
+    }
+  }
+}
+
+async function cleanupDeletedRecoveryAudioIfSafe(projectId: string) {
+  // Strict scanning fails closed. If recovery storage becomes unreadable, keep
+  // extra bytes rather than risk deleting the only copy of a dormant take.
+  const protectedAudioKeys = recoveryAudioReferences(projectId);
+  await cleanupDeletedProjectAudio(projectId, protectedAudioKeys);
+}
+
+function legacyProjectRecoveryKey(projectId: string) {
+  return `${RECOVERY_SNAPSHOT_PREFIX}${encodeURIComponent(projectId)}`;
+}
+
+function currentRecoverySessionKeyPrefix(projectId: string) {
+  return `${legacyProjectRecoveryKey(projectId)}:${getRecoverySessionId()}:`;
+}
+
+function isCurrentRecoverySessionKey(projectId: string, key: string) {
+  return key.startsWith(currentRecoverySessionKeyPrefix(projectId));
+}
+
+function recoverySnapshotKey(projectId: string, generation: number) {
+  // Each value is immutable after publication. A recovery reader can safely
+  // delete the exact key it processed without racing an owning tab that is
+  // publishing a successor snapshot under a fresh nonce-suffixed key.
+  return `${currentRecoverySessionKeyPrefix(projectId)}${generation.toString(36)}:${makeId()}`;
+}
+
+function isImmutableRecoverySnapshotKey(key: string) {
+  if (!key.startsWith(RECOVERY_SNAPSHOT_PREFIX)) return false;
+  // encoded project id, session id, generation, publication nonce
+  return key.slice(RECOVERY_SNAPSHOT_PREFIX.length).split(":").length >= 4;
+}
+
+function immutableRecoverySessionId(projectId: string, key: string) {
+  if (!isImmutableRecoverySnapshotKey(key)) return null;
+  const prefix = `${legacyProjectRecoveryKey(projectId)}:`;
+  if (!key.startsWith(prefix)) return null;
+  const [sessionId, generation, nonce] = key.slice(prefix.length).split(":");
+  return sessionId && generation && nonce ? sessionId : null;
+}
+
+interface LegacyRecoveryRetirement {
+  markerKey: string;
+  sourceKey: string;
+  sourceRaw: string;
+}
+
+function legacyRecoveryRetirementKey(projectId: string) {
+  return `${RECOVERY_RETIREMENT_PREFIX}${encodeURIComponent(projectId)}:${makeId()}`;
+}
+
+function readLegacyRecoveryRetirements(
+  projectId: string,
+): LegacyRecoveryRetirement[] {
+  if (typeof localStorage === "undefined") return [];
+  const prefix = `${RECOVERY_RETIREMENT_PREFIX}${encodeURIComponent(projectId)}:`;
+  const retirements: LegacyRecoveryRetirement[] = [];
+  try {
+    for (let index = 0; index < localStorage.length; index++) {
+      const markerKey = localStorage.key(index);
+      if (!markerKey?.startsWith(prefix)) continue;
+      const raw = localStorage.getItem(markerKey);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw) as {
+        sourceKey?: unknown;
+        sourceRaw?: unknown;
+      };
+      if (
+        typeof parsed.sourceKey === "string" &&
+        typeof parsed.sourceRaw === "string"
+      ) {
+        retirements.push({
+          markerKey,
+          sourceKey: parsed.sourceKey,
+          sourceRaw: parsed.sourceRaw,
+        });
+      }
+    }
+  } catch {
+    // A missing/corrupt retirement marker only causes conservative duplicate
+    // recovery; it can never authorize deleting a journal or its audio.
+  }
+  return retirements;
+}
+
+function isRetiredLegacyRecoveryEntry(
+  projectId: string,
+  entry: RecoveryEntry,
+) {
+  return (
+    !isImmutableRecoverySnapshotKey(entry.key) &&
+    entry.serialized !== null &&
+    readLegacyRecoveryRetirements(projectId).some(
+      ({ sourceKey, sourceRaw }) =>
+        sourceKey === entry.key && sourceRaw === entry.serialized,
+    )
+  );
+}
+
+function retireHandledRecoveryEntry(projectId: string, entry: RecoveryEntry) {
+  if (isImmutableRecoverySnapshotKey(entry.key)) {
+    removeRecoveryEntry(entry.key);
+    return;
+  }
+  if (typeof localStorage === "undefined" || entry.serialized === null) return;
+  try {
+    const markerKey = legacyRecoveryRetirementKey(projectId);
+    localStorage.setItem(
+      markerKey,
+      JSON.stringify({ sourceKey: entry.key, sourceRaw: entry.serialized }),
+    );
+  } catch {
+    // Keep the legacy journal discoverable. It may be materialized again, but
+    // no pending branch is lost when retirement metadata cannot be stored.
+  }
+}
+
+function removeRetiredLegacyRecoveryEntriesUnderExclusiveSession(
+  projectId: string,
+  removeMarkers = true,
+) {
+  if (typeof localStorage === "undefined") return;
+  const groups = new Map<string, LegacyRecoveryRetirement[]>();
+  for (const retirement of readLegacyRecoveryRetirements(projectId)) {
+    const group = groups.get(retirement.sourceKey) ?? [];
+    group.push(retirement);
+    groups.set(retirement.sourceKey, group);
+  }
+  for (const [sourceKey, retirements] of groups) {
+    if (sourceKey === LEGACY_RECOVERY_SNAPSHOT_KEY) {
+      // This key is shared by every project from the oldest schema. A
+      // per-project exclusive lock cannot authorize deleting it or its
+      // exact-value retirement marker.
+      continue;
+    }
+    const currentRaw = localStorage.getItem(sourceKey);
+    if (
+      currentRaw !== null &&
+      retirements.some(({ sourceRaw }) => sourceRaw === currentRaw)
+    ) {
+      // The caller holds the project's exclusive lifetime session lock, so no
+      // cooperating writer can replace this mutable legacy value between the
+      // check and removal.
+      localStorage.removeItem(sourceKey);
+      if (localStorage.getItem(sourceKey) !== null) {
+        throw new Error("A retired recovery journal could not be removed.");
+      }
+    }
+    if (removeMarkers) {
+      for (const { markerKey } of retirements) {
+        localStorage.removeItem(markerKey);
+      }
+    }
+  }
+}
+
+function isPersistedProject(value: unknown): value is PersistedProject {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<PersistedProject>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.name === "string" &&
+    typeof candidate.bpm === "number" &&
+    Array.isArray(candidate.tracks) &&
+    typeof candidate.updatedAt === "number"
+  );
+}
+
+function addProjectAudioReferences(
+  project: PersistedProject,
+  references: Set<string>,
+) {
+  for (const track of project.tracks) {
+    if (track.audioKey) references.add(track.audioKey);
+    for (const pad of track.pads ?? []) {
+      if (pad.audioKey) references.add(pad.audioKey);
+    }
+  }
+}
+
+function recoveryAudioReferences(projectId: string): string[] {
+  const references = new Set<string>();
+  if (typeof localStorage === "undefined") {
+    throw new Error(
+      "Recovery storage is unavailable, so Cypher cannot compact this project safely.",
+    );
+  }
+  try {
+    void localStorage.length;
+  } catch {
+    throw new Error(
+      "Recovery storage is unavailable, so Cypher cannot compact this project safely.",
+    );
+  }
+  for (const entry of readRecoverySnapshotsStrict(projectId)) {
+    addProjectAudioReferences(entry.envelope.project, references);
+  }
+  try {
+    const projectBackupPrefix = `${RECOVERY_CONFLICT_PREFIX}${encodeURIComponent(
+      projectId,
+    )}:`;
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(projectBackupPrefix)) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw) as { project?: unknown };
+        if (
+          isPersistedProject(parsed.project) &&
+          parsed.project.id === projectId
+        ) {
+          addProjectAudioReferences(parsed.project, references);
+        } else {
+          throw new Error("Recovery backup metadata does not match its project.");
+        }
+      } catch (error) {
+        throw new Error(
+          "A recovery backup is unreadable, so Cypher cannot compact or delete this project safely.",
+          { cause: error },
+        );
+      }
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith("A recovery backup is unreadable")
+    ) {
+      throw error;
+    }
+    throw new Error(
+      "Recovery storage changed while Cypher was checking it. Retry the storage action.",
+      { cause: error },
+    );
+  }
+  return [...references];
+}
+
+function parseRecoveryEnvelope(
+  raw: string,
+  projectId: string,
+): RecoveryEnvelope | null {
+  try {
+    const parsed = JSON.parse(raw) as {
+      version?: number;
+      project?: unknown;
+      acceptableBaseUpdatedAts?: Array<number | null>;
+      expectedUpdatedAt?: number | null;
+      hasKnownBase?: boolean;
+    };
+    if (
+      parsed.version === 3 &&
+      isPersistedProject(parsed.project) &&
+      Array.isArray(parsed.acceptableBaseUpdatedAts) &&
+      parsed.acceptableBaseUpdatedAts.every(
+        (revision) => typeof revision === "number" || revision === null,
+      )
+    ) {
+      if (parsed.project.id !== projectId) return null;
+      return {
+        version: 3,
+        project: parsed.project,
+        acceptableBaseUpdatedAts: [
+          ...new Set(parsed.acceptableBaseUpdatedAts),
+        ],
+      };
+    }
+    // v2 journals carried one expected base revision. Convert them without
+    // weakening the compare-and-swap rule used by recovery.
+    if (
+      parsed.version === 2 &&
+      isPersistedProject(parsed.project) &&
+      (typeof parsed.expectedUpdatedAt === "number" ||
+        parsed.expectedUpdatedAt === null)
+    ) {
+      if (parsed.project.id !== projectId) return null;
+      return {
+        version: 3,
+        project: parsed.project,
+        acceptableBaseUpdatedAts:
+          parsed.hasKnownBase === false ? [null] : [parsed.expectedUpdatedAt],
+      };
+    }
+    // Legacy journals did not carry a base revision. They can safely create a
+    // missing project, but must never replace an existing record.
+    if (isPersistedProject(parsed) && parsed.id === projectId) {
+      return {
+        version: 3,
+        project: parsed,
+        acceptableBaseUpdatedAts: [null],
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function collapseImmutableRecoveryGenerations(
+  projectId: string,
+  entries: RecoveryEntry[],
+) {
+  const retained: RecoveryEntry[] = [];
+  const bySession = new Map<string, RecoveryEntry[]>();
+  for (const entry of entries) {
+    const sessionId = immutableRecoverySessionId(projectId, entry.key);
+    if (!sessionId) {
+      retained.push(entry);
+      continue;
+    }
+    const group = bySession.get(sessionId) ?? [];
+    group.push(entry);
+    bySession.set(sessionId, group);
+  }
+
+  for (const group of bySession.values()) {
+    const newestUpdatedAt = Math.max(
+      ...group.map(({ envelope }) => envelope.project.updatedAt),
+    );
+    const newest = group.filter(
+      ({ envelope }) => envelope.project.updatedAt === newestUpdatedAt,
+    );
+    const first = newest[0];
+    const sameSnapshot = newest.every((entry) =>
+      projectsRepresentSameSnapshot(first.envelope.project, entry.envelope.project),
+    );
+    const winners = sameSnapshot
+      ? [
+          newest.toSorted(
+            (a, b) =>
+              b.envelope.acceptableBaseUpdatedAts.length -
+                a.envelope.acceptableBaseUpdatedAts.length ||
+              b.key.localeCompare(a.key),
+          )[0],
+        ]
+      : newest;
+    const winnerKeys = new Set(winners.map(({ key }) => key));
+    retained.push(...winners);
+    for (const entry of group) {
+      if (!winnerKeys.has(entry.key)) removeRecoveryEntry(entry.key);
+    }
+  }
+  return retained;
+}
+
+function readRecoverySnapshots(projectId: string): RecoveryEntry[] {
+  if (typeof localStorage === "undefined") return [];
+  const legacyProjectKey = legacyProjectRecoveryKey(projectId);
+  const sessionPrefix = `${legacyProjectKey}:`;
+  const keys: string[] = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key === legacyProjectKey || key?.startsWith(sessionPrefix)) {
+        keys.push(key);
+      }
+    }
+    if (localStorage.getItem(LEGACY_RECOVERY_SNAPSHOT_KEY)) {
+      keys.push(LEGACY_RECOVERY_SNAPSHOT_KEY);
+    }
+  } catch {
+    return [];
+  }
+
+  const entries: RecoveryEntry[] = [];
+  for (const key of new Set(keys)) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const envelope = parseRecoveryEnvelope(raw, projectId);
+      if (envelope) {
+        const entry: RecoveryEntry = { key, envelope, serialized: raw };
+        if (!isRetiredLegacyRecoveryEntry(projectId, entry)) {
+          entries.push(entry);
+        }
+      } else if (isImmutableRecoverySnapshotKey(key)) {
+        localStorage.removeItem(key);
+      }
+    } catch {
+      // Leave an unreadable entry in place; another session may still be able
+      // to inspect or export it when storage access becomes available.
+    }
+  }
+  return collapseImmutableRecoveryGenerations(projectId, entries).sort(
+    (a, b) =>
+      b.envelope.project.updatedAt - a.envelope.project.updatedAt ||
+      a.key.localeCompare(b.key),
+  );
+}
+
+/**
+ * Read every journal that could root audio for a destructive storage action.
+ * The normal recovery path is intentionally best-effort so one corrupt entry
+ * cannot prevent startup; compaction/deletion must instead fail closed when a
+ * journal cannot be enumerated or parsed.
+ */
+function readRecoverySnapshotsStrict(
+  projectId: string,
+  includeRetiredLegacy = false,
+): RecoveryEntry[] {
+  if (typeof localStorage === "undefined") {
+    throw new Error("Recovery storage is unavailable.");
+  }
+  const legacyProjectKey = legacyProjectRecoveryKey(projectId);
+  const sessionPrefix = `${legacyProjectKey}:`;
+  const keys: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key === legacyProjectKey || key?.startsWith(sessionPrefix)) {
+      keys.push(key);
+    }
+  }
+  if (localStorage.getItem(LEGACY_RECOVERY_SNAPSHOT_KEY) !== null) {
+    keys.push(LEGACY_RECOVERY_SNAPSHOT_KEY);
+  }
+
+  const entries: RecoveryEntry[] = [];
+  for (const key of new Set(keys)) {
+    const raw = localStorage.getItem(key);
+    // Another document may have just promoted and removed this entry. Missing
+    // is safe; unreadable is not, because its audio roots are unknowable.
+    if (raw === null) continue;
+    const envelope = parseRecoveryEnvelope(raw, projectId);
+    if (envelope) {
+      entries.push({ key, envelope, serialized: raw });
+      continue;
+    }
+
+    if (key === LEGACY_RECOVERY_SNAPSHOT_KEY) {
+      try {
+        const parsed = JSON.parse(raw) as { project?: unknown };
+        const candidate = isPersistedProject(parsed.project)
+          ? parsed.project
+          : isPersistedProject(parsed)
+            ? parsed
+            : null;
+        if (candidate && candidate.id !== projectId) continue;
+      } catch {
+        // The owner cannot be determined, so it may belong to this project.
+      }
+    }
+    throw new Error(
+      "A recovery journal is unreadable, so Cypher cannot compact or delete this project safely.",
+    );
+  }
+  // Destructive storage actions must root every generation they observed.
+  // Best-effort pruning may have failed, and an older full snapshot can still
+  // uniquely reference audio that the newest generation removed.
+  const rootedEntries = includeRetiredLegacy
+    ? entries
+    : entries.filter(
+        (entry) => !isRetiredLegacyRecoveryEntry(projectId, entry),
+      );
+  return rootedEntries.sort(
+    (a, b) =>
+      b.envelope.project.updatedAt - a.envelope.project.updatedAt ||
+      a.key.localeCompare(b.key),
+  );
+}
+
+function writeRecoverySnapshot(): boolean {
+  if (typeof localStorage === "undefined" || projectTransitioning) return false;
+  const dirty = dirtyPersistSnapshot;
+  if (!dirty) return false;
+  try {
+    const snapshot = buildPersisted(dirty.state);
+    // Preserve the edit revision. An idle/stale tab must not become "newer"
+    // merely because it was hidden after another tab saved real changes.
+    snapshot.updatedAt = dirty.changedAt;
+    const envelope: RecoveryEnvelope = {
+      version: 3,
+      project: snapshot,
+      acceptableBaseUpdatedAts: [...dirty.acceptableBaseUpdatedAts],
+    };
+    const publishedKey = recoverySnapshotKey(snapshot.id, dirty.generation);
+    // Publish the complete successor before pruning older entries. Recovery
+    // readers treat keys as immutable, so deleting an entry they already read
+    // can never delete this newly published generation.
+    localStorage.setItem(publishedKey, JSON.stringify(envelope));
+    for (const key of currentRecoverySessionKeys(snapshot.id)) {
+      if (key !== publishedKey) localStorage.removeItem(key);
+    }
+    return true;
+  } catch {
+    // IndexedDB autosave remains the primary path when localStorage is full
+    // or unavailable. Audio data is never written to localStorage.
+    return false;
+  }
+}
+
+function currentRecoverySessionKeys(projectId: string): string[] {
+  if (typeof localStorage === "undefined") return [];
+  const prefix = currentRecoverySessionKeyPrefix(projectId);
+  const keys: string[] = [];
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (key?.startsWith(prefix)) keys.push(key);
+  }
+  return keys;
+}
+
+function rewriteRecoverySnapshotIfPresent(projectId: string) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (currentRecoverySessionKeys(projectId).length > 0) {
+      writeRecoverySnapshot();
+    }
+  } catch {
+    // Best effort only.
+  }
+}
+
+function clearRecoverySnapshot(
+  projectId: string,
+  savedAt = Number.POSITIVE_INFINITY,
+) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    for (const key of currentRecoverySessionKeys(projectId)) {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const recovery = parseRecoveryEnvelope(raw, projectId);
+      if (recovery && recovery.project.updatedAt > savedAt) continue;
+      // The key is immutable. Even if its owning code publishes a successor
+      // concurrently, that successor has a different key and survives.
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // Best effort only.
+  }
+}
+
+function removeRecoveryEntry(key: string, allowMutable = false) {
+  if (
+    typeof localStorage === "undefined" ||
+    (!allowMutable && !isImmutableRecoverySnapshotKey(key))
+  ) {
+    // Mutable session keys from older builds cannot be deleted safely while
+    // an old live tab may still rewrite them. Retain those legacy roots; all newly
+    // published entries are immutable and can be removed by exact key.
+    return;
+  }
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // Best effort only.
+  }
+}
+
+function retirePreparedRecoveryEntryAfterExclusiveDelete(
+  projectId: string,
+  entry: RecoveryEntry,
+  canRetireMutable: boolean,
+) {
+  if (isImmutableRecoverySnapshotKey(entry.key)) {
+    removeRecoveryEntry(entry.key);
+    return;
+  }
+
+  // The immutable conflict backup created before deletion now owns this exact
+  // snapshot. A retirement marker suppresses duplicate recovery if the old
+  // mutable key cannot be removed.
+  retireHandledRecoveryEntry(projectId, entry);
+  if (
+    !canRetireMutable ||
+    entry.serialized === null ||
+    entry.key === LEGACY_RECOVERY_SNAPSHOT_KEY
+  ) {
+    // The one global legacy key is not protected by a per-project session
+    // lock. Another project/tab may replace it at any point, so retain both
+    // its exact-value marker and the source key.
+    return;
+  }
+  const projectKey = legacyProjectRecoveryKey(projectId);
+  if (entry.key !== projectKey && !entry.key.startsWith(`${projectKey}:`)) {
+    return;
+  }
+  // The caller owns this project's exclusive lifetime session lock. Compare
+  // the captured value so a pre-lock successor is retained; cooperating tabs
+  // cannot rewrite it between this check and removal.
+  if (localStorage.getItem(entry.key) !== entry.serialized) return;
+  localStorage.removeItem(entry.key);
+  if (localStorage.getItem(entry.key) !== null) {
+    throw new Error("A prepared recovery journal could not be retired.");
+  }
+}
+
+function projectsRepresentSameSnapshot(
+  current: PersistedProject,
+  pending: PersistedProject,
+) {
+  return (
+    current.id === pending.id &&
+    current.name === pending.name &&
+    current.bpm === pending.bpm &&
+    JSON.stringify(current.timeSignature ?? null) ===
+      JSON.stringify(pending.timeSignature ?? null) &&
+    JSON.stringify(current.tracks) === JSON.stringify(pending.tracks) &&
+    (current.latencyOffsetMs ?? 0) === (pending.latencyOffsetMs ?? 0) &&
+    (current.countInBeats ?? 0) === (pending.countInBeats ?? 0)
+  );
+}
+
+interface PreservedRecoveryConflict {
+  warning: string;
+  recoveredProjectId: string | null;
+  preserved: boolean;
+}
+
+async function preserveRecoveryConflict(
+  recovery: RecoveryEnvelope,
+  currentUpdatedAt: number | null,
+): Promise<PreservedRecoveryConflict> {
+  const recoveredProjectId = makeId();
+  const recoveredName = `${recovery.project.name} (Recovered ${new Date()
+    .toISOString()
+    .slice(0, 16)
+    .replace("T", " ")})`;
+  try {
+    await materializeRecoveryProject(
+      recovery.project,
+      recoveredProjectId,
+      recoveredName,
+    );
+    await clearPendingAudioForProject(recovery.project).catch(() => {});
+    return {
+      recoveredProjectId,
+      preserved: true,
+      warning: `Pending changes conflicted with another tab, so they were saved as “${recoveredName}” in the project library.`,
+    };
+  } catch {
+    // If quota or a missing referenced blob prevents a full project copy,
+    // retain a versioned metadata backup that the user can download from the
+    // project menu. Never overwrite an earlier conflict branch.
+  }
+
+  if (typeof localStorage !== "undefined") {
+    try {
+      const backupKey = recoveryConflictKey(recovery.project.id);
+      localStorage.setItem(
+        backupKey,
+        JSON.stringify({
+          ...recovery,
+          currentUpdatedAt,
+          conflictedAt: Date.now(),
+        }),
+      );
+      return {
+        recoveredProjectId: null,
+        preserved: true,
+        warning:
+          "Pending changes conflicted with another tab. Their metadata was preserved as a downloadable recovery backup in the project menu.",
+      };
+    } catch {
+      // Leave the active journal intact if the conflict backup cannot be made.
+    }
+  }
+
+  return {
+    recoveredProjectId: null,
+    preserved: false,
+    warning:
+      "Pending changes conflicted with another tab and could not be copied. Keep this tab open and free storage before retrying.",
+  };
+}
+
+async function recoverProjectSnapshot(projectId: string): Promise<string | null> {
+  const entries = readRecoverySnapshots(projectId);
+  const inMemoryDirty = dirtyPersistSnapshot;
+  if (inMemoryDirty?.state.currentProjectId === projectId) {
+    const project = buildPersisted(inMemoryDirty.state);
+    project.updatedAt = inMemoryDirty.changedAt;
+    const inMemoryEnvelope: RecoveryEnvelope = {
+      version: 3,
+      project,
+      acceptableBaseUpdatedAts: [
+        ...inMemoryDirty.acceptableBaseUpdatedAts,
+      ],
+    };
+    // The latest in-memory full-state snapshot supersedes any older journal
+    // generations from this document. Process it once as a synthetic immutable
+    // entry; the real session keys are only cleared after identity-safe async
+    // promotion below.
+    for (let index = entries.length - 1; index >= 0; index--) {
+      if (isCurrentRecoverySessionKey(projectId, entries[index].key)) {
+        entries.splice(index, 1);
+      }
+    }
+    entries.push({
+      key: `${currentRecoverySessionKeyPrefix(projectId)}memory:${inMemoryDirty.generation.toString(36)}`,
+      envelope: inMemoryEnvelope,
+      serialized: null,
+    });
+    entries.sort(
+      (a, b) =>
+        b.envelope.project.updatedAt - a.envelope.project.updatedAt ||
+        a.key.localeCompare(b.key),
+    );
+  }
+  if (entries.length === 0) return null;
+  const warnings = new Set<string>();
+  let ownEntryHandled = false;
+  let ownPromotedRevision: number | undefined;
+
+  for (const entry of entries) {
+    const recovery = entry.envelope;
+    const isOwnEntry = isCurrentRecoverySessionKey(projectId, entry.key);
+    const existing = await loadProject(projectId);
+    const currentUpdatedAt = existing?.updatedAt ?? null;
+
+    // A journal whose full semantic snapshot is already stored is redundant
+    // regardless of timestamp. Requiring revision equality would make two
+    // opening tabs duplicate the same journal after one legitimately advances
+    // its CAS token.
+    if (existing && projectsRepresentSameSnapshot(existing, recovery.project)) {
+      await clearPendingAudioForProject(recovery.project).catch(() => {});
+      if (isOwnEntry) {
+        ownEntryHandled = true;
+        ownPromotedRevision = currentUpdatedAt ?? undefined;
+      } else {
+        retireHandledRecoveryEntry(projectId, entry);
+      }
+      continue;
+    }
+
+    // Compare lineage before timestamps. A divergent stale-tab snapshot is a
+    // real branch even when its wall-clock edit time is older than the current
+    // save, and must be preserved instead of silently deleted.
+    const baseMatches = recovery.acceptableBaseUpdatedAts.some(
+      (revision) => revision === currentUpdatedAt,
+    );
+    if (!baseMatches) {
+      const preserved = await preserveRecoveryConflict(
+        recovery,
+        currentUpdatedAt,
+      );
+      warnings.add(preserved.warning);
+      if (preserved.preserved) {
+        if (isOwnEntry) ownEntryHandled = true;
+        else retireHandledRecoveryEntry(projectId, entry);
+      }
+      continue;
+    }
+
+    recovery.project.createdAt =
+      existing?.createdAt ?? recovery.project.createdAt ?? Date.now();
+    // Clock changes must not move the stored CAS token backwards.
+    recovery.project.updatedAt = Math.max(
+      recovery.project.updatedAt,
+      (currentUpdatedAt ?? 0) + 1,
+      Date.now(),
+    );
+    const result = await saveProjectIfRevision(
+      recovery.project,
+      currentUpdatedAt,
+    );
+    if (result.status === "conflict") {
+      // Another opener may have promoted this exact journal after our read but
+      // before our CAS. Reload before branching: an identical current snapshot
+      // means the journal was consumed, not that it diverged.
+      const latest = await loadProject(projectId);
+      if (
+        latest &&
+        projectsRepresentSameSnapshot(latest, recovery.project)
+      ) {
+        lastDirtyAt = Math.max(lastDirtyAt, latest.updatedAt);
+        await clearPendingAudioForProject(recovery.project).catch(() => {});
+        if (isOwnEntry) {
+          ownEntryHandled = true;
+          ownPromotedRevision = latest.updatedAt;
+        } else {
+          retireHandledRecoveryEntry(projectId, entry);
+        }
+        continue;
+      }
+      const preserved = await preserveRecoveryConflict(
+        recovery,
+        result.currentUpdatedAt,
+      );
+      warnings.add(preserved.warning);
+      if (preserved.preserved) {
+        if (isOwnEntry) ownEntryHandled = true;
+        else retireHandledRecoveryEntry(projectId, entry);
+      }
+      continue;
+    }
+    lastDirtyAt = Math.max(lastDirtyAt, result.project.updatedAt);
+    await clearPendingAudioForProject(result.project).catch(() => {});
+    if (isOwnEntry) {
+      ownEntryHandled = true;
+      ownPromotedRevision = result.project.updatedAt;
+    } else {
+      retireHandledRecoveryEntry(projectId, entry);
+    }
+  }
+
+  // Retry runs in the same document after an autosave failure. Once this
+  // tab's journal has been promoted or preserved as a branch, discard its
+  // in-memory twin so a later pagehide cannot recreate the obsolete journal.
+  if (ownEntryHandled && dirtyPersistSnapshot === inMemoryDirty) {
+    cancelQueuedPersist();
+    dirtyPersistSnapshot = null;
+    clearRecoverySnapshot(projectId);
+  } else if (
+    ownPromotedRevision !== undefined &&
+    dirtyPersistSnapshot?.state.currentProjectId === projectId
+  ) {
+    // A newer edit landed while Retry was promoting the captured generation.
+    // Keep it queued, but advance its safe predecessor to the revision that
+    // now contains the handled snapshot.
+    persistedProjectRevisions.set(projectId, ownPromotedRevision);
+    addAcceptableBaseRevision(
+      dirtyPersistSnapshot,
+      ownPromotedRevision,
+    );
+    rewriteRecoverySnapshotIfPresent(projectId);
+  } else if (
+    ownEntryHandled &&
+    dirtyPersistSnapshot?.state.currentProjectId === projectId
+  ) {
+    // The captured local branch was copied aside, but a still-newer edit is a
+    // descendant of that local branch—not of the other tab's authoritative
+    // revision. Keep its original lineage and make Retry preserve it as a new
+    // branch instead of allowing its stale queued CAS to overwrite anything.
+    cancelQueuedPersist();
+    if (!writeRecoverySnapshot()) {
+      warnings.add(
+        "Newer pending changes remain only in this tab because browser recovery storage is unavailable. Keep it open and Retry.",
+      );
+    }
+  }
+
+  return warnings.size > 0 ? [...warnings].join(" ") : null;
+}
+
+function addAcceptableBaseRevision(
+  dirty: DirtyPersistSnapshot,
+  revision: number | null,
+) {
+  if (
+    !dirty.acceptableBaseUpdatedAts.some(
+      (candidate) => candidate === revision,
+    )
+  ) {
+    dirty.acceptableBaseUpdatedAts.push(revision);
+  }
+}
+
+function reportPersistFailure(error: unknown) {
+  const preserved = writeRecoverySnapshot();
+  // A newer debounce may already be queued behind the failed flush. Its full
+  // state is in the journal above; allowing the stale closure to run during
+  // Retry would CAS against the pre-recovery revision and manufacture a false
+  // cross-tab conflict.
+  cancelQueuedPersist();
+  const detail = error instanceof Error ? error.message : String(error);
+  const recovery = preserved
+    ? "Pending changes were preserved in this browser."
+    : "Browser recovery storage was unavailable, so keep this tab open.";
+  useCypher.setState({
+    isLoaded: false,
+    loadError: `Couldn't save this project. ${recovery} Retry to save again.${
+      detail ? ` ${detail}` : ""
+    }`,
+  });
+}
+
+function schedulePersist(
+  state: PersistInput,
+  allowDuringProjectTransition = false,
+) {
+  if (projectTransitioning && !allowDuringProjectTransition) return;
+  const generation = ++persistGeneration;
+  const changedAt = Math.max(Date.now(), lastDirtyAt + 1);
+  lastDirtyAt = changedAt;
+  const dirty: DirtyPersistSnapshot = {
+    generation,
+    changedAt,
+    acceptableBaseUpdatedAts: [
+      persistedProjectRevisions.get(state.currentProjectId) ?? null,
+    ],
+    state,
+  };
+  dirtyPersistSnapshot = dirty;
+  const scheduledEpoch = projectEpoch;
   const flush = async () => {
+    if (
+      scheduledEpoch !== projectEpoch ||
+      state.currentProjectId !== useCypher.getState().currentProjectId
+    ) return;
     const built = buildPersisted(state);
-    const existing = await loadProject(built.id);
-    built.createdAt = existing?.createdAt ?? Date.now();
-    await saveProject(built);
-    useCypher.setState({ lastSavedAt: built.updatedAt });
+    built.updatedAt = changedAt;
+    const expectedUpdatedAt = persistedProjectRevisions.get(built.id) ?? null;
+    const pendingDirty = dirtyPersistSnapshot;
+    if (
+      pendingDirty &&
+      pendingDirty.state.currentProjectId === built.id &&
+      pendingDirty.generation >= generation
+    ) {
+      addAcceptableBaseRevision(pendingDirty, expectedUpdatedAt);
+      // `built.updatedAt` is only a proposed CAS token until IndexedDB
+      // confirms this write. Adding it here would let a recovery journal
+      // mistake an unrelated same-millisecond revision from another tab for
+      // its predecessor. The saved branch below adds the confirmed revision.
+      rewriteRecoverySnapshotIfPresent(built.id);
+    }
+
+    let result: Awaited<ReturnType<typeof saveProjectIfRevision>>;
+    try {
+      result = await saveProjectIfRevision(built, expectedUpdatedAt);
+    } catch (error) {
+      if (
+        scheduledEpoch === projectEpoch &&
+        built.id === useCypher.getState().currentProjectId
+      ) {
+        reportPersistFailure(error);
+      }
+      throw error;
+    }
+    if (result.status === "conflict") {
+      let message =
+        result.currentUpdatedAt === null
+          ? "This project was deleted in another tab. Retry to open the current project."
+          : "This project changed in another tab. Retry to load the latest saved version.";
+      if (
+        scheduledEpoch === projectEpoch &&
+        built.id === useCypher.getState().currentProjectId
+      ) {
+        // Do not leave a later stale debounce or unload journal queued behind
+        // the conflict. Retry reloads the authoritative revision from IDB.
+        const dirty = dirtyPersistSnapshot;
+        cancelQueuedPersist();
+        // Freeze the editor before the potentially slow branch copy. Store
+        // actions can still race this await, so the generation check below is
+        // the actual data-safety boundary rather than relying on the UI alone.
+        useCypher.setState({ isLoaded: false, loadError: message });
+        let pendingPreserved = true;
+        if (dirty && dirty.state.currentProjectId === built.id) {
+          const pendingProject = buildPersisted(dirty.state);
+          pendingProject.updatedAt = dirty.changedAt;
+          writeRecoverySnapshot();
+          const preserved = await preserveRecoveryConflict(
+            {
+              version: 3,
+              project: pendingProject,
+              acceptableBaseUpdatedAts: [
+                ...dirty.acceptableBaseUpdatedAts,
+              ],
+            },
+            result.currentUpdatedAt,
+          );
+          pendingPreserved = preserved.preserved;
+          message = `${message} ${preserved.warning}`;
+        }
+        if (pendingPreserved && dirtyPersistSnapshot === dirty) {
+          // Only the exact generation copied above is now redundant. A newer
+          // dirty object may have landed while materialization awaited IDB and
+          // must never be discarded with its ancestor.
+          dirtyPersistSnapshot = null;
+          clearRecoverySnapshot(built.id);
+        } else {
+          // A newer generation descends from the captured local branch, not
+          // from the other tab's authoritative revision. Cancel its stale CAS
+          // closure and retain both its original lineage and full-state
+          // journal so Retry preserves it as another branch.
+          cancelQueuedPersist();
+          if (
+            dirtyPersistSnapshot?.state.currentProjectId === built.id
+          ) {
+            if (!writeRecoverySnapshot()) {
+              message = `${message} Newer pending changes remain only in this tab because browser recovery storage is unavailable. Keep it open and Retry.`;
+            }
+          }
+        }
+        useCypher.setState({ isLoaded: false, loadError: message });
+      }
+      throw new Error(message);
+    }
+    persistedProjectRevisions.set(built.id, result.project.updatedAt);
+    await clearPendingAudioForProject(result.project).catch(() => {});
+    if (
+      dirtyPersistSnapshot &&
+      dirtyPersistSnapshot.generation > generation &&
+      dirtyPersistSnapshot.state.currentProjectId === built.id
+    ) {
+      // A newer full-state snapshot contains this just-saved edit, so this
+      // revision is now its safe predecessor if the tab closes mid-flush.
+      addAcceptableBaseRevision(
+        dirtyPersistSnapshot,
+        result.project.updatedAt,
+      );
+      rewriteRecoverySnapshotIfPresent(built.id);
+    }
+    if (
+      scheduledEpoch === projectEpoch &&
+      built.id === useCypher.getState().currentProjectId
+    ) {
+      useCypher.setState({ lastSavedAt: result.project.updatedAt });
+      if (dirtyPersistSnapshot?.generation === generation) {
+        dirtyPersistSnapshot = null;
+      }
+      clearRecoverySnapshot(built.id, result.project.updatedAt);
+    }
   };
   pendingFlush = flush;
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
+  saveTimer = setTimeout(() => {
     saveTimer = null;
     const f = pendingFlush;
     pendingFlush = null;
-    if (f) await f();
+    if (f) void runPersist(f).catch(() => {});
   }, 400);
 }
 
 async function flushPersist() {
-  if (saveTimer) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
+  while (true) {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    const f = pendingFlush;
+    pendingFlush = null;
+    if (f) {
+      await runPersist(f);
+    } else if (persistInFlight) {
+      await persistInFlight;
+    }
+    if (!saveTimer && !pendingFlush && !persistInFlight) return;
   }
-  const f = pendingFlush;
+}
+
+function runPersist(flush: () => Promise<void>) {
+  const previous = persistInFlight;
+  const running = (previous ? previous.catch(() => {}) : Promise.resolve()).then(flush);
+  persistInFlight = running;
+  void running.finally(() => {
+    if (persistInFlight === running) persistInFlight = null;
+  }).catch(() => {});
+  return running;
+}
+
+function cancelQueuedPersist() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = null;
   pendingFlush = null;
-  if (f) await f();
+}
+
+function discardPendingPersist(clearJournal = true) {
+  cancelQueuedPersist();
+  const dirtyProjectId = dirtyPersistSnapshot?.state.currentProjectId;
+  dirtyPersistSnapshot = null;
+  if (clearJournal && dirtyProjectId) clearRecoverySnapshot(dirtyProjectId);
+}
+
+async function waitForPersistIdle() {
+  while (persistInFlight) {
+    const running = persistInFlight;
+    await running.catch(() => {});
+    if (persistInFlight === running) persistInFlight = null;
+  }
 }
 
 // ---- Undo / redo ----
@@ -1229,21 +4276,29 @@ const MAX_HISTORY = 50;
 const HISTORY_COALESCE_MS = 800;
 let lastHistoryAction = "";
 let lastHistoryTime = 0;
-let historyApplyInFlight = false;
+// Multiple calls can be queued programmatically before React disables the
+// controls. Keep the editor inert until the whole Undo/Redo queue drains.
+let historyApplicationCount = 0;
 
 function captureHistorySnapshot(state: CypherState): HistorySnapshot {
   // TrackState is mostly primitives plus the pads array, which we deep-clone
   // so a snapshot can't be mutated by later pad edits.
   return {
     bpm: state.bpm,
+    timeSignature: { ...state.timeSignature },
     tracks: state.tracks.map((t) => ({
       ...t,
       pads: t.pads.map((p) => ({ ...p })),
+      samplerPattern: t.samplerPattern.map((event) => ({ ...event })),
     })),
   };
 }
 
 function pushHistory(state: CypherState, action: string) {
+  // A normal edit splits an in-progress sampler overdub into a new semantic
+  // history group. Otherwise a later hit could be removed together with an
+  // unrelated volume/trim/etc. undo.
+  if (action !== "samplerRecord") samplerHistoryProjectId = null;
   const now = Date.now();
   if (action === lastHistoryAction && now - lastHistoryTime < HISTORY_COALESCE_MS) {
     lastHistoryTime = now;
@@ -1270,6 +4325,32 @@ function resetHistoryCoalesce() {
   lastHistoryTime = 0;
 }
 
+function resetSamplerHistoryGrouping() {
+  samplerHistoryProjectId = null;
+  // A fresh transport/recording pass, or consuming a history entry, starts a
+  // new sampler overdub action even if it happens inside the generic 800 ms
+  // coalescing window.
+  resetHistoryCoalesce();
+}
+
+function reconcileTransportAfterDurationChange() {
+  const state = useCypher.getState();
+  const duration = projectDuration(state.tracks);
+  const canCapturePastEnd = hasSamplerCaptureSource(state.tracks);
+  const position = getEngine().seconds();
+  if (
+    !canRunTransport(state.tracks) ||
+    (!canCapturePastEnd && position >= duration)
+  ) {
+    getEngine().stop();
+    useCypher.setState({ isPlaying: false, positionSec: 0 });
+    return;
+  }
+  if (!state.isPlaying) {
+    useCypher.setState({ positionSec: clampProjectTime(position, duration) });
+  }
+}
+
 async function restoreTrackAudio(trackId: string, audioKey: string, fileName: string | null) {
   const blob = await loadAudio(audioKey);
   if (!blob) return false;
@@ -1282,54 +4363,96 @@ async function restoreTrackAudio(trackId: string, audioKey: string, fileName: st
   }
 }
 
-async function applyHistorySnapshot(snap: HistorySnapshot) {
+async function settleAudioRestores(promises: Promise<unknown>[]) {
+  const results = await Promise.allSettled(promises);
+  const failure = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failure) throw failure.reason;
+}
+
+async function applyHistorySnapshot(
+  snap: HistorySnapshot,
+  project: ProjectIdentity,
+  forceAudioReload = false,
+) {
+  // The caller holds withProjectOperation so snapshot application, project
+  // transitions, and durable sampler commits cannot interleave.
+  if (!isProjectIdentityCurrent(project)) return;
   const engine = getEngine();
+  const resumePlayback = engine.isPlaying();
+  const resumePosition = engine.seconds();
   engine.setBpm(snap.bpm);
+  engine.setTimeSignature(snap.timeSignature);
 
   const currentTracks = useCypher.getState().tracks;
   const snapById = new Map(snap.tracks.map((t) => [t.id, t]));
   const currById = new Map(currentTracks.map((t) => [t.id, t]));
 
-  for (const cur of currentTracks) {
-    if (!snapById.has(cur.id)) engine.removeTrack(cur.id);
+  // Reconcile against the actual graph, not only Zustand state. A previous
+  // failed restore may have added a track before another blob failed, leaving
+  // an engine-only ghost that the rollback snapshot must remove.
+  for (const engineTrack of engine.getTracks()) {
+    if (!snapById.has(engineTrack.id)) engine.removeTrack(engineTrack.id);
   }
 
   // Add and reload audio for all tracks in parallel — each track is keyed
-  // by id and the final setState rebuilds the whole list, so order
-  // doesn't matter.
-  await Promise.all(
+  // by id and the final setState rebuilds the whole list, so order doesn't
+  // matter.
+  await settleAudioRestores(
     snap.tracks.map(async (snapT) => {
       if (!engine.getTrack(snapT.id)) {
         await engine.addTrack(snapT.id, snapT.name, snapT.kind);
       }
       const cur = currById.get(snapT.id);
-      if (cur?.audioKey !== snapT.audioKey && snapT.audioKey) {
-        await restoreTrackAudio(snapT.id, snapT.audioKey, snapT.fileName);
+      if (!snapT.audioKey) {
+        engine.clearTrackAudio(snapT.id);
+      } else if (forceAudioReload || cur?.audioKey !== snapT.audioKey) {
+        const restored = await restoreTrackAudio(
+          snapT.id,
+          snapT.audioKey,
+          snapT.fileName,
+        );
+        if (!restored) {
+          throw new Error(`Audio for ${snapT.name} is unavailable`);
+        }
       }
       if (snapT.kind === "sampler") {
         engine.clearAllPads(snapT.id);
-        await Promise.all(
+        await settleAudioRestores(
           snapT.pads.map(async (p, i) => {
             if (!p.audioKey) return;
             const blob = await loadAudio(p.audioKey);
-            if (!blob) return;
+            if (!blob) {
+              throw new Error(
+                `Pad ${i + 1} audio for ${snapT.name} is unavailable`,
+              );
+            }
             const arr = await blob.arrayBuffer();
             try {
               const buf = await engine.context().decodeAudioData(arr.slice(0));
               engine.setPadBuffer(snapT.id, i, buf);
-            } catch {
-              // Ignore unreadable pad samples — pad UI will reflect missing audio.
+            } catch (error) {
+              throw new Error(
+                `Pad ${i + 1} audio for ${snapT.name} could not be decoded`,
+                { cause: error },
+              );
             }
           }),
         );
+        engine.setSamplerPattern(snapT.id, snapT.samplerPattern);
       }
     }),
   );
 
+  if (!isProjectIdentityCurrent(project)) return;
+
   for (const snapT of snap.tracks) {
     engine.setVolume(snapT.id, snapT.volume);
     engine.setPan(snapT.id, snapT.pan);
-    if (snapT.audioKey) engine.setTrim(snapT.id, snapT.trimInSec, snapT.trimOutSec);
+    if (snapT.audioKey) {
+      engine.setTrim(snapT.id, snapT.trimInSec, snapT.trimOutSec);
+    }
     engine.setNormalizationGain(
       snapT.id,
       snapT.normalized ? snapT.normalizationGain : 1,
@@ -1338,67 +4461,85 @@ async function applyHistorySnapshot(snap: HistorySnapshot) {
 
   // Bump bufferRevision so the waveform re-reads from the engine.
   const revBase = Date.now();
+  const liveTracksById = new Map(
+    useCypher.getState().tracks.map((track) => [track.id, track]),
+  );
   useCypher.setState({
     bpm: snap.bpm,
-    tracks: snap.tracks.map((t, i) => ({
-      ...t,
-      bufferRevision: revBase + i,
-      pads: t.pads.map((p, j) => ({
-        ...p,
-        bufferRevision: revBase + i * 1000 + j,
-      })),
-    })),
+    timeSignature: { ...snap.timeSignature },
+    tracks: snap.tracks.map((t, i) => {
+      const liveTrack = liveTracksById.get(t.id);
+      return {
+        ...t,
+        // Input routing and record-arm controls are intentionally not history
+        // actions. Preserve their latest values when applying a project edit.
+        inputDeviceId: liveTrack?.inputDeviceId ?? t.inputDeviceId,
+        armed: liveTrack?.armed ?? t.armed,
+        samplerRecArmed: liveTrack?.samplerRecArmed ?? t.samplerRecArmed,
+        bufferRevision: revBase + i,
+        pads: t.pads.map((p, j) => ({
+          ...p,
+          bufferRevision: revBase + i * 1000 + j,
+        })),
+      };
+    }),
   });
-  applyMixState(useCypher.getState().tracks);
+  const restoredTracks = useCypher.getState().tracks;
+  applyMixState(restoredTracks);
+  if (resumePlayback) {
+    const restoredDuration = projectDuration(restoredTracks);
+    const samplerCaptureReady = hasSamplerCaptureSource(restoredTracks);
+    if (
+      !canRunTransport(restoredTracks) ||
+      (!samplerCaptureReady && resumePosition >= restoredDuration)
+    ) {
+      engine.stop();
+      useCypher.setState({ isPlaying: false, positionSec: 0 });
+    } else {
+      await engine.seek(resumePosition);
+      useCypher.setState({ positionSec: resumePosition });
+    }
+  } else {
+    reconcileTransportAfterDurationChange();
+  }
   schedulePersist(useCypher.getState());
+  // Undo/Redo is not finished until its metadata snapshot is durable. This
+  // prevents an immediate reload from observing an older pattern revision.
+  await flushPersist();
 }
 
-async function gcOrphanedAudio() {
-  const projectId = useCypher.getState().currentProjectId;
-  try {
-    const all = await listAudioKeysForProject(projectId);
-    // Re-read state AFTER the IDB query so any audio key persisted by an
-    // in-flight recording/import (and added to store state during the
-    // await) shows up as referenced and isn't deleted as an orphan.
-    const s = useCypher.getState();
-    if (s.currentProjectId !== projectId) return; // project changed mid-flight
-    const referenced = new Set<string>();
-    const collect = (snap: {
-      tracks: {
-        audioKey: string | null;
-        pads?: { audioKey: string | null }[];
-      }[];
-    }) => {
-      for (const t of snap.tracks) {
-        if (t.audioKey) referenced.add(t.audioKey);
-        if (t.pads) {
-          for (const p of t.pads) if (p.audioKey) referenced.add(p.audioKey);
-        }
-      }
-    };
-    collect({ tracks: s.tracks });
-    s.undoStack.forEach(collect);
-    s.redoStack.forEach(collect);
-    const orphans = all.filter((k) => !referenced.has(k));
-    await Promise.all(orphans.map(deleteAudio));
-  } catch {
-    // best-effort cleanup
-  }
+function gcOrphanedAudio() {
+  // Deliberately retain replacement/history blobs until their project is
+  // deleted. A tab cannot see another tab's in-memory pendingAudioKeys, so an
+  // automatic orphan sweep can race that tab between saveAudio() and its
+  // metadata CAS and permanently delete live audio. Delete Project remains
+  // the safe, transactional reclamation boundary.
 }
 
 // Build a list of MixTrack values for export. Pulls volume/pan/trim/normalization
-// from the user-facing store state (so solo isn't interpreted as mute) and the
-// audio buffer from the engine.
+// from the user-facing store state and the audio buffer from the engine.
+function collectSamplerEvents(track: TrackState) {
+  if (track.kind !== "sampler") return [];
+  const engine = getEngine();
+  return track.samplerPattern.flatMap((event) => {
+    const buffer = engine.getPadBuffer(track.id, event.padIdx);
+    return buffer ? [{ buffer, timeSec: event.timeSec }] : [];
+  });
+}
+
 function collectMixTracks(opts: { includeMuted: boolean }): MixTrack[] {
   const engine = getEngine();
   const state = useCypher.getState();
+  const anySoloed = state.tracks.some((track) => track.soloed);
   const out: MixTrack[] = [];
   for (const s of state.tracks) {
-    if (!opts.includeMuted && s.muted) continue;
+    if (!opts.includeMuted && !isTrackAudible(s, anySoloed)) continue;
     const e = engine.getTrack(s.id);
-    if (!e?.buffer) continue;
+    const events = collectSamplerEvents(s);
+    if (!e?.buffer && events.length === 0) continue;
     out.push({
-      buffer: e.buffer,
+      buffer: e?.buffer ?? null,
+      events,
       volume: s.volume,
       pan: s.pan,
       trimInSec: s.trimInSec,
@@ -1415,11 +4556,13 @@ function collectStems(): Array<{ name: string; track: MixTrack }> {
   const stems: Array<{ name: string; track: MixTrack }> = [];
   for (const s of state.tracks) {
     const e = engine.getTrack(s.id);
-    if (!e?.buffer) continue;
+    const events = collectSamplerEvents(s);
+    if (!e?.buffer && events.length === 0) continue;
     stems.push({
       name: s.name,
       track: {
-        buffer: e.buffer,
+        buffer: e?.buffer ?? null,
+        events,
         volume: s.volume,
         pan: s.pan,
         trimInSec: s.trimInSec,
@@ -1445,7 +4588,12 @@ function installLifecycleHooks() {
   if (lifecycleHooksInstalled) return;
   if (typeof window === "undefined" || typeof document === "undefined") return;
   lifecycleHooksInstalled = true;
+  installProjectCoordinationChannel();
   const flush = () => {
+    // Browsers do not wait for asynchronous IndexedDB work during unload.
+    // Journal the small metadata snapshot synchronously; startup promotes it
+    // back into IndexedDB if the async flush was interrupted.
+    writeRecoverySnapshot();
     void flushPersist();
   };
   document.addEventListener("visibilitychange", () => {
@@ -1465,155 +4613,260 @@ type Setter = {
   ): void;
 };
 
-async function loadProjectIntoEngine(id: string, set: Setter) {
-  const engine = getEngine();
-  await flushPersist();
-  engine.clearAllTracks();
-  trackCounter = 0;
-
-  const persisted = await loadProject(id);
-  if (!persisted) {
-    // No record under this id — create a fresh empty project. Start with no
-    // tracks so the user picks Audio vs Sampler from the Add Track menu
-    // instead of getting two surprise audio tracks pre-populated.
-    await switchToProject(id, "Untitled", false, set);
-    return;
-  }
-
-  await engine.start();
-  engine.setBpm(persisted.bpm);
-  const restored: TrackState[] = [];
-  for (const pt of persisted.tracks) {
-    const numericId = Number(pt.id.replace(/^t/, "")) || 0;
-    if (numericId > trackCounter) trackCounter = numericId;
-    const kind: TrackKind = pt.kind === "sampler" ? "sampler" : "audio";
-    await engine.addTrack(pt.id, pt.name, kind);
-    engine.setVolume(pt.id, pt.volume);
-    engine.setPan(pt.id, pt.pan);
-    const hasAudio = pt.audioKey
-      ? await restoreTrackAudio(pt.id, pt.audioKey, pt.fileName)
-      : false;
-    if (hasAudio) {
-      engine.setTrim(pt.id, pt.trimInSec ?? 0, pt.trimOutSec ?? null);
-    }
-    const bufferRevision = hasAudio ? 1 : 0;
-    let pads: SamplerPadState[] = [];
-    if (kind === "sampler") {
-      const persistedPads = pt.pads ?? [];
-      pads = emptyPads();
-      for (let i = 0; i < pads.length; i++) {
-        const pp = persistedPads[i];
-        if (!pp?.audioKey) continue;
-        const blob = await loadAudio(pp.audioKey);
-        if (!blob) continue;
-        try {
-          const arr = await blob.arrayBuffer();
-          const buf = await engine.context().decodeAudioData(arr.slice(0));
-          engine.setPadBuffer(pt.id, i, buf);
-          pads[i] = {
-            hasAudio: true,
-            fileName: pp.fileName,
-            durationSec: pp.durationSec,
-            audioKey: pp.audioKey,
-            bufferRevision: 1,
-          };
-        } catch {
-          // Leave as empty; user can reload the sample.
-        }
-      }
-    }
-    restored.push({
-      id: pt.id,
-      name: pt.name,
-      kind,
-      hasAudio,
-      fileName: pt.fileName,
-      durationSec: pt.durationSec,
-      volume: pt.volume,
-      pan: pt.pan,
-      muted: pt.muted,
-      soloed: pt.soloed,
-      bufferRevision,
-      audioKey: pt.audioKey,
-      trimInSec: pt.trimInSec ?? 0,
-      trimOutSec: pt.trimOutSec ?? null,
-      inputDeviceId: pt.inputDeviceId ?? "default",
-      inputGain: pt.inputGain ?? DEFAULT_INPUT_GAIN,
-      armed: pt.armed ?? false,
-      normalized: pt.normalized ?? false,
-      normalizationGain: pt.normalizationGain ?? 1,
-      pads,
-      samplerRecArmed: false,
-      samplerPattern: [],
-    });
-    if (hasAudio && pt.normalized && pt.normalizationGain && pt.normalizationGain !== 1) {
-      engine.setNormalizationGain(pt.id, pt.normalizationGain);
-    }
-  }
-  await setCurrentProjectId(id);
-  set({
-    tracks: restored,
-    bpm: persisted.bpm,
-    currentProjectId: id,
-    currentProjectName: persisted.name,
-    latencyOffsetMs: persisted.latencyOffsetMs ?? 0,
-    countInBeats: persisted.countInBeats ?? 0,
-    isPlaying: false,
-    isMultiRecording: false,
-    recordingTrackId: null,
-    isLoaded: true,
-    undoStack: [],
-    redoStack: [],
-  });
-  resetHistoryCoalesce();
-  applyMixState(restored);
-  void gcOrphanedAudio();
+function projectLoadError(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  return detail
+    ? `Couldn't restore this project. ${detail}`
+    : "Couldn't restore this project.";
 }
 
-async function switchToProject(
+async function loadProjectIntoEngine(
+  id: string,
+  set: Setter,
+  createIfMissing = false,
+) {
+  await holdProjectSessionLease(id);
+  try {
+    await withProjectOperation(() =>
+      loadProjectIntoEngineUnlocked(id, set, createIfMissing),
+    );
+  } catch (error) {
+    if (useCypher.getState().currentProjectId !== id) {
+      await releaseProjectSessionLease(id);
+    }
+    throw error;
+  }
+}
+
+async function loadProjectIntoEngineUnlocked(
+  id: string,
+  set: Setter,
+  createIfMissing = false,
+) {
+  const engine = getEngine();
+  set({ isLoaded: false, loadError: null });
+  let transition: number | null = null;
+  try {
+    await flushPersist();
+    transition = beginProjectTransition();
+    await holdProjectSessionLease(id);
+    engine.clearAllTracks();
+    trackCounter = 0;
+
+    const persisted = await loadProject(id);
+    if (!persisted) {
+      if (createIfMissing) {
+        // First launch: create the default project with no surprise tracks.
+        await switchToProjectUnlocked(id, "Untitled", false, set);
+        return;
+      }
+      throw new Error(
+        "This project was deleted in another tab. Return to the library and choose another project.",
+      );
+    }
+    persistedProjectRevisions.set(id, persisted.updatedAt ?? null);
+    lastDirtyAt = Math.max(lastDirtyAt, persisted.updatedAt ?? 0);
+
+    await engine.start();
+    engine.setBpm(persisted.bpm);
+    const timeSignature = sanitizeTimeSignature(persisted.timeSignature);
+    engine.setTimeSignature(timeSignature);
+    const restored: TrackState[] = [];
+    for (const pt of persisted.tracks) {
+      const numericId = Number(pt.id.replace(/^t/, "")) || 0;
+      if (numericId > trackCounter) trackCounter = numericId;
+      const kind: TrackKind = pt.kind === "sampler" ? "sampler" : "audio";
+      await engine.addTrack(pt.id, pt.name, kind);
+      engine.setVolume(pt.id, pt.volume);
+      engine.setPan(pt.id, pt.pan);
+      const hasAudio = pt.audioKey
+        ? await restoreTrackAudio(pt.id, pt.audioKey, pt.fileName)
+        : false;
+      if (hasAudio) {
+        engine.setTrim(pt.id, pt.trimInSec ?? 0, pt.trimOutSec ?? null);
+      }
+      const bufferRevision = hasAudio ? 1 : 0;
+      let pads: SamplerPadState[] = [];
+      if (kind === "sampler") {
+        const persistedPads = pt.pads ?? [];
+        pads = emptyPads();
+        for (let i = 0; i < pads.length; i++) {
+          const pp = persistedPads[i];
+          if (!pp?.audioKey) continue;
+          const blob = await loadAudio(pp.audioKey);
+          if (!blob) continue;
+          try {
+            const arr = await blob.arrayBuffer();
+            const buf = await engine.context().decodeAudioData(arr.slice(0));
+            engine.setPadBuffer(pt.id, i, buf);
+            pads[i] = {
+              hasAudio: true,
+              fileName: pp.fileName,
+              durationSec: pp.durationSec,
+              audioKey: pp.audioKey,
+              bufferRevision: 1,
+            };
+          } catch {
+            // Leave as empty; user can reload the sample.
+          }
+        }
+      }
+      const samplerPattern =
+        kind === "sampler"
+          ? (pt.samplerPattern ?? []).flatMap((event) => {
+              const safeEvent = sanitizeSamplerEvent(
+                event,
+                SAMPLER_PAD_COUNT,
+              );
+              return safeEvent ? [safeEvent] : [];
+            })
+          : [];
+      restored.push({
+        id: pt.id,
+        name: pt.name,
+        kind,
+        hasAudio,
+        fileName: pt.fileName,
+        durationSec: pt.durationSec,
+        volume: pt.volume,
+        pan: pt.pan,
+        muted: pt.muted,
+        soloed: pt.soloed,
+        bufferRevision,
+        audioKey: pt.audioKey,
+        trimInSec: pt.trimInSec ?? 0,
+        trimOutSec: pt.trimOutSec ?? null,
+        inputDeviceId: pt.inputDeviceId ?? "default",
+        inputGain: pt.inputGain ?? DEFAULT_INPUT_GAIN,
+        armed: pt.armed ?? false,
+        normalized: pt.normalized ?? false,
+        normalizationGain: pt.normalizationGain ?? 1,
+        pads,
+        samplerRecArmed: false,
+        samplerPattern,
+      });
+      if (
+        hasAudio &&
+        pt.normalized &&
+        pt.normalizationGain &&
+        pt.normalizationGain !== 1
+      ) {
+        engine.setNormalizationGain(pt.id, pt.normalizationGain);
+      }
+    }
+    await setCurrentProjectId(id);
+    if (transition !== projectEpoch) return;
+    await holdProjectSessionLease(id);
+    await releaseOtherProjectSessionLeases(id);
+    set({
+      tracks: restored,
+      bpm: persisted.bpm,
+      timeSignature,
+      currentProjectId: id,
+      currentProjectName: persisted.name,
+      latencyOffsetMs: persisted.latencyOffsetMs ?? 0,
+      countInBeats: persisted.countInBeats ?? 0,
+      positionSec: 0,
+      countdownActive: false,
+      countdownBeat: 0,
+      isCalibrating: false,
+      exportProgress: null,
+      isPlaying: false,
+      isMultiRecording: false,
+      recordingTrackId: null,
+      lastSavedAt: persisted.updatedAt ?? null,
+      isLoaded: true,
+      loadError: null,
+      undoStack: [],
+      redoStack: [],
+    });
+    completeProjectTransition(transition);
+    resetHistoryCoalesce();
+    applyMixState(restored);
+    void gcOrphanedAudio();
+  } catch (error) {
+    if (transition === null || transition === projectEpoch) {
+      set({ isLoaded: false, loadError: projectLoadError(error) });
+    }
+    throw error;
+  } finally {
+    if (transition !== null) completeProjectTransition(transition);
+  }
+}
+
+async function switchToProjectUnlocked(
   id: string,
   name: string,
   withInitialTracks: boolean,
   set: Setter,
 ) {
   const engine = getEngine();
-  await flushPersist();
-  engine.clearAllTracks();
-  trackCounter = 0;
-  await engine.start();
-  engine.setBpm(120);
+  set({ isLoaded: false, loadError: null });
+  let transition: number | null = null;
+  try {
+    await flushPersist();
+    transition = beginProjectTransition();
+    await holdProjectSessionLease(id);
+    engine.clearAllTracks();
+    trackCounter = 0;
+    await engine.start();
+    engine.setBpm(120);
+    engine.setTimeSignature(DEFAULT_TIME_SIGNATURE);
 
-  const tracks: TrackState[] = [];
-  if (withInitialTracks) {
-    const a = nextId();
-    const b = nextId();
-    await engine.addTrack(a, "Track 1");
-    await engine.addTrack(b, "Track 2");
-    tracks.push(emptyTrack(a, "Track 1"), emptyTrack(b, "Track 2"));
+    const tracks: TrackState[] = [];
+    if (withInitialTracks) {
+      const a = nextId();
+      const b = nextId();
+      await engine.addTrack(a, "Track 1");
+      await engine.addTrack(b, "Track 2");
+      tracks.push(emptyTrack(a, "Track 1"), emptyTrack(b, "Track 2"));
+    }
+    const initialProject = buildPersisted({
+      currentProjectId: id,
+      currentProjectName: name,
+      tracks,
+      bpm: 120,
+      timeSignature: { ...DEFAULT_TIME_SIGNATURE },
+      latencyOffsetMs: 0,
+      countInBeats: 0,
+    });
+    const createdProject = await createProjectAndSetCurrent(initialProject);
+    if (transition !== projectEpoch) return;
+    await releaseOtherProjectSessionLeases(id);
+    persistedProjectRevisions.set(id, createdProject.updatedAt);
+    lastDirtyAt = Math.max(lastDirtyAt, createdProject.updatedAt);
+    set({
+      tracks,
+      bpm: 120,
+      timeSignature: { ...DEFAULT_TIME_SIGNATURE },
+      currentProjectId: id,
+      currentProjectName: name,
+      latencyOffsetMs: 0,
+      countInBeats: 0,
+      positionSec: 0,
+      countdownActive: false,
+      countdownBeat: 0,
+      isCalibrating: false,
+      exportProgress: null,
+      isPlaying: false,
+      isMultiRecording: false,
+      recordingTrackId: null,
+      lastSavedAt: createdProject.updatedAt,
+      isLoaded: true,
+      loadError: null,
+      undoStack: [],
+      redoStack: [],
+    });
+    completeProjectTransition(transition);
+    resetHistoryCoalesce();
+  } catch (error) {
+    if (transition === null || transition === projectEpoch) {
+      set({ isLoaded: false, loadError: projectLoadError(error) });
+    }
+    throw error;
+  } finally {
+    if (transition !== null) completeProjectTransition(transition);
   }
-  await setCurrentProjectId(id);
-  set({
-    tracks,
-    bpm: 120,
-    currentProjectId: id,
-    currentProjectName: name,
-    isPlaying: false,
-    isMultiRecording: false,
-    recordingTrackId: null,
-    isLoaded: true,
-    undoStack: [],
-    redoStack: [],
-  });
-  resetHistoryCoalesce();
-  schedulePersist({
-    currentProjectId: id,
-    currentProjectName: name,
-    tracks,
-    bpm: 120,
-    latencyOffsetMs: 0,
-    countInBeats: 0,
-  });
-  await flushPersist();
 }
 
 /**
@@ -1633,14 +4886,11 @@ async function measureLatency(deviceId: string): Promise<number | null> {
       // ignore
     }
   }
-  const sampleRate = ctx.sampleRate;
   const beatMs = 500;
   const beats = 4;
   const totalSec = (beats * beatMs) / 1000 + 0.5;
-  const totalSamples = Math.ceil(totalSec * sampleRate);
 
   let stream: MediaStream | null = null;
-  let recorderSamples: Float32Array;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -1666,9 +4916,11 @@ async function measureLatency(deviceId: string): Promise<number | null> {
       osc.start(at);
       osc.stop(at + 0.05);
     }
-    recorderSamples = await captureViaMediaRecorder(stream, totalSec);
+    const recording = await captureViaMediaRecorder(stream, totalSec, ctx);
+    const recorderSamples = recording.samples;
+    const recordingSampleRate = recording.sampleRate;
     // Detect click peaks in recorded audio.
-    const sampleClickWindow = Math.floor(0.06 * sampleRate);
+    const sampleClickWindow = Math.floor(0.06 * recordingSampleRate);
     const peaks: number[] = [];
     let i = 0;
     const threshold = 0.1;
@@ -1680,7 +4932,7 @@ async function measureLatency(deviceId: string): Promise<number | null> {
         let bestVal = v;
         const windowEnd = Math.min(
           recorderSamples.length,
-          i + Math.floor(0.02 * sampleRate),
+          i + Math.floor(0.02 * recordingSampleRate),
         );
         for (let j = i + 1; j < windowEnd; j++) {
           if (Math.abs(recorderSamples[j]) > bestVal) {
@@ -1688,19 +4940,21 @@ async function measureLatency(deviceId: string): Promise<number | null> {
             bestIdx = j;
           }
         }
-        peaks.push(bestIdx / sampleRate);
+        peaks.push(bestIdx / recordingSampleRate);
         i = bestIdx + sampleClickWindow;
       } else {
         i++;
       }
     }
     if (peaks.length < 2) return null;
-    // Average the per-click delay (peak time minus click schedule time relative
-    // to when recording started — we assume recorder started ~0 s into the buffer).
+    // Average each acoustic peak against the click's actual position relative
+    // to MediaRecorder start. The clicks are intentionally scheduled 200 ms in
+    // the future; treating the first click as t=0 biases every result by that
+    // full lead-in.
     let totalDelayMs = 0;
     let count = 0;
     for (let i = 0; i < Math.min(peaks.length, clickTimes.length); i++) {
-      const expected = clickTimes[i] - startAt; // 0, 0.5, 1.0, ...
+      const expected = clickTimes[i] - recording.startedAt;
       const observed = peaks[i];
       const delayMs = (observed - expected) * 1000;
       if (delayMs > 0 && delayMs < 600) {
@@ -1726,56 +4980,111 @@ async function measureLatency(deviceId: string): Promise<number | null> {
 async function captureViaMediaRecorder(
   stream: MediaStream,
   durationSec: number,
-): Promise<Float32Array> {
+  clock: AudioContext,
+): Promise<{ samples: Float32Array; sampleRate: number; startedAt: number }> {
   const types = [
     "audio/webm;codecs=opus",
     "audio/webm",
     "audio/mp4",
     "audio/aac",
   ];
-  const mime =
-    types.find((t) => MediaRecorder.isTypeSupported(t)) ?? "audio/webm";
-  const rec = new MediaRecorder(stream, { mimeType: mime });
+  const mime = types.find((t) => MediaRecorder.isTypeSupported(t)) ?? "";
+  const rec = new MediaRecorder(
+    stream,
+    mime ? { mimeType: mime } : undefined,
+  );
   const chunks: Blob[] = [];
   rec.ondataavailable = (e) => {
     if (e.data?.size > 0) chunks.push(e.data);
   };
-  rec.start(50);
+  const startedAt = clock.currentTime;
+  // As in the main recording path, avoid timeslices: concatenated MP4
+  // fragments are not reliably decodable on Safari.
+  rec.start();
   await new Promise((r) => setTimeout(r, durationSec * 1000));
   await new Promise<void>((resolve) => {
     rec.onstop = () => resolve();
     rec.stop();
   });
-  const blob = new Blob(chunks, { type: mime });
+  const blob = new Blob(chunks, { type: rec.mimeType || mime });
   const ctx = new AudioContext();
-  const arr = await blob.arrayBuffer();
-  const buf = await ctx.decodeAudioData(arr);
-  await ctx.close();
-  return buf.getChannelData(0);
+  try {
+    const arr = await blob.arrayBuffer();
+    const buf = await ctx.decodeAudioData(arr);
+    return {
+      samples: new Float32Array(buf.getChannelData(0)),
+      sampleRate: buf.sampleRate,
+      startedAt,
+    };
+  } finally {
+    await ctx.close().catch(() => {});
+  }
 }
-
-let countInCancelled = false;
 
 async function runCountIn(
   beats: number,
   bpm: number,
+  timeSignature: TimeSignature,
+  finalStartOffsetSec: number,
+  project: ProjectIdentity,
   set: Setter,
+  signal: AbortSignal,
 ): Promise<boolean> {
   const engine = getEngine();
   await engine.start();
-  countInCancelled = false;
-  const beatMs = 60_000 / bpm;
+  if (
+    signal.aborted ||
+    countInCancelled ||
+    !isProjectIdentityCurrent(project)
+  ) {
+    return false;
+  }
+  const beatMs = signaturePulseMs(bpm, timeSignature);
   for (let i = 0; i < beats; i++) {
-    if (countInCancelled) {
+    if (
+      signal.aborted ||
+      countInCancelled ||
+      !isProjectIdentityCurrent(project)
+    ) {
+      if (!isProjectIdentityCurrent(project)) return false;
       set({ countdownActive: false, countdownBeat: 0 });
       return false;
     }
     set({ countdownActive: true, countdownBeat: i + 1 });
-    engine.tickClick(i % 4 === 0);
-    await new Promise((r) => setTimeout(r, beatMs));
+    engine.tickClick(isSignatureAccent(i, timeSignature));
+    const finalLeadMs = finalStartOffsetSec * 1000;
+    const waitMs = i === beats - 1 ? Math.max(0, beatMs - finalLeadMs) : beatMs;
+    if (!(await abortableDelay(waitMs, signal))) {
+      set({ countdownActive: false, countdownBeat: 0 });
+      return false;
+    }
+  }
+  if (
+    signal.aborted ||
+    countInCancelled ||
+    !isProjectIdentityCurrent(project)
+  ) {
+    if (!isProjectIdentityCurrent(project)) return false;
+    set({ countdownActive: false, countdownBeat: 0 });
+    return false;
   }
   set({ countdownActive: false, countdownBeat: 0 });
   return true;
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 let lowRateWarnShown = false;
@@ -1901,7 +5210,10 @@ function applyMixState(tracks: TrackState[]) {
   const anySoloed = tracks.some((t) => t.soloed);
   const engine = getEngine();
   for (const t of tracks) {
-    const audible = anySoloed ? t.soloed && !t.muted : !t.muted;
-    engine.setMute(t.id, !audible);
+    engine.setMute(t.id, !isTrackAudible(t, anySoloed));
   }
+}
+
+function isTrackAudible(track: TrackState, anySoloed: boolean) {
+  return !track.muted && (!anySoloed || track.soloed);
 }
