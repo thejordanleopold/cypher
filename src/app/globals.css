@@ -157,6 +157,11 @@ input[type="number"] {
   -moz-appearance: textfield;
 }
 
+.mixer-channel-strip,
+.mixer-add-strip {
+  block-size: 360px;
+}
+
 /* Keep the dense desktop mixer compact while giving coarse-pointer devices
    genuinely finger-sized controls. The sampler's smallest grids need a
    touch-specific layout change so enlarged targets never overlap. */
@@ -213,6 +218,24 @@ input[type="number"] {
 
   .sampler-pad-actions > button {
     grid-column: 1 / -1;
+  }
+}
+
+@media (min-width: 1024px) {
+  .desktop-workspace-scroll {
+    scrollbar-gutter: stable both-edges;
+  }
+
+  .mixer-channel-strip,
+  .mixer-add-strip {
+    block-size: min(520px, calc(100dvh - 17rem));
+    min-block-size: 420px;
+  }
+}
+
+@media (min-width: 1024px) and (pointer: fine) {
+  .mixer-channel-strip {
+    inline-size: 112px;
   }
 }
 

@@ -8,7 +8,6 @@ type Variant = "wide" | "strip";
 
 interface Props {
   variant: Variant;
-  stripHeight?: number;
 }
 
 interface PopoverPos {
@@ -24,7 +23,7 @@ const POPOVER_MIN_HEIGHT = 112;
 const VIEWPORT_PADDING = 12;
 const POPOVER_GAP = 8;
 
-export function AddTrackButton({ variant, stripHeight }: Props) {
+export function AddTrackButton({ variant }: Props) {
   const addTrack = useCypher((s) => s.addTrack);
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<PopoverPos | null>(null);
@@ -217,8 +216,7 @@ export function AddTrackButton({ variant, stripHeight }: Props) {
         aria-label="Add new track"
         aria-haspopup="menu"
         aria-expanded={open}
-        style={stripHeight ? { height: stripHeight } : undefined}
-        className="glass shrink-0 w-12 rounded-xl text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] flex items-center justify-center transition-colors"
+        className="mixer-add-strip glass shrink-0 w-12 lg:w-14 rounded-xl lg:rounded-2xl text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] flex items-center justify-center transition-colors"
       >
         <PlusIcon size={16} />
       </button>

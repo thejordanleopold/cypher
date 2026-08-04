@@ -108,16 +108,27 @@ test("mobile PWA shell records and persists native-rate audio", async ({
   await expect(page.getByRole("button", { name: "Start Demo" })).toBeVisible({
     timeout: 15_000,
   });
+  await expect(
+    page.getByRole("group", { name: "Workspace view" }),
+  ).toBeHidden();
+  await expect(
+    page.getByRole("heading", { name: "Arrangement" }),
+  ).toBeHidden();
+  await expect(
+    page.getByRole("button", { name: "Switch to mixer view" }),
+  ).toBeVisible();
 
   const platform = await page.evaluate(async () => {
     const manifest = await fetch("./manifest.webmanifest");
     const worklet = await fetch("./worklets/pcm-recorder.js");
     const worker = await fetch("./workers/pcm-spooler.js");
-    const smallestButton = Math.min(
-      ...Array.from(document.querySelectorAll("button"), (button) =>
-        button.getBoundingClientRect().width,
-      ),
-    );
+    const visibleButtonWidths = Array.from(
+      document.querySelectorAll("button"),
+      (button) => button.getBoundingClientRect(),
+    )
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .map((rect) => rect.width);
+    const smallestButton = Math.min(...visibleButtonWidths);
     return {
       bodyOverflow: document.body.scrollWidth - window.innerWidth,
       manifest: manifest.ok,

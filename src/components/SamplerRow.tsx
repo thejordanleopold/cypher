@@ -43,10 +43,10 @@ export const SamplerRow = memo(function SamplerRow({
   return (
     <article
       data-track-id={track.id}
-      className="glass rounded-xl touch-pan-y"
+      className="glass rounded-xl lg:rounded-2xl touch-pan-y"
       aria-label={track.name}
     >
-      <header className="flex flex-wrap items-center gap-1 px-2.5 pt-1.5 pb-1">
+      <header className="flex flex-wrap items-center gap-1 px-2.5 lg:px-4 pt-1.5 lg:pt-2.5 pb-1 lg:pb-2">
         <button
           type="button"
           aria-label={`${collapsed ? "Expand" : "Collapse"} ${track.name}`}
@@ -178,8 +178,8 @@ export const SamplerRow = memo(function SamplerRow({
         }`}
       >
         <div className="overflow-hidden">
-          <div className="px-2.5 pb-2 space-y-2">
-            <div className="grid grid-cols-2 gap-2">
+          <div className="px-2.5 lg:px-4 pb-2 lg:pb-4 space-y-2 lg:space-y-3">
+            <div className="grid grid-cols-2 gap-2 lg:grid-cols-[minmax(0,15rem)_minmax(0,15rem)] lg:justify-end lg:gap-4">
               <SliderRow
                 label="Volume"
                 short="V"
@@ -293,7 +293,7 @@ function PadGrid({
   bankOffset: number;
 }) {
   return (
-    <div className="flex-1 grid grid-cols-4 gap-1.5">
+    <div className="flex-1 grid grid-cols-4 lg:grid-cols-8 gap-1.5 lg:gap-2">
       {pads.map((pad, i) => (
         <Pad key={bankOffset + i} trackId={trackId} padIdx={bankOffset + i} pad={pad} />
       ))}

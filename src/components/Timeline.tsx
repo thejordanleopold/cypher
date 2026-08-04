@@ -118,7 +118,7 @@ export function Timeline({ onOpenSongEditor }: { onOpenSongEditor?: () => void }
   const playPercent = hasAudio ? (position / duration) * 100 : 0;
 
   return (
-    <div className="px-3 sm:px-4 py-1.5">
+    <div className="px-3 sm:px-4 lg:px-5 py-1.5 lg:pb-3">
       <div className="flex items-center gap-2">
         <span className="text-[11px] tabular-nums text-[var(--accent)] w-10 text-right">
           {formatTime(position)}

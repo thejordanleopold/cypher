@@ -231,12 +231,15 @@ export default function Home() {
           }}
         />
       )}
-      <div className="sticky top-0 z-20 px-2 sm:px-3 pt-[max(env(safe-area-inset-top),0.5rem)] pb-2 bg-gradient-to-b from-[var(--bg-base)] via-[var(--bg-base)]/85 to-transparent">
-        <div className="flex items-center justify-between px-1 pt-3 pb-2">
-          <h1 className="font-[family-name:var(--font-bebas)] text-[2.25rem] sm:text-[2.4rem] tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
+      <div className="sticky top-0 z-20 px-2 sm:px-3 lg:px-6 pt-[max(env(safe-area-inset-top),0.5rem)] lg:pt-4 pb-2 lg:pb-3 bg-gradient-to-b from-[var(--bg-base)] via-[var(--bg-base)]/85 to-transparent">
+        <div className="w-full max-w-[1280px] mx-auto flex items-center justify-between px-1 lg:px-2 pt-3 lg:pt-1 pb-2 lg:pb-3">
+          <h1 className="font-[family-name:var(--font-bebas)] text-[2.25rem] sm:text-[2.4rem] lg:text-[2.7rem] tracking-[0.18em] leading-none bg-gradient-to-b from-white to-[#9bb6e6] bg-clip-text text-transparent">
             CYPHER
           </h1>
           <div className="flex items-center gap-2">
+            <div className="hidden lg:block">
+              <DesktopViewToggle mode={viewMode} onChange={setViewMode} />
+            </div>
             <button
               type="button"
               disabled={demoLoading}
@@ -248,22 +251,27 @@ export default function Home() {
                   try { await startDemo(); } finally { setDemoLoading(false); }
                 }
               }}
-              className="h-9 px-3 rounded-md glass border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[10px] uppercase tracking-[0.16em] font-semibold active:scale-95 transition-colors disabled:opacity-50 disabled:pointer-events-none"
+              className="h-9 lg:h-10 px-3 lg:px-4 rounded-md glass border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[10px] uppercase tracking-[0.16em] font-semibold active:scale-95 transition-colors disabled:opacity-50 disabled:pointer-events-none"
             >
               {demoLoading ? "Loading…" : isDemoMode ? "Exit Demo" : "Start Demo"}
             </button>
             <MainMenu />
           </div>
         </div>
-        <div className="glass-raised rounded-2xl overflow-hidden">
-          <header className="px-3 sm:px-4 pt-2 pb-2 flex items-center gap-2">
+        <div className="w-full max-w-[1280px] mx-auto glass-raised rounded-2xl lg:rounded-[1.25rem] overflow-hidden">
+          <header className="px-3 sm:px-4 lg:px-5 pt-2 lg:pt-3 pb-2 flex items-center gap-2">
             <div className="flex items-baseline gap-1.5 min-w-0 flex-1">
               <span aria-hidden="true" className="text-[var(--text-faint)] text-[13px] leading-none">/</span>
               <p className="text-[13px] text-[var(--text-muted)] truncate min-w-0 leading-none">
                 {projectName}
               </p>
+              <span className="hidden lg:inline text-[10px] uppercase tracking-[0.16em] text-[var(--text-faint)] leading-none">
+                {tracks.length} {tracks.length === 1 ? "track" : "tracks"}
+              </span>
             </div>
-            <ViewToggle mode={viewMode} onChange={setViewMode} />
+            <div className="lg:hidden">
+              <ViewToggle mode={viewMode} onChange={setViewMode} />
+            </div>
           </header>
           <Transport />
           <Timeline onOpenSongEditor={() => setShowSongEditor(true)} />
@@ -272,14 +280,27 @@ export default function Home() {
       {viewMode === "track" ? (
         <div
           ref={containerRef}
-          className="flex-1 overflow-y-auto px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] flex flex-col gap-1.5"
+          className="desktop-workspace-scroll flex-1 overflow-y-auto px-3 lg:px-6 pt-2 lg:pt-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] lg:pb-6 flex flex-col items-center gap-1.5 lg:gap-2.5"
         >
+          <div className="hidden lg:flex w-full max-w-[1280px] items-center justify-between px-1 pb-1">
+            <div>
+              <h2 className="font-[family-name:var(--font-bebas)] text-lg tracking-[0.14em] text-[var(--text-primary)] leading-none">
+                Arrangement
+              </h2>
+              <p className="mt-1 text-[11px] text-[var(--text-faint)]">
+                Record, layer, and shape your session
+              </p>
+            </div>
+            <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-faint)]">
+              {tracks.length} {tracks.length === 1 ? "channel" : "channels"}
+            </span>
+          </div>
           {tracks.map((t, i) => (
             <Fragment key={t.id}>
               {/* Insertion indicator — always rendered when dragging, fades in/out */}
               {draggingId && (
                 <div
-                  className={`h-0.5 rounded-full mx-2 shrink-0 transition-[opacity,transform,background-color] duration-150 ${
+                  className={`w-full max-w-[1280px] h-0.5 rounded-full mx-2 shrink-0 transition-[opacity,transform,background-color] duration-150 ${
                     insertBefore === i
                       ? "bg-[var(--accent)] opacity-100 scale-x-100"
                       : "opacity-0 scale-x-75"
@@ -287,7 +308,7 @@ export default function Home() {
                 />
               )}
               <div
-                className={`shrink-0 transition-opacity duration-150 ${
+                className={`w-full max-w-[1280px] shrink-0 transition-opacity duration-150 ${
                   draggingId === t.id ? "opacity-0 pointer-events-none" : ""
                 }`}
               >
@@ -309,14 +330,16 @@ export default function Home() {
           ))}
           {draggingId && (
             <div
-              className={`h-0.5 rounded-full mx-2 shrink-0 transition-[opacity,transform,background-color] duration-150 ${
+              className={`w-full max-w-[1280px] h-0.5 rounded-full mx-2 shrink-0 transition-[opacity,transform,background-color] duration-150 ${
                 insertBefore === tracks.length
                   ? "bg-[var(--accent)] opacity-100 scale-x-100"
                   : "opacity-0 scale-x-75"
               }`}
             />
           )}
-          <AddTrackButton variant="wide" />
+          <div className="w-full max-w-[1280px]">
+            <AddTrackButton variant="wide" />
+          </div>
         </div>
       ) : (
         <MixerView />
@@ -606,5 +629,41 @@ function ViewToggle({
         {mode === "track" ? "Mixer" : "Tracks"}
       </span>
     </button>
+  );
+}
+
+function DesktopViewToggle({
+  mode,
+  onChange,
+}: {
+  mode: ViewMode;
+  onChange: (mode: ViewMode) => void;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="Workspace view"
+      className="glass flex items-center gap-1 rounded-lg p-1"
+    >
+      {(["track", "mixer"] as const).map((option) => {
+        const active = mode === option;
+        const label = option === "track" ? "Tracks" : "Mixer";
+        return (
+          <button
+            key={option}
+            type="button"
+            onClick={() => onChange(option)}
+            aria-pressed={active}
+            className={`h-8 min-w-20 rounded-md px-3 text-[10px] font-semibold uppercase tracking-[0.16em] transition-[background-color,color,box-shadow] active:scale-[0.98] ${
+              active
+                ? "bg-[var(--accent)] text-[#031024] shadow-[0_4px_14px_-6px_rgba(96,165,250,0.8)]"
+                : "text-[var(--text-muted)] hover:bg-white/[0.07] hover:text-[var(--text-primary)]"
+            }`}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
   );
 }

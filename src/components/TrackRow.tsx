@@ -44,7 +44,7 @@ export const TrackRow = memo(function TrackRow({
   return (
     <article
       data-track-id={track.id}
-      className={`glass rounded-xl touch-pan-y transition-colors ${
+      className={`glass rounded-xl lg:rounded-2xl touch-pan-y transition-colors ${
         isRecordingNow
           ? "!border-red-500/60 ring-1 ring-red-500/40"
           : track.armed
@@ -53,7 +53,7 @@ export const TrackRow = memo(function TrackRow({
       }`}
       aria-label={track.name}
     >
-      <header className="flex flex-wrap items-center gap-1 px-2.5 pt-1.5 pb-1">
+      <header className="flex flex-wrap items-center gap-1 px-2.5 lg:px-4 pt-1.5 lg:pt-2.5 pb-1 lg:pb-2">
         <button
           type="button"
           aria-label={`${collapsed ? "Expand" : "Collapse"} ${track.name}`}
@@ -156,7 +156,7 @@ export const TrackRow = memo(function TrackRow({
         }`}
       >
         <div className="overflow-hidden">
-          <div className="px-2.5 pb-1.5 space-y-1">
+          <div className="px-2.5 lg:px-4 pb-1.5 lg:pb-2.5 space-y-1 lg:space-y-0 lg:grid lg:grid-cols-[minmax(20rem,0.85fr)_minmax(0,1.5fr)] lg:items-center lg:gap-5">
             <div className="flex gap-1">
               <div className="flex-1 min-w-0">
                 <InputPicker
@@ -228,7 +228,7 @@ export const TrackRow = memo(function TrackRow({
       </div>
 
       {/* Waveform — always visible so collapsed cards still tell you what's there */}
-      <div className="px-2.5 pb-2">
+      <div className="px-2.5 lg:px-4 pb-2 lg:pb-3">
         {isRecordingNow ? (
           <LiveWaveform trackId={track.id} />
         ) : (

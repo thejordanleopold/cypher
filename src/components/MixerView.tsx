@@ -7,18 +7,16 @@ import { AddTrackButton } from "@/components/AddTrackButton";
 
 const VOL_MIN = 0;
 const VOL_MAX = 1.5;
-const STRIP_HEIGHT = 360; // px — caps mixer strip card height
-
 export function MixerView() {
   const tracks = useCypher((s) => s.tracks);
 
   return (
-    <div className="flex-1 min-h-0 overflow-auto overscroll-contain">
-      <div className="flex items-start justify-end gap-1.5 px-3 pt-2 pb-[max(env(safe-area-inset-bottom),0.75rem)] min-w-min">
+    <div className="desktop-workspace-scroll flex-1 min-h-0 overflow-auto overscroll-contain">
+      <div className="flex items-start justify-start gap-1.5 lg:gap-2.5 px-3 lg:px-6 pt-2 lg:pt-4 pb-[max(env(safe-area-inset-bottom),0.75rem)] lg:pb-6 min-w-min lg:w-full lg:max-w-[1280px] lg:mx-auto">
         {tracks.map((t) => (
           <ChannelStrip key={t.id} track={t} />
         ))}
-        <AddTrackButton variant="strip" stripHeight={STRIP_HEIGHT} />
+        <AddTrackButton variant="strip" />
       </div>
     </div>
   );
@@ -40,8 +38,7 @@ function ChannelStrip({ track }: { track: TrackState }) {
 
   return (
     <div
-      style={{ height: STRIP_HEIGHT }}
-      className={`mixer-channel-strip glass shrink-0 w-[92px] rounded-xl flex flex-col gap-1.5 px-2 pt-2 pb-2.5 transition-colors ${
+      className={`mixer-channel-strip glass shrink-0 w-[92px] rounded-xl lg:rounded-2xl flex flex-col gap-1.5 px-2 lg:px-2.5 pt-2 lg:pt-3 pb-2.5 lg:pb-3 transition-colors ${
         isRecordingNow
           ? "!border-red-500/60 ring-1 ring-red-500/40"
           : track.armed

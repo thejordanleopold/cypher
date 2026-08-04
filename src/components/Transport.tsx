@@ -54,7 +54,7 @@ export function Transport() {
 
   return (
     <div>
-      <div className="flex flex-wrap items-center justify-center gap-2 px-2 py-2 sm:flex-nowrap sm:px-4">
+      <div className="flex flex-wrap items-center justify-center gap-2 px-2 py-2 sm:flex-nowrap sm:px-4 lg:px-5 lg:py-3">
         <div className="flex items-center gap-1 sm:gap-2">
         <button
           disabled={playDisabled}
@@ -246,7 +246,7 @@ function TempoInput({
           setDraft(String(bpm));
         }
       }}
-      className="w-11 sm:w-12 h-7 sm:h-9 bg-white/[0.05] border border-[var(--border-subtle)] rounded-md px-1 text-sm text-[var(--text-primary)] tabular-nums text-center focus:border-[var(--accent)] outline-none transition-colors"
+      className="w-11 sm:w-12 h-7 sm:h-9 bg-white/[0.05] border border-[var(--border-subtle)] rounded-md px-1 text-sm text-[var(--text-primary)] tabular-nums text-center focus:border-[var(--accent)] transition-colors"
       aria-label="Tempo in beats per minute"
     />
   );
