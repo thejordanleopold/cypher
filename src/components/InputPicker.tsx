@@ -242,7 +242,7 @@ export function InputPicker({ trackId, selectedDeviceId, disabled }: Props) {
                   <span className="text-amber-400 text-[11px] mt-px shrink-0">ⓘ</span>
                   <p className="text-[10px] text-amber-300/80 leading-snug">
                     <strong className="text-amber-300 font-semibold">Voice Isolation</strong> may be filtering your mic. To disable it during recording: swipe open iOS <strong className="text-amber-300 font-semibold">Control Center</strong>, tap <strong className="text-amber-300 font-semibold">Mic Mode</strong>, and choose <strong className="text-amber-300 font-semibold">Standard</strong>. iOS remembers this per app.
-                    {"\n\n"}Note: AirPods Bluetooth is hardware-capped at 16 kHz — for higher quality, use a wired or USB mic.
+                    {"\n\n"}Note: Bluetooth headset microphones commonly switch to reduced-bandwidth mono while you monitor audio. For full-bandwidth recording, keep AirPods as the output and select the built-in, wired, or USB mic as the input.
                   </p>
                 </div>
               )}

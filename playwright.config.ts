@@ -10,8 +10,24 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:4173",
     trace: "retain-on-failure",
-    ...devices["Desktop Chrome"],
   },
+  projects: [
+    {
+      name: "desktop-chromium",
+      testIgnore: "**/mobile-audio.spec.ts",
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "android-chromium",
+      testMatch: "**/mobile-audio.spec.ts",
+      use: { ...devices["Pixel 7"] },
+    },
+    {
+      name: "iphone-webkit",
+      testMatch: "**/mobile-audio.spec.ts",
+      use: { ...devices["iPhone 15"] },
+    },
+  ],
   webServer: {
     command: "node scripts/serve-static.mjs out 4173",
     url: "http://127.0.0.1:4173",

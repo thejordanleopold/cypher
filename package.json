@@ -9,6 +9,7 @@
     "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types --test tests/*.test.ts",
+    "test:audio-hardware": "node scripts/test-bluetooth-overdub.mjs",
     "test:e2e": "playwright test",
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm test:e2e"
   },

@@ -94,7 +94,7 @@ The constraint shaping every choice: **low-latency multitrack audio in a mobile 
 ### Audio engine
 - **Web Audio API** — the only viable browser API for sample-accurate scheduling and multi-track mixing.
 - **Tone.js** as a thin convenience layer over Web Audio for transport, scheduling, and the metronome. Avoids reinventing the clock. Drop down to raw `AudioContext` for buffer manipulation and routing.
-- **MediaRecorder API** for the recording path, with Web Audio analyser nodes for metering and decoded `AudioBuffer`s for playback/editing.
+- **AudioWorklet PCM capture** for the primary recording path, with transferable chunks spooled off-thread to temporary OPFS storage and Web Audio analyser nodes for metering. Retain MediaRecorder as a compatibility fallback when the lossless worker path cannot start or Web Audio cannot preserve the input sample rate.
 
 ### Waveform rendering
 - **Custom canvas peak renderer** — immutable `AudioBuffer`s are summarized once into cached min/max bins, so resize and remount work stays bounded even for long recordings.
@@ -141,7 +141,9 @@ The constraint shaping every choice: **low-latency multitrack audio in a mobile 
 │   ├─ Tone.Transport (clock, metronome)                 │
 │   ├─ Per-track GainNode → PannerNode → master bus      │
 │   ├─ Master bus → DynamicsCompressor (limiter) → dest  │
-│   ├─ Recording: getUserMedia → MediaRecorder → Buffer  │
+│   ├─ Recording: getUserMedia → AudioWorklet → Worker   │
+│   │              → OPFS spool → Buffer                 │
+│   │              (MediaRecorder compatibility fallback)│
 │   └─ Export: OfflineAudioContext → WAV/MP3 (Worker)    │
 └────────────────────────────────────────────────────────┘
 ```

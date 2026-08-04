@@ -13,6 +13,12 @@ pnpm dev
 Run the same quality gates as CI with `pnpm verify`; dependency advisories are
 checked separately with `pnpm audit --audit-level low`.
 
+With the dev server running and AirPods connected for both input and output,
+run `pnpm test:audio-hardware`. Chrome plays a six-second synthetic
+instrumental while capturing the selected headset mic with browser DSP off. It
+reports the negotiated device format, clipping, and backing-track correlation,
+then writes the JSON report and captured WAV under `output/playwright/`.
+
 For a static deployment below a URL prefix, build with a normalized path such
 as `NEXT_PUBLIC_BASE_PATH=/cypher pnpm build`. Next.js, public demo samples,
 PWA metadata, and service-worker scope all use that build-time prefix.
@@ -84,4 +90,12 @@ src/
     ...
 ```
 
-Recording is **MediaRecorder**-based: each session captures from a `getUserMedia` stream into an `audio/webm` (Chrome/Firefox) or `audio/mp4` (Safari) blob, decodes via `decodeAudioData` into an `AudioBuffer`, and attaches it to a `Tone.Player`. An `AnalyserNode` runs in parallel for the live waveform.
+Recording uses an **AudioWorklet PCM path** when Web Audio can preserve the
+microphone's sample rate. The worklet transfers raw Float32 chunks to a
+dedicated worker, which spools them to temporary OPFS storage when available
+and streams bounded segments into the final `AudioBuffer`. This avoids a
+perceptual-codec round trip without retaining the whole take on the UI thread.
+The worker uses isolated memory when OPFS is unavailable. MediaRecorder remains
+a compatibility fallback when the worklet/worker cannot start or Web Audio
+would reduce input bandwidth. An `AnalyserNode` runs in parallel for the live
+waveform.

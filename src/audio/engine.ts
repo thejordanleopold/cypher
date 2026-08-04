@@ -4,6 +4,8 @@ import {
   type TimeSignature,
 } from "@/audio/time-signature";
 import { hasUsableRecordingAfterLead } from "@/audio/recording-duration";
+import { PcmSpooler } from "@/audio/pcm-spooler";
+import { getBasePath } from "@/base-path";
 
 export type TrackId = string;
 
@@ -44,6 +46,26 @@ export interface Track {
   activePadSources: Set<AudioBufferSourceNode>;
 }
 
+interface PcmCapture {
+  kind: "pcm";
+  node: AudioWorkletNode;
+  spooler: PcmSpooler;
+  sampleRate: number;
+  stopped: Promise<void>;
+  resolveStopped: () => void;
+}
+
+interface EncodedCapture {
+  kind: "encoded";
+  recorder: MediaRecorder;
+  chunks: Blob[];
+  mimeType: string;
+  stopped: Promise<void>;
+  resolveStopped: () => void;
+}
+
+type RecordingCapture = PcmCapture | EncodedCapture;
+
 interface RecordingSession {
   trackId: TrackId;
   audioSessionToken: symbol;
@@ -52,17 +74,13 @@ interface RecordingSession {
   analyser: AnalyserNode;
   sink: GainNode;
   inputGainValue: number;
-  recorder: MediaRecorder;
-  chunks: Blob[];
-  mimeType: string;
+  capture: RecordingCapture;
   startedAt: number;
   transportStartAt: number | null;
   capturedSampleRate: number;
   routerEl: HTMLAudioElement | null;
   expectedStop: boolean;
   interruptionReported: boolean;
-  stopped: Promise<void>;
-  resolveStopped: () => void;
   cleanupInterruptionListeners: () => void;
 }
 
@@ -76,7 +94,15 @@ const TRANSPORT_SCHEDULE_MARGIN_SEC = 0.01;
 const DECODE_SAMPLE_RATE = 48_000;
 
 function disconnectSessionNodes(session: RecordingSession) {
-  for (const node of [session.analyser, session.sink, session.source]) {
+  const captureNode =
+    session.capture.kind === "pcm" ? session.capture.node : null;
+  for (const node of [
+    captureNode,
+    session.analyser,
+    session.sink,
+    session.source,
+  ]) {
+    if (!node) continue;
     try {
       node.disconnect();
     } catch {
@@ -236,6 +262,12 @@ function needsIosRecordingOutputBridge(): boolean {
 }
 
 function pickRecorderMimeType(): string {
+  if (
+    typeof MediaRecorder === "undefined" ||
+    typeof MediaRecorder.isTypeSupported !== "function"
+  ) {
+    return "";
+  }
   const candidates = [
     "audio/webm;codecs=opus",
     "audio/webm",
@@ -244,8 +276,7 @@ function pickRecorderMimeType(): string {
     "audio/aac",
   ];
   for (const c of candidates) {
-    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(c))
-      return c;
+    if (MediaRecorder.isTypeSupported(c)) return c;
   }
   return "";
 }
@@ -256,6 +287,7 @@ class AudioEngine {
   private tracks = new Map<TrackId, Track>();
   private started = false;
   private nativeCtx: AudioContext | null = null;
+  private pcmWorkletReady: Promise<void> | null = null;
   private recording: RecordingSession | null = null;
   private multiRecording = new Map<TrackId, RecordingSession>();
   // A token exists from the moment a recording session starts opening until
@@ -1035,6 +1067,112 @@ class AudioEngine {
     }
   }
 
+  private async createPcmCapture(
+    source: MediaStreamAudioSourceNode,
+    sink: GainNode,
+    capturedSampleRate: number,
+  ): Promise<PcmCapture | null> {
+    const ctx = this.context();
+    if (
+      typeof AudioWorkletNode === "undefined" ||
+      !ctx.audioWorklet ||
+      ctx.sampleRate + 1 < capturedSampleRate
+    ) {
+      return null;
+    }
+
+    let node: AudioWorkletNode | null = null;
+    let spooler: PcmSpooler | null = null;
+    try {
+      if (!this.pcmWorkletReady) {
+        const moduleUrl = `${getBasePath()}/worklets/pcm-recorder.js`;
+        this.pcmWorkletReady = ctx.audioWorklet.addModule(moduleUrl);
+        void this.pcmWorkletReady.catch(() => {
+          this.pcmWorkletReady = null;
+        });
+      }
+      await this.pcmWorkletReady;
+      spooler = await PcmSpooler.create();
+
+      node = new AudioWorkletNode(ctx, "cypher-pcm-recorder", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      let resolveStopped = () => {};
+      const stopped = new Promise<void>((resolve) => {
+        resolveStopped = resolve;
+      });
+      const capture: PcmCapture = {
+        kind: "pcm",
+        node,
+        spooler,
+        sampleRate: ctx.sampleRate,
+        stopped,
+        resolveStopped,
+      };
+      node.port.onmessage = (
+        event: MessageEvent<
+          | { type: "chunk"; channels: ArrayBuffer[] }
+          | { type: "started" | "stopped" }
+        >,
+      ) => {
+        if (event.data.type === "chunk") {
+          spooler?.push(event.data.channels);
+        } else if (event.data.type === "stopped") {
+          capture.resolveStopped();
+        }
+      };
+      source.connect(node);
+      node.connect(sink);
+      return capture;
+    } catch (error) {
+      console.warn(
+        "Lossless PCM capture unavailable; using encoded fallback",
+        error,
+      );
+      try {
+        if (node) source.disconnect(node);
+        node?.disconnect();
+        node?.port.close();
+        void spooler?.abort();
+      } catch {
+        // Ignore a partially constructed worklet and use the encoded fallback.
+      }
+      return null;
+    }
+  }
+
+  private createEncodedCapture(stream: MediaStream): EncodedCapture {
+    if (typeof MediaRecorder === "undefined") {
+      throw new Error(
+        "This browser supports neither lossless PCM capture nor MediaRecorder",
+      );
+    }
+    const mimeType = pickRecorderMimeType();
+    const options: MediaRecorderOptions = {
+      audioBitsPerSecond: DEFAULT_RECORDER_BITRATE,
+    };
+    if (mimeType) options.mimeType = mimeType;
+    const recorder = new MediaRecorder(stream, options);
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) chunks.push(event.data);
+    };
+    let resolveStopped = () => {};
+    const stopped = new Promise<void>((resolve) => {
+      resolveStopped = resolve;
+    });
+    return {
+      kind: "encoded",
+      recorder,
+      chunks,
+      mimeType: recorder.mimeType || mimeType || "audio/webm",
+      stopped,
+      resolveStopped,
+    };
+  }
+
   private async openRecordingSession(
     trackId: TrackId,
     deviceId?: string,
@@ -1043,9 +1181,6 @@ class AudioEngine {
   ): Promise<RecordingSession> {
     const track = this.tracks.get(trackId);
     if (!track) throw new Error(`No track ${trackId}`);
-    if (typeof MediaRecorder === "undefined") {
-      throw new Error("MediaRecorder is not supported in this browser");
-    }
     const audioSessionToken = this.acquireRecordingAudioSession();
     try {
       await this.start();
@@ -1076,8 +1211,9 @@ class AudioEngine {
     // boolean in `{ exact: false }` so browsers that interpret the bare
     // false as "don't care" still definitively disable the processing.
     // Sample rate and channel count are expressed as `ideal` so devices
-    // that can't hit 48 kHz (Bluetooth HFP mics top out at 16 kHz) still
-    // produce a stream instead of NotReadableError.
+    // that can't hit 48 kHz (Bluetooth headset routes commonly negotiate
+    // reduced 16–24 kHz mono formats) still produce a stream instead of
+    // NotReadableError.
     const audioConstraints: MediaTrackConstraints = {
       echoCancellation: { exact: false },
       noiseSuppression: { exact: false },
@@ -1101,10 +1237,10 @@ class AudioEngine {
       await this.nativeCtx.resume().catch(() => {});
     }
     // Probe the device's actual ceiling and force it. getCapabilities()
-    // tells us the real maximum the OS will give us for this mic — for
-    // the iPhone built-in mic that's 48 kHz stereo, for AirPods over HFP
-    // it's 16 kHz mono (a hard Bluetooth-protocol limit), and for USB
-    // interfaces it can be 96 kHz.  Try `exact` first so the device is
+    // tells us the maximum the browser advertises for this mic — built-in
+    // and USB inputs can offer 48–96 kHz, while Bluetooth headset routes
+    // commonly settle on a reduced mono format even when the reported range
+    // is wider. Try `exact` first so the device is
     // pushed to the top of its range; fall back to `ideal` so devices
     // that refuse to be pinned still produce a stream.
     const audioTrack = stream.getAudioTracks()[0];
@@ -1163,22 +1299,14 @@ class AudioEngine {
     source.connect(analyser);
     analyser.connect(sink);
 
-    // Recorder reads the raw mic stream — Web Audio is only used for the
-    // level meter / live waveform tap above. Routing the recording through
-    // the AudioContext would resample to its rate (24 kHz on iOS speaker
-    // route), gutting the high-frequency content. Gain is applied on the
-    // decoded buffer in finalizeSession instead, so we don't need a
-    // brickwall limiter to catch peaks during capture.
-    const mimeType = pickRecorderMimeType();
-    const options: MediaRecorderOptions = {
-      audioBitsPerSecond: DEFAULT_RECORDER_BITRATE,
-    };
-    if (mimeType) options.mimeType = mimeType;
-    const recorder = new MediaRecorder(stream, options);
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
+    // Prefer sample-accurate Float32 PCM from the rendering thread. If Web
+    // Audio would downsample the raw stream (notably on some iOS speaker
+    // routes), keep the high-bitrate MediaRecorder path as a compatibility
+    // fallback so choosing lossless capture never costs microphone bandwidth.
+    const capture =
+      (await this.createPcmCapture(source, sink, capturedSampleRate)) ??
+      this.createEncodedCapture(stream);
+    if (capture.kind === "pcm") setupNodes.push(capture.node);
 
     // iOS Safari workaround: when getUserMedia is active the audio session
     // Speaker routing during recording is handled by the master output
@@ -1189,10 +1317,6 @@ class AudioEngine {
     // capture down to ~16 kHz.
     const routerEl: HTMLAudioElement | null = null;
 
-    let resolveStopped = () => {};
-    const stopped = new Promise<void>((resolve) => {
-      resolveStopped = resolve;
-    });
     const session: RecordingSession = {
       trackId,
       audioSessionToken,
@@ -1201,17 +1325,13 @@ class AudioEngine {
       analyser,
       sink,
       inputGainValue: Math.max(0, gainValue),
-      recorder,
-      chunks,
-      mimeType: recorder.mimeType || mimeType || "audio/webm",
+      capture,
       startedAt: ctx.currentTime,
       transportStartAt: null,
       capturedSampleRate,
       routerEl,
       expectedStop: false,
       interruptionReported: false,
-      stopped,
-      resolveStopped,
       cleanupInterruptionListeners: () => {},
     };
     const reportInterruption = (
@@ -1233,16 +1353,34 @@ class AudioEngine {
       );
     };
     const onRecorderStop = () => {
-      session.resolveStopped();
+      if (capture.kind !== "encoded") return;
+      capture.resolveStopped();
       reportInterruption("recorder-stopped");
     };
+    const onProcessorError = () => {
+      if (capture.kind === "pcm") capture.resolveStopped();
+      reportInterruption(
+        "recorder-error",
+        new Error("The lossless PCM recorder stopped unexpectedly"),
+      );
+    };
     audioTrack?.addEventListener("ended", onTrackEnded);
-    recorder.addEventListener("error", onRecorderError);
-    recorder.addEventListener("stop", onRecorderStop);
+    if (capture.kind === "encoded") {
+      capture.recorder.addEventListener("error", onRecorderError);
+      capture.recorder.addEventListener("stop", onRecorderStop);
+    } else {
+      capture.node.addEventListener("processorerror", onProcessorError);
+      capture.spooler.setErrorHandler(onProcessorError);
+    }
     session.cleanupInterruptionListeners = () => {
       audioTrack?.removeEventListener("ended", onTrackEnded);
-      recorder.removeEventListener("error", onRecorderError);
-      recorder.removeEventListener("stop", onRecorderStop);
+      if (capture.kind === "encoded") {
+        capture.recorder.removeEventListener("error", onRecorderError);
+        capture.recorder.removeEventListener("stop", onRecorderStop);
+      } else {
+        capture.node.removeEventListener("processorerror", onProcessorError);
+        capture.spooler.setErrorHandler(null);
+      }
     };
     return session;
     } catch (err) {
@@ -1278,57 +1416,69 @@ class AudioEngine {
   }
 
   private startSession(session: RecordingSession) {
-    // Don't pass a timeslice. With one, MediaRecorder fires `dataavailable`
-    // every N ms with a chunk and we concatenate them via new Blob([...]) at
-    // stop time — but on Safari/iOS the per-chunk MP4 fragments aren't
-    // reliably concatenable (only the first carries the moov header), so the
-    // decoder produces audible glitches at every boundary, heard as periodic
-    // clicks/clipping. Letting the recorder buffer the whole session and
-    // emit a single blob on stop keeps the container intact.
     session.startedAt = this.context().currentTime;
-    session.recorder.start();
+    if (session.capture.kind === "pcm") {
+      session.capture.node.port.postMessage({ type: "start" });
+      return;
+    }
+    // Don't pass a timeslice. Safari MP4 fragments are not reliably
+    // concatenable; this fallback therefore asks the browser for one intact
+    // container while the primary PCM path streams transferable chunks.
+    session.capture.recorder.start();
   }
 
   private async stopSessionRecorder(session: RecordingSession): Promise<void> {
     session.expectedStop = true;
-    if (session.recorder.state !== "inactive") {
+    if (session.capture.kind === "pcm") {
+      session.capture.node.port.postMessage({ type: "stop" });
+      await session.capture.stopped;
+      return;
+    }
+    if (session.capture.recorder.state !== "inactive") {
       try {
-        session.recorder.stop();
+        session.capture.recorder.stop();
       } catch {
-        session.resolveStopped();
+        session.capture.resolveStopped();
       }
     }
-    await session.stopped;
+    await session.capture.stopped;
   }
 
   private releaseSession(session: RecordingSession) {
     session.expectedStop = true;
     session.cleanupInterruptionListeners();
     disconnectSessionNodes(session);
+    if (session.capture.kind === "pcm") session.capture.node.port.close();
     session.stream.getTracks().forEach((t) => t.stop());
     this.disableOutputBridge();
     this.releaseRecordingAudioSession(session.audioSessionToken);
   }
 
   private async decodeSession(session: RecordingSession): Promise<AudioBuffer | null> {
-    if (session.chunks.length === 0) {
-      throw Object.assign(new Error("Recording captured no audio"), {
-        name: "EmptyRecordingError",
-      });
-    }
-    const blob = new Blob(session.chunks, { type: session.mimeType });
     let buf: AudioBuffer;
-    try {
-      const arr = await blob.arrayBuffer();
-      buf = await decodeRecording(arr, session.capturedSampleRate);
-    } catch (err) {
-      console.error("Failed to decode recording", err);
-      throw Object.assign(
-        new Error(
-          err instanceof Error ? err.message : "Could not decode the recording",
-        ),
-        { name: "DecodeFailedError" },
-      );
+    if (session.capture.kind === "pcm") {
+      buf = await session.capture.spooler.finish(session.capture.sampleRate);
+    } else {
+      if (session.capture.chunks.length === 0) {
+        throw Object.assign(new Error("Recording captured no audio"), {
+          name: "EmptyRecordingError",
+        });
+      }
+      const blob = new Blob(session.capture.chunks, {
+        type: session.capture.mimeType,
+      });
+      try {
+        const arr = await blob.arrayBuffer();
+        buf = await decodeRecording(arr, session.capturedSampleRate);
+      } catch (err) {
+        console.error("Failed to decode recording", err);
+        throw Object.assign(
+          new Error(
+            err instanceof Error ? err.message : "Could not decode the recording",
+          ),
+          { name: "DecodeFailedError" },
+        );
+      }
     }
     const scheduledLead = Math.max(
       0,
@@ -1364,11 +1514,25 @@ class AudioEngine {
     for (const s of sessions) {
       s.expectedStop = true;
       s.cleanupInterruptionListeners();
-      try {
-        if (s.recorder.state !== "inactive") s.recorder.stop();
-        else s.resolveStopped();
-      } catch {
-        s.resolveStopped();
+      if (s.capture.kind === "pcm") {
+        try {
+          s.capture.node.port.postMessage({ type: "stop" });
+        } catch {
+          // ignore
+        }
+        s.capture.resolveStopped();
+        s.capture.node.port.close();
+        void s.capture.spooler.abort();
+      } else {
+        try {
+          if (s.capture.recorder.state !== "inactive") {
+            s.capture.recorder.stop();
+          } else {
+            s.capture.resolveStopped();
+          }
+        } catch {
+          s.capture.resolveStopped();
+        }
       }
       disconnectSessionNodes(s);
       s.stream.getTracks().forEach((t) => {
@@ -1416,6 +1580,7 @@ class AudioEngine {
       throwIfRecordingStartAborted(signal);
     } catch (err) {
       this.recording = null;
+      if (session.capture.kind === "pcm") void session.capture.spooler.abort();
       this.releaseSession(session);
       this.maybeRestorePlaybackSession();
       this.stop();
@@ -1450,6 +1615,7 @@ class AudioEngine {
       }
     } catch (err) {
       for (const s of sessions) {
+        if (s.capture.kind === "pcm") void s.capture.spooler.abort();
         this.releaseSession(s);
       }
       this.maybeRestorePlaybackSession();

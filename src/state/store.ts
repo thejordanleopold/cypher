@@ -3,6 +3,7 @@ import {
   getEngine,
   type RecordingInterruption,
 } from "@/audio/engine";
+import { captureCalibrationAudio } from "@/audio/calibration-capture";
 import { mixdown, type MixTrack } from "@/audio/mixdown";
 import { encodeBuffer, downloadBlob, type ExportFormat } from "@/audio/export";
 import { audioBufferToWavBlob } from "@/audio/wav";
@@ -4900,23 +4901,31 @@ async function measureLatency(deviceId: string): Promise<number | null> {
         autoGainControl: false,
       },
     });
-    // Schedule N click bursts.
     const clickTimes: number[] = [];
-    const startAt = ctx.currentTime + 0.2;
-    for (let i = 0; i < beats; i++) {
-      const at = startAt + i * (beatMs / 1000);
-      clickTimes.push(at);
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.frequency.value = 1000;
-      gain.gain.setValueAtTime(0, at);
-      gain.gain.linearRampToValueAtTime(1, at + 0.001);
-      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.04);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(at);
-      osc.stop(at + 0.05);
-    }
-    const recording = await captureViaMediaRecorder(stream, totalSec, ctx);
+    const recording = await captureCalibrationAudio(
+      stream,
+      totalSec,
+      ctx,
+      () => {
+        // Schedule the bursts only after capture is confirmed active. Loading
+        // an AudioWorklet can take longer than the old 200 ms lead on a cold
+        // mobile launch, which otherwise loses the first clicks entirely.
+        const startAt = ctx.currentTime + 0.2;
+        for (let i = 0; i < beats; i++) {
+          const at = startAt + i * (beatMs / 1000);
+          clickTimes.push(at);
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.frequency.value = 1000;
+          gain.gain.setValueAtTime(0, at);
+          gain.gain.linearRampToValueAtTime(1, at + 0.001);
+          gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.04);
+          osc.connect(gain).connect(ctx.destination);
+          osc.start(at);
+          osc.stop(at + 0.05);
+        }
+      },
+    );
     const recorderSamples = recording.samples;
     const recordingSampleRate = recording.sampleRate;
     // Detect click peaks in recorded audio.
@@ -4948,9 +4957,8 @@ async function measureLatency(deviceId: string): Promise<number | null> {
     }
     if (peaks.length < 2) return null;
     // Average each acoustic peak against the click's actual position relative
-    // to MediaRecorder start. The clicks are intentionally scheduled 200 ms in
-    // the future; treating the first click as t=0 biases every result by that
-    // full lead-in.
+    // to capture start. The clicks are intentionally scheduled 200 ms in the
+    // future; treating the first click as t=0 biases every result by that lead.
     let totalDelayMs = 0;
     let count = 0;
     for (let i = 0; i < Math.min(peaks.length, clickTimes.length); i++) {
@@ -4974,50 +4982,6 @@ async function measureLatency(deviceId: string): Promise<number | null> {
     } catch {
       // ignore
     }
-  }
-}
-
-async function captureViaMediaRecorder(
-  stream: MediaStream,
-  durationSec: number,
-  clock: AudioContext,
-): Promise<{ samples: Float32Array; sampleRate: number; startedAt: number }> {
-  const types = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/mp4",
-    "audio/aac",
-  ];
-  const mime = types.find((t) => MediaRecorder.isTypeSupported(t)) ?? "";
-  const rec = new MediaRecorder(
-    stream,
-    mime ? { mimeType: mime } : undefined,
-  );
-  const chunks: Blob[] = [];
-  rec.ondataavailable = (e) => {
-    if (e.data?.size > 0) chunks.push(e.data);
-  };
-  const startedAt = clock.currentTime;
-  // As in the main recording path, avoid timeslices: concatenated MP4
-  // fragments are not reliably decodable on Safari.
-  rec.start();
-  await new Promise((r) => setTimeout(r, durationSec * 1000));
-  await new Promise<void>((resolve) => {
-    rec.onstop = () => resolve();
-    rec.stop();
-  });
-  const blob = new Blob(chunks, { type: rec.mimeType || mime });
-  const ctx = new AudioContext();
-  try {
-    const arr = await blob.arrayBuffer();
-    const buf = await ctx.decodeAudioData(arr);
-    return {
-      samples: new Float32Array(buf.getChannelData(0)),
-      sampleRate: buf.sampleRate,
-      startedAt,
-    };
-  } finally {
-    await ctx.close().catch(() => {});
   }
 }
 
@@ -5098,12 +5062,12 @@ function maybeWarnAboutLowSampleRate(
   if (typeof rate !== "number" || rate <= 0) return;
   if (rate >= LOW_RATE_THRESHOLD_HZ) return;
   lowRateWarnShown = true;
-  const isHfp = rate <= 16_000;
+  const isBluetoothVoiceRate = rate <= 24_000;
   pushToast({
     variant: "warn",
     title: `Capturing at ${(rate / 1000).toFixed(1)} kHz`,
-    message: isHfp
-      ? "AirPods and other Bluetooth headsets max out at 16 kHz when used as a mic — that's a hardware limit. Plug in wired headphones or use the built-in mic for full-bandwidth audio."
+    message: isBluetoothVoiceRate
+      ? "Bluetooth headset microphones commonly negotiate 16–24 kHz mono while output is active. Keep the headset for monitoring, but select the built-in, wired, or USB mic for full-bandwidth audio."
       : "The OS handed us a low sample rate, usually because the speaker route is active. Plug in wired headphones, or pick a different mic in the picker, to get full quality.",
     ttlMs: 12_000,
   });

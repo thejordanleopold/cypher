@@ -1001,12 +1001,21 @@ test("concurrent deletion of the last two projects cannot form a lease cycle", a
 
   await Promise.all([waitForShell(page), waitForShell(otherTab)]);
   const remainingIds = (await readStoredProjects(page)).map(({ id }) => id);
-  // One delete may safely refuse once the other tab adopts its project as the
-  // fallback. The invariant is that both actions settle and at least one
-  // original is removed; neither tab may wait cyclically on the other's lock.
-  expect(
-    remainingIds.filter((id) => id === first.id || id === second.id),
-  ).toHaveLength(1);
+  const originalIds = remainingIds.filter(
+    (id) => id === first.id || id === second.id,
+  );
+  const [pageState, otherTabState] = await Promise.all([
+    readCompactionState(page),
+    readCompactionState(otherTab),
+  ]);
+  // Depending on lock timing, one delete may refuse after the other tab adopts
+  // its project, or both explicit deletes may commit and each tab may create a
+  // fresh unowned fallback. The safety invariant is that both actions settle,
+  // at least one original is removed, and every tab lands on durable metadata.
+  expect(originalIds.length).toBeLessThanOrEqual(1);
+  expect(remainingIds.length).toBeGreaterThanOrEqual(1);
+  expect(remainingIds).toContain(pageState.currentProjectId);
+  expect(remainingIds).toContain(otherTabState.currentProjectId);
 });
 
 test("deleting a project keeps a conflict backup fully restorable", async ({
